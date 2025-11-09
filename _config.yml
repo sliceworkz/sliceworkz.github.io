@@ -16,7 +16,7 @@ timezone:
 
 title: Sliceworkz # the main title
 
-tagline: Feature Slices, Event Sourcing and EventModeling libraries
+tagline: Feature Slices, Event Sourcing and Event Modeling libraries
 
 description: >- # used by seo meta and the atom feed
   Libraries for modern Java development based on Event Sourcing, EventModeling, DCB (Dynamic Context Boundary) and independent feature slices with Vertical Slice Architecture.
