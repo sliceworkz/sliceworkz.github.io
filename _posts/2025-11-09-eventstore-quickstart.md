@@ -32,7 +32,7 @@ Add the EventStore BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventstore.version>0.2.1</sliceworkz.eventstore.version>
+    <sliceworkz.eventstore.version>0.3.0</sliceworkz.eventstore.version>
 </properties>
 ...
 <dependencyManagement>
