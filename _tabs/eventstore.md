@@ -5,6 +5,11 @@ description: A DCB-Compliant EventStore
 icon: fas fa-solid fa-database
 order: 1
 ---
+
+[![Repo](https://img.shields.io/badge/git_repo-develop-green?logo=github)](https://github.com/sliceworkz/eventstore)
+[![Docs](https://img.shields.io/badge/Quickstart%20Guide-blue)](https://sliceworkz.github.io/posts/eventstore-quickstart/)
+
+
 ## What is Eventstore?
 
 Sliceworkz Eventstore is an **open source eventstore** implementation in Java.
