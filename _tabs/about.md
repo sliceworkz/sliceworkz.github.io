@@ -1,7 +1,7 @@
 ---
 # the default layout is 'page'
 icon: fas fa-info-circle
-order: 5
+order: 6
 ---
 
 Sliceworkz is a set of open source Java libraries that support implementing highly modular application architectures, building on Vertical Slice Architecture, Event Sourcing and Event Modeling techniques.
