@@ -20,12 +20,39 @@ It builds upon the <a href="/eventstore/">EventStore</a>, and provides direct im
 
 This guide walks you through building your first application with the Sliceworkz Event Modeling framework. We'll create a simple banking domain with account management functionality.
 
+
 ## Prerequisites
 
 - Java 21 or later
 - Maven 3.6 or later
 
 ## Step 1: Add Maven Dependencies
+
+Sliceworkz Eventmodeling is available in <a href="https://mvnrepository.com/artifact/org.sliceworkz">maven central</a>.
+
+All Eventmodeling modules are bundled in a Bill-Of-Material pom file.
+Add the Eventmodeling BOM to your project pom.xml to manage dependency versions:
+
+```xml
+...
+<properties>
+    <sliceworkz.eventstore.version>0.1.1</sliceworkz.eventstore.version>
+</properties>
+...
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.sliceworkz</groupId>
+            <artifactId>sliceworkz-eventmodeling-bom</artifactId>
+            <version>${sliceworkz.eventmodeling.version}</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+...
+```
+
 
 Add the Event Modeling implementation and an event storage provider to your `pom.xml`:
 
@@ -35,14 +62,12 @@ Add the Event Modeling implementation and an event storage provider to your `pom
     <dependency>
         <groupId>org.sliceworkz</groupId>
         <artifactId>sliceworkz-eventmodeling-impl</artifactId>
-        <version>0.1.1</version>
     </dependency>
 
     <!-- In-Memory Event Storage (for development/testing) -->
     <dependency>
         <groupId>org.sliceworkz</groupId>
         <artifactId>sliceworkz-eventstore-infra-inmem</artifactId>
-        <version>0.3.3</version>
     </dependency>
 </dependencies>
 ```
