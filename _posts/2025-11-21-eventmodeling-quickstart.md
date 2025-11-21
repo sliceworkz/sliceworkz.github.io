@@ -36,7 +36,7 @@ Add the Eventmodeling BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventstore.version>0.1.1</sliceworkz.eventstore.version>
+    <sliceworkz.eventmodeling.version>0.1.1</sliceworkz.eventmodeling.version>
 </properties>
 ...
 <dependencyManagement>
