@@ -2,7 +2,7 @@
 toc: true
 title: Eventmodeling
 description: An opinionated EventModeling implementation framework
-icon: fas fa-solid fa-command
+icon: fas fa-solid fa-microchip
 order: 2
 ---
 
