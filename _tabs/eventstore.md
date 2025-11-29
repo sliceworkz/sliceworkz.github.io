@@ -7,14 +7,15 @@ order: 1
 ---
 
 [![Repo](https://img.shields.io/badge/git_repo-develop-green?logo=github)](https://github.com/sliceworkz/eventstore)
-[![Docs](https://img.shields.io/badge/Quickstart%20Guide-blue)](https://sliceworkz.github.io/posts/eventstore-quickstart/)
+[![Quickstart](https://img.shields.io/badge/Quickstart%20Guide-blue)](/posts/eventstore-quickstart/)
+[![Docs](https://img.shields.io/badge/Documentation-purple)](/categories/eventstore-documentation/)
 
 
 ## What is Eventstore?
 
 Sliceworkz Eventstore is an **open source eventstore** implementation in Java.
 
-* If're you're into eventsourcing, have a look at our <a href="/posts/eventstore-quickstart/">quickstart guide</a> to get started.
+* If're you're into eventsourcing, have a look at our <a href="/posts/eventstore-quickstart/">quickstart guide</a> and <a href="/categories/eventstore-documentation/">documentation</a> to get started.
 * If you're new to eventsourcing, do yourself a favor and <a href="https://leanpub.com/eventmodeling-and-eventsourcing">learn about it</a>
 
 ## Features
