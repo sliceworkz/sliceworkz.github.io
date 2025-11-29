@@ -3,6 +3,7 @@ layout: post
 toc: true
 title: Appending Events
 description: Appending Domain Events to the Eventstore
+date: 2025-11-29 02:00:00
 categories: [Eventstore Documentation]
 tags: [events,append,tags,optimistic locking,dcb,idempotency]
 ---
