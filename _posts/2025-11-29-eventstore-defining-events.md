@@ -1,7 +1,7 @@
 ---
 layout: post
 toc: true
-title: Defining your Events
+title: Defining Events
 description: Defining Domain Events in the Eventstore
 date: 2025-11-29 01:00:00
 categories: [Eventstore Documentation]
