@@ -250,6 +250,9 @@ public record Address (
 
 Generating your obligatory GDPR data register that lists all personal data held, along with the rationale for keeping it, now becomes just a matter of Java reflection on your domain events!
 
+> IMPORTANT: ErasableData can be used to "forget" data in your EventStore, but be aware that PII data will probably still exist in your projections and readmodels.
+Make sure to register a domain event that expresses that the right to be forgotten has been used, and remove that data from your readmodels in the projection logic.
+{: .prompt-warning }
 
 ## Versioning Events
 
