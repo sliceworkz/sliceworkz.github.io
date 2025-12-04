@@ -4,7 +4,7 @@ toc: true
 title: PostgreSQL EventStorage
 description: Configuring PostgreSQL EventStorage
 date: 2025-11-29 05:00:00
-categories: [Eventstore Documentation]
+categories: [Eventstore Documentation,Eventstore deployment]
 tags: [postgres,eventstorage,database]
 ---
 

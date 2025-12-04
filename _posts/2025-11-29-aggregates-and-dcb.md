@@ -4,7 +4,7 @@ toc: true
 title: Aggregates and DCB
 description: Aggregates and Dynamic Consistency Boundary
 date: 2025-11-29 07:00:00
-categories: [Eventstore Documentation]
+categories: [Eventstore Documentation,Eventstore Application Scenarios]
 tags: [aggregate,dcb,dynamic consistency boundary]
 ---
 # Aggregates and Dynamic Consistency Boundaries

@@ -4,7 +4,7 @@ toc: true
 title: Bookmarking
 description: Reader Bookmarks on an EventStream
 date: 2025-11-29 06:00:00
-categories: [Eventstore Documentation]
+categories: [Eventstore Documentation,Eventstore API]
 tags: [bookmark]
 ---
 # Stream Readers and Bookmarking

@@ -4,7 +4,7 @@ toc: true
 title: Defining Events
 description: Defining Domain Events in the Eventstore
 date: 2025-11-29 01:00:00
-categories: [Eventstore Documentation]
+categories: [Eventstore Documentation,Eventstore API]
 tags: [events,gdpr,erasable data]
 ---
 

@@ -4,7 +4,7 @@ toc: true
 title: Projecting Events
 description: Projecting Domain Events into a read model
 date: 2025-11-29 04:00:00
-categories: [Eventstore Documentation]
+categories: [Eventstore Documentation,Eventstore API]
 tags: [events,projection,projector,read model]
 ---
 
