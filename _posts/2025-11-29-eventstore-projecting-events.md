@@ -346,3 +346,147 @@ Accumulated metrics are useful for:
 - **Debugging**: Identify performance issues across runs
 - **Resumption**: Get the current position for checkpointing
 - **Reporting**: Calculate processing statistics
+
+## Bookmarking for Process Restart and Progress Tracking
+
+Bookmarking allows projectors to automatically save and restore their position in the event stream. This enables projectors to:
+
+- **Resume after restart**: Pick up exactly where they left off when your application restarts
+- **Track progress**: Monitor how far a projection has processed through the event stream
+- **Allow projection updates to run subsequently on different instances**: Share position with next application instance needing it
+- **Enable incremental updates**: Process only new events since the last run (without relying on a local in-process variable)
+
+A bookmark consists of a reader name (unique identifier) and an event reference (position in the stream).   
+Optionally, you can add tags to add metadata (eg: application version, hostname, process id, ... that placed the bookmark)
+
+### Basic Bookmarking
+
+Configure bookmarking using the fluent API:
+
+```java
+CustomerSummary projection = new CustomerSummary("123");
+
+Projector<CustomerEvent> projector = Projector.from(stream)
+    .towards(projection)
+    .bookmarkProgress()
+        .withReader("customer-summary-projection")
+        .done()
+    .build();
+
+// First run processes all historical events and saves bookmark
+projector.run();
+
+// Application restarts...
+
+// Second run automatically reads bookmark and processes only new events
+projector.run();
+```
+
+The projector automatically:
+1. Reads the bookmark before each run to determine the starting position
+2. Processes events from that position forward
+3. Saves the updated bookmark after processing new events
+
+### Continuous Projection Updates
+
+For long-running projections that need to stay current with new events, combine bookmarking with event notifications:
+
+```java
+public class CustomerProjectionService {
+    private final EventStream<CustomerEvent> stream;
+    private final CustomerSummary projection;
+    private final Projector<CustomerEvent> projector;
+
+    public CustomerProjectionService(EventStore eventStore) {
+        EventStreamId streamId = EventStreamId.forContext("customers");
+        this.stream = eventStore.getEventStream(streamId, CustomerEvent.class);
+        this.projection = new CustomerSummary("123");
+
+        // Configure projector with bookmarking
+        this.projector = Projector.from(stream)
+            .towards(projection)
+            .bookmarkProgress()
+                .withReader("customer-summary")
+                .withTags(Tags.of("customer", "123"))
+                .readBeforeEachExecution()
+                .done()
+            .build();
+
+        // Subscribe to append notifications
+        stream.subscribe(this::updateProjection);
+    }
+
+	/*
+	 *  This method is called asynchronously each time the 
+	 */	
+    private void updateProjection(EventReference atLeastUntil) {
+
+        // Project new events, bookmark is fetched before this run (ref builder instructions above)
+        ProjectorMetrics metrics = projector.run();
+
+        if (metrics.eventsHandled() > 0) {
+            System.out.println("Processed " + metrics.eventsHandled() + " new events");
+            System.out.println("Current position: " + metrics.lastEventReference());
+        }
+
+        // Bookmark is automatically updated after each run
+    }
+
+    public CustomerSummary getProjection() {
+        return projection;
+    }
+}
+```
+
+This pattern ensures your read model stays synchronized with the event stream:
+
+1. **Initial state**: The projector reads the bookmark to resume from the last known position
+2. **New events**: When events are appended, the notification triggers an update
+3. **Incremental processing**: Only new events since the bookmark are processed
+4. **Automatic bookmark update**: The new position is saved for the next run
+
+### Bookmark Read Frequencies
+
+Control when bookmarks are read to match your use case:
+
+```java
+// Read before each execution (default) - for distributed systems
+Projector.from(stream)
+    .towards(projection)
+    .bookmarkProgress()
+        .withReader("my-projection")
+        .readBeforeEachExecution()  // Default behavior
+        .done()
+    .build();
+
+// Read once at creation - for single-instance applications
+Projector.from(stream)
+    .towards(projection)
+    .bookmarkProgress()
+        .withReader("my-projection")
+        .readAtCreationOnly()
+        .done()
+    .build();
+
+// Read before first execution - for delayed initialization
+Projector.from(stream)
+    .towards(projection)
+    .bookmarkProgress()
+        .withReader("my-projection")
+        .readBeforeFirstExecution()
+        .done()
+    .build();
+
+// Manual control - explicit bookmark management
+Projector<CustomerEvent> projector = Projector.from(stream)
+    .towards(projection)
+    .bookmarkProgress()
+        .withReader("my-projection")
+        .readOnManualTriggerOnly()
+        .done()
+    .build();
+
+// Explicitly read bookmark when needed
+projector.readBookmark();
+projector.run();
+```
