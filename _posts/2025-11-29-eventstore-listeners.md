@@ -54,12 +54,12 @@ stream.subscribe((EventReference atLeastUntil) -> {
     stream.query(EventQuery.matchAll(), lastProcessed.get())
         .forEach(event -> {
             System.out.println("Processing: " + event.type());
-            updateReadModel(event);
+            lastProcessed.set(event.reference());
         });
 
     // Update bookmark for resumability
-    lastProcessed.set(atLeastUntil);
     stream.placeBookmark("order-processor", atLeastUntil, Tags.none());
+    return lastProcessed.get();
 });
 ```
 

@@ -119,6 +119,7 @@ stream.subscribe((EventReference atLeastUntil) -> {
                 Tags.of("processed-at", Instant.now().toString())
             );
         });
+    return null;
 });
 
 // Initial catch-up: process all existing events

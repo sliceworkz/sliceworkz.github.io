@@ -388,6 +388,7 @@ stream.subscribe(new EventStreamEventuallyConsistentAppendListener() {
         if (!newEvents.isEmpty()) {
             lastSeen.set(newEvents.getLast().reference());
         }
+        return lastSeen.get();
     }
 });
 ```

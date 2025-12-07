@@ -419,7 +419,7 @@ public class CustomerProjectionService {
 	/*
 	 *  This method is called asynchronously each time the 
 	 */	
-    private void updateProjection(EventReference atLeastUntil) {
+    private EventReference updateProjection(EventReference atLeastUntil) {
 
         // Project new events, bookmark is fetched before this run (ref builder instructions above)
         ProjectorMetrics metrics = projector.run();
@@ -430,6 +430,8 @@ public class CustomerProjectionService {
         }
 
         // Bookmark is automatically updated after each run
+        
+        return metrics.lastEventReference();
     }
 
     public CustomerSummary getProjection() {
