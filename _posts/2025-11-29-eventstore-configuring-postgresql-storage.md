@@ -100,30 +100,9 @@ The EventStore can automatically create and configure DataSources from a `db.pro
 2. Environment variable: `EVENTSTORE_DB_CONFIG=/path/to/db.properties`
 3. Current working directory and up to 2 parent directories: `./db.properties`, `../db.properties`, `../../db.properties`
 
-### Simple Configuration (Single DataSource)
+### Configuring the pooled and non-pooled connections
 
-For basic setups, define a single pooled DataSource:
-
-```properties
-# db.properties - Simple configuration
-db.url=jdbc:postgresql://<host>/<db>
-db.username=<user>
-db.password=<password>
-db.leakDetectionThreshold=70000
-db.maximumPoolSize=2
-db.datasource.sslmode=require
-db.datasource.channelBinding=require
-db.datasource.cachePrepStmts=true
-db.datasource.prepStmtCacheSize=250
-db.datasource.prepStmtCacheSqlLimit=2048
-```
-
-The monitoring mechanism holds on for longer periods to the connection, making it required to avoid false positive leakDetections too early one them.
-
-
-### Advanced Configuration (Separate Pooled and Non-pooled)
-
-For production environments, especially with PgBouncer, define separate datasources:
+Define separate datasources:
 
 ```properties
 # db.properties - Advanced configuration
@@ -156,7 +135,7 @@ db.nonpooled.datasource.prepStmtCacheSqlLimit=2048
 Be sure the size your pooled datasource connections according to your application needs.
 The non-pooled datasource used for monitoring appends with the NOTIFY/LISTEN mechanism only needs 2 connections.
 
-The EventStore automatically detects the configuration style and creates appropriate DataSources.
+leakDetectionThreshold on the pooled (application) connections should be set quite low, for the monitoring connections this should be at least 30 seconds, as the monitoring connection only refreshes after a longer LISTEN for updates.
 
 ## Preparing the Database Schema Manually via DDL
 
@@ -171,18 +150,34 @@ The recommended approach is to create the database schema manually using DDL scr
 The library includes an `quickstart.ddl.sql` script (available in the JAR or source repository):
 
 ```sql
-
 CREATE TABLE events (
+    -- Primary key and positioning
     event_position BIGSERIAL PRIMARY KEY,
+
+    -- XID8 transaction id
+    event_tx xid8 DEFAULT pg_current_xact_id()::xid8 NOT NULL,
+
+    -- Event identification
     event_id UUID NOT NULL UNIQUE,
+
+    -- Stream identification
     stream_context TEXT NOT NULL,
     stream_purpose TEXT NOT NULL DEFAULT '',
+
+    -- Event metadata
     event_type TEXT NOT NULL,
+
+    -- Transaction information
     event_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    -- Event payload
     event_data JSONB NOT NULL,
     event_erasable_data JSONB,
+
+    -- Tags as string array
     event_tags TEXT[] DEFAULT '{}'
-);
+
+) WITH (FILLFACTOR = 100);
 
 -- Additional indexes, functions, and triggers...
 ```
@@ -201,18 +196,34 @@ For these scenario's, EventStore supports the usage of prefixes, in which all re
 You can find a DDL script named `initialisation.sql`, which has exactly the same content as `quickstart.ddl.sql`, but with a "PREFIX_" before each object that you can replace by any tenant name you like, ending with "_":
 
 ```sql
-
 CREATE TABLE PREFIX_events (
+    -- Primary key and positioning
     event_position BIGSERIAL PRIMARY KEY,
+
+    -- XID8 transaction id
+    event_tx xid8 DEFAULT pg_current_xact_id()::xid8 NOT NULL,
+
+    -- Event identification
     event_id UUID NOT NULL UNIQUE,
+
+    -- Stream identification
     stream_context TEXT NOT NULL,
     stream_purpose TEXT NOT NULL DEFAULT '',
+
+    -- Event metadata
     event_type TEXT NOT NULL,
+
+    -- Transaction information
     event_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    -- Event payload
     event_data JSONB NOT NULL,
     event_erasable_data JSONB,
+
+    -- Tags as string array
     event_tags TEXT[] DEFAULT '{}'
-);
+
+) WITH (FILLFACTOR = 100);
 
 -- Additional indexes, functions, and triggers...
 ```
