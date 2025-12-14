@@ -284,6 +284,49 @@ This enables:
 - **Controlled updates**: Process events in stages
 - **Testing**: Verify projection behavior at specific points
 
+## Subscribing to Stream Updates
+
+Instead of manually calling `run()` to update projections, you can subscribe a projector to automatically receive notifications when new events are appended. Simply include `subscribe()` in the builder chain:
+
+```java
+CustomerSummary projection = new CustomerSummary("123");
+
+Projector<CustomerEvent> projector = Projector.from(stream)
+    .towards(projection)
+    .subscribe()
+    .build();
+
+// New events automatically trigger projection updates
+stream.append(
+    AppendCriteria.none(),
+    Event.of(new CustomerRegistered("Alice"), Tags.of("customer", "123"))
+);
+
+// The projection is updated asynchronously
+```
+
+The `subscribe()` method configures the projector to register itself as an eventually consistent append listener on the stream. When events are appended, the projector's `eventsAppended()` method is invoked asynchronously, triggering a `run()` to process new events.
+
+This subscription-based approach is ideal for keeping read models current with minimal latency. The projector automatically handles incremental updates, processing only events since its last run.
+
+Combine subscriptions with bookmarking for resilience across restarts:
+
+```java
+Projector<CustomerEvent> projector = Projector.from(stream)
+    .towards(projection)
+    .subscribe()
+    .bookmarkProgress()
+        .withReader("customer-summary")
+        .readBeforeEachExecution()
+        .done()
+    .build();
+```
+
+With this configuration:
+- **On startup**: The projector reads the bookmark and catches up to the current position
+- **During operation**: New appends trigger automatic incremental updates
+- **After each update**: The bookmark is saved, enabling seamless recovery
+
 ## Interpreting Metrics
 
 The Projector returns `ProjectorMetrics` containing detailed statistics about projection execution:
