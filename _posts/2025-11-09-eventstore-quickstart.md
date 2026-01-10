@@ -323,7 +323,7 @@ try {
                 EventTypesFilter.any(),
                 Tags.of("customer", "123")
             ),
-            Optional.of(lastKnownEvent)
+            lastKnownEvent
         ),
         Event.of(
             new CustomerNameChanged("123", "Jane"),

@@ -152,7 +152,7 @@ EventReference lastRef = relevantEvents.getLast().reference();
 // Step 4 & 5: Conditional append
 try {
     stream.append(
-        AppendCriteria.of(relevantQuery, Optional.of(lastRef)),
+        AppendCriteria.of(relevantQuery, lastRef),
         Event.of(new CustomerNameChanged("Jane"), Tags.of("customer", "123"))
     );
 } catch (OptimisticLockingException e) {
@@ -168,7 +168,7 @@ When appending to an empty stream or when no previous relevant events exist, not
 stream.append(
     AppendCriteria.of(
         EventQuery.forEvents(EventTypesFilter.any(), Tags.of("customer", "123")),
-        Optional.empty()  // No last reference expected
+        null  // No last reference expected
     ),
     Event.of(new CustomerRegistered("John"), Tags.of("customer", "123"))
 );
@@ -230,7 +230,7 @@ public void appendIdempotently(
             EventTypesFilter.any(),
             Tags.of("idempotency", idempotencyKey)
         ),
-        Optional.empty()  // Expect no prior event with this key
+        null  // Expect no prior event with this key
     );
 
     try {

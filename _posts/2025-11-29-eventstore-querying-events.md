@@ -641,7 +641,7 @@ public class SubscribeToCourseCommand {
 
             // Append new event with optimistic locking
             stream.append(
-                AppendCriteria.of(query, Optional.of(lastRelevantFact)),
+                AppendCriteria.of(query, lastRelevantFact),
                 Event.of(
                     new StudentSubscribedToCourse(studentId, courseId),
                     Tags.of("student", studentId, "course", courseId)

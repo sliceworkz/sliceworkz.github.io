@@ -139,7 +139,7 @@ void saveStudent(Student student, List<StudentDomainEvent> events) {
                 EventTypesFilter.any(),
                 Tags.of("student", student.studentId)
             ),
-            Optional.ofNullable(student.lastEventReference())
+            student.lastEventReference()
         ),
         events.stream()
             .<EphemeralEvent<? extends LearningDomainEvent>>map(e -> Event.of(e, Tags.of("student", student.studentId)))
@@ -252,7 +252,7 @@ void saveCourse(Course course, List<CourseDomainEvent> events) {
                 EventTypesFilter.any(),
                 Tags.of("course", course.courseId)
             ),
-            Optional.ofNullable(course.lastEventReference())
+            course.lastEventReference()
         ),
         events.stream()
             .<EphemeralEvent<? extends LearningDomainEvent>>map(e -> Event.of(e, Tags.of("course", course.courseId)))
@@ -432,7 +432,7 @@ public boolean subscribeStudentToCourse(String studentId, String courseId) {
 
     if ( dm.canSubscribe() ) {
         stream.append(
-                AppendCriteria.of(dm.getEventQuery(), Optional.ofNullable(lastRef)),
+                AppendCriteria.of(dm.getEventQuery(), lastRef),
                 Event.of(
                     new StudentSubscribedToCourse(studentId, courseId),
                     Tags.of(Tag.of("student", studentId), Tag.of("course", courseId))
