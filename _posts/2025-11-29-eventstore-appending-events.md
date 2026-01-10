@@ -176,13 +176,41 @@ stream.append(
 
 ## Idempotency
 
-Idempotency ensures that duplicate command submissions don't create duplicate events. 
+Idempotency ensures that duplicate command submissions don't create duplicate events.
 When handling for example incoming REST calls or asynchronous messages (JMS, Kafka, ...), it could happen that your correctly process and append the information, but that you're not able to acknowledge proper processing to the client or messaging system due to a system or connection failure.
 In that case, it is to be expected that the client assumes processing hasn't happened yet, and that it resubmits the same information.  Idempotency in your system then allows to detect and silently ignore the duplicate processing, while confirming (again) to the client that reception and processing has happened correctly.
 
-An easy way to implement this is by tagging events with an idempotency key and using optimistic locking to prevent duplicate appends.
+### Idempotent append()
 
-### Implementation Pattern
+The EventStore provides built-in idempotency support through idempotency keys. When appending an event with an idempotency key, if an event with the same key already exists, the append operation is silently ignored and returns an empty list.
+
+```java
+String requestId = "req-2025-01-15-abc123";
+
+// First submission - succeeds and returns the appended event
+List<Event<CustomerEvent>> events = stream.append(
+    AppendCriteria.none(),
+    Event.of(new CustomerRegistered("John"), Tags.none())
+        .withIdempotencyKey(requestId)
+);
+assertEquals(1, events.size());
+
+// Duplicate submission - silently ignored, returns empty list
+events = stream.append(
+    AppendCriteria.none(),
+    Event.of(new CustomerRegistered("John"), Tags.none())
+        .withIdempotencyKey(requestId)
+);
+assertEquals(0, events.size());
+```
+
+**Important**: Idempotency keys can only be used when appending a single event. When appending multiple events in a batch, none of them may have an idempotency key.
+
+### DCB-style Idempotency
+
+An alternative way to implement idempotency is by tagging events with an idempotency tag and using optimistic locking to prevent duplicate appends.
+
+#### Implementation Pattern
 
 ```java
 public void appendIdempotently(
@@ -215,7 +243,7 @@ public void appendIdempotently(
 }
 ```
 
-### Usage Example
+#### Usage Example
 
 ```java
 String requestId = "req-2024-01-15-abc123";
