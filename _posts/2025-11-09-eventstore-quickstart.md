@@ -32,7 +32,7 @@ Add the EventStore BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventstore.version>0.5.3</sliceworkz.eventstore.version>
+    <sliceworkz.eventstore.version>0.6.2</sliceworkz.eventstore.version>
 </properties>
 ...
 <dependencyManagement>
@@ -232,12 +232,11 @@ Key-value pairs attached to events that enable dynamic querying across different
 
 ### EventQuery
 
-Defines which events to retrieve from storage based on event types and tags. 
-Supports filtering on specific Event types, Events with certain Tags, as well as point-in-time queries via an optional "until" reference.
+Defines which events to retrieve from storage and how to traverse them. An `EventQuery` wraps an `EventFilter` (matching criteria: event types, tags, and an optional "until" reference) together with a direction (forward or backward) and an optional limit.
 
 ### AppendCriteria
 
-Controls optimistic locking when appending events. Contains an `EventQuery` and an optional reference to the last known event. If new matching events exist after the reference, the append fails with `OptimisticLockingException`.
+Controls optimistic locking when appending events. Contains an `EventFilter` (the matching criteria extracted from an `EventQuery`) and an optional reference to the last known event. If new matching events exist after the reference, the append fails with `OptimisticLockingException`.
 
 
 ## Dynamic Consistency Boundary - Optimistic Locking with Tags
@@ -368,7 +367,7 @@ EventStream<Object> stream = eventstore.getEventStream(EventStreamId.anyContext(
 
 // Get reference to last event as starting point
 Handle<EventReference> lastSeen = Handle.of(
-    stream.queryBackwards(EventQuery.matchAll(), Limit.to(1))
+    stream.query(EventQuery.matchAll().backwards().limit(1))
           .findFirst()
           .map(Event::reference)
           .orElse(null)

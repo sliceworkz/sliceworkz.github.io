@@ -12,7 +12,7 @@ This guide covers the various ways to query events from the EventStore, includin
 
 ## EventQuery Concept
 
-An `EventQuery` is the fundamental mechanism for selecting events from the EventStore. It defines matching criteria based on event types and tags.
+An `EventQuery` is the fundamental mechanism for selecting events from the EventStore. It wraps an `EventFilter` (which defines matching criteria based on event types, tags, and an optional temporal boundary) together with traversal semantics: a direction (forward or backward) and an optional limit.
 
 **An event matches an EventQuery if:**
 1. The event's type is **any** of the types allowed by the query (OR condition)
@@ -266,26 +266,24 @@ while (true) {
 }
 ```
 
-The `after` parameter is a technical optimization that tells the store where to start scanning. It doesn't affect which events match the query, only where the scan begins.
+The cursor parameter is a technical optimization that tells the store where to start scanning. For forward queries it acts as an "after" cursor; for backward queries it acts as a "before" cursor. It doesn't affect which events match the query, only where the scan begins.
 
 ## Querying backwards
 
-Backward queries return events in reverse chronological order (newest first). This is useful for finding the most recent events or the last occurrence of a business fact:
+Backward queries return events in reverse chronological order (newest first). The direction is set on the `EventQuery` itself using `backwards()`, and a limit can be set using `limit()`:
 
 ```java
 // Get the last 10 events
-Stream<Event<CustomerEvent>> recentEvents = stream.queryBackwards(
-    EventQuery.matchAll(),
-    Limit.to(10)
+Stream<Event<CustomerEvent>> recentEvents = stream.query(
+    EventQuery.matchAll().backwards().limit(10)
 );
 
 // Find the last CustomerRegistered event
-Optional<Event<CustomerEvent>> lastRegistration = stream.queryBackwards(
+Optional<Event<CustomerEvent>> lastRegistration = stream.query(
     EventQuery.forEvents(
         EventTypesFilter.of(CustomerRegistered.class),
         Tags.none()
-    ),
-    Limit.to(1)
+    ).backwards().limit(1)
 ).findFirst();
 ```
 
@@ -293,9 +291,10 @@ Optional<Event<CustomerEvent>> lastRegistration = stream.queryBackwards(
 
 ```java
 EventReference beforeRef = null;
+EventQuery backwardsQuery = EventQuery.matchAll().backwards();
 while (true) {
-    Stream<Event<CustomerEvent>> batch = stream.queryBackwards(
-        EventQuery.matchAll(),
+    Stream<Event<CustomerEvent>> batch = stream.query(
+        backwardsQuery,
         beforeRef,
         Limit.to(100)
     );
@@ -308,7 +307,7 @@ while (true) {
     // Process events (already in reverse order)
     events.forEach(event -> processEvent(event));
 
-    // Update to continue before the first event in this batch
+    // Update cursor to continue before the oldest event in this batch
     beforeRef = events.getLast().reference();
 }
 ```
@@ -602,6 +601,32 @@ Both queries must have:
 - The same "until" reference
 
 Attempting to combine queries with different "until" references throws an `IllegalArgumentException`.
+
+**Compatible direction and limit:**
+
+When combining queries, both must have the same direction and the same limit:
+
+```java
+// Same direction and limit - OK
+EventQuery q7 = EventQuery.forEvents(EventTypesFilter.of(CustomerRegistered.class), Tags.none())
+    .backwards().limit(10);
+EventQuery q8 = EventQuery.forEvents(EventTypesFilter.of(OrderPlaced.class), Tags.none())
+    .backwards().limit(10);
+EventQuery combinedBackward = q7.combineWith(q8); // Success
+
+// Different direction - ERROR
+EventQuery q9 = EventQuery.forEvents(EventTypesFilter.of(CustomerRegistered.class), Tags.none());
+EventQuery q10 = EventQuery.forEvents(EventTypesFilter.of(OrderPlaced.class), Tags.none())
+    .backwards();
+// q9.combineWith(q10) throws IllegalArgumentException
+
+// Different limits - ERROR
+EventQuery q11 = EventQuery.forEvents(EventTypesFilter.of(CustomerRegistered.class), Tags.none())
+    .limit(10);
+EventQuery q12 = EventQuery.forEvents(EventTypesFilter.of(OrderPlaced.class), Tags.none())
+    .limit(20);
+// q11.combineWith(q12) throws IllegalArgumentException
+```
 
 ### Practical Use Case: Dynamic Consistency Boundary
 
