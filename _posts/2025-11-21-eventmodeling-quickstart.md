@@ -36,7 +36,7 @@ Add the Eventmodeling BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventmodeling.version>0.1.1</sliceworkz.eventmodeling.version>
+    <sliceworkz.eventmodeling.version>0.2.0</sliceworkz.eventmodeling.version>
 </properties>
 ...
 <dependencyManagement>
@@ -159,7 +159,6 @@ import org.sliceworkz.eventmodeling.boundedcontext.BoundedContextBuilder;
 import org.sliceworkz.eventmodeling.slices.FeatureSlice;
 import org.sliceworkz.eventmodeling.slices.FeatureSlice.Type;
 import org.sliceworkz.eventmodeling.slices.FeatureSliceConfiguration;
-import com.example.banking.BankingBoundedContext;
 import com.example.banking.BankingDomain.BankingDomainEvent;
 import com.example.banking.BankingDomain.BankingInboundEvent;
 import com.example.banking.BankingDomain.BankingOutboundEvent;
@@ -174,9 +173,19 @@ public class OpenAccountFeatureSlice
     implements FeatureSliceConfiguration<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> {
 
     @Override
-    public void configure(
+    public void configureCommand(
         BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
         // Commands are automatically discovered, no explicit registration needed
+    }
+
+    @Override
+    public void configureQuery(
+        BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
+    }
+
+    @Override
+    public void configureAutomation(
+        BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
     }
 }
 ```
@@ -185,6 +194,7 @@ public class OpenAccountFeatureSlice
 - `@FeatureSlice` annotation marks this class for automatic discovery
 - `type = Type.STATE_CHANGE` indicates this feature handles commands
 - `context`, `chapter`, and `tags` provide organizational metadata
+- Each feature slice has three configuration methods for commands, queries, and automations
 
 ### 4.2: Create the Command Implementation
 
@@ -222,15 +232,13 @@ public class OpenAccountCommand implements Command<BankingDomainEvent> {
         DomainConceptId accountId = DomainConceptId.create();
 
         // Raise the AccountOpened event with appropriate tags
-        result.raiseEvent(
+        return result.raiseEvent(
             new AccountOpened(accountId, customerId, LocalDate.now()),
             Tags.of(
                 DomainConceptTag.of(BankingDomain.CONCEPT_ACCOUNT, accountId),
                 DomainConceptTag.of(BankingDomain.CONCEPT_CUSTOMER, customerId)
             )
         );
-
-        return result;
     }
 }
 ```
@@ -238,7 +246,7 @@ public class OpenAccountCommand implements Command<BankingDomainEvent> {
 **Key concepts:**
 - Commands implement `Command<EVENT_TYPE>`
 - `execute()` method receives a `CommandContext` and returns a `CommandResult`
-- Use `result.raiseEvent()` to append events to the event store
+- `raiseEvent()` returns the `CommandResult`, allowing fluent return statements
 - Tag events with domain concepts for efficient querying
 
 ## Step 5: Create a STATE_READ Feature Slice (Read Model)
@@ -269,10 +277,20 @@ public class AccountDetailsFeatureSlice
     implements FeatureSliceConfiguration<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> {
 
     @Override
-    public void configure(
+    public void configureCommand(
+        BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
+    }
+
+    @Override
+    public void configureQuery(
         BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
         // Register the read model
         builder.readmodel(AccountDetailsReadModel.class);
+    }
+
+    @Override
+    public void configureAutomation(
+        BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
     }
 }
 ```
@@ -399,7 +417,9 @@ public class BankingApplication {
             .name("banking")
             .eventStorage(eventStorage)
             .instance(instance)
-            .rootPackage(BankingApplication.class.getPackage())  // Scans for @FeatureSlice
+            .features()
+                .rootPackage(BankingApplication.class.getPackage())  // Scans for @FeatureSlice
+                .done()
             .build(BankingBoundedContext.class);
 
         // 4. Execute a command
@@ -482,10 +502,12 @@ Now that you have a working Event Modeling application, you can:
 
 1. **Add more events** to `BankingDomainEvent` (e.g., `MoneyDeposited`, `MoneyWithdrawn`)
 2. **Implement decision models** to enforce business rules in commands
-3. **Create automations** to implement automated activities
-4. **Add translators** to handle inbound events from external systems
-5. **Implement dispatchers** for the outbox pattern to publish outbound events
-6. **Switch to PostgreSQL** for production-ready event storage
-7. **Add tests** using the `sliceworkz-eventmodeling-testing` module
+3. **Use aggregates** for traditional aggregate-style command handling with snapshot support
+4. **Create automations** to implement automated activities
+5. **Add translators** to handle inbound events from external systems
+6. **Implement dispatchers** for the outbox pattern to publish outbound events
+7. **Switch to PostgreSQL** for production-ready event storage
+8. **Add observability** with Micrometer metrics for monitoring commands, events, and read models
+9. **Add tests** using the `sliceworkz-eventmodeling-testing` module
 
 For more examples, see the `sliceworkz-eventmodeling-examples` module in the repository.
