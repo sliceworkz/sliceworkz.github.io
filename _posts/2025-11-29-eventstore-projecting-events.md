@@ -327,6 +327,57 @@ With this configuration:
 - **During operation**: New appends trigger automatic incremental updates
 - **After each update**: The bookmark is saved, enabling seamless recovery
 
+## Initializing Projections with Savepoints
+
+For projections that are created on-the-fly — for example, to answer a query in an API request — replaying the entire event history on every instantiation can be expensive. The **savepoint pattern** addresses this by allowing projections to initialize from a recent snapshot event rather than replaying from the beginning.
+
+A projection can optionally implement `initQuery()` to find the most recent savepoint event before the main `eventQuery()` runs:
+
+```java
+public class StockLevelProjection implements Projection<StockEvent> {
+    private final String product;
+    private int level = 0;
+
+    public StockLevelProjection(String product) {
+        this.product = product;
+    }
+
+    @Override
+    public EventQuery initQuery() {
+        return EventQuery.forEvents(
+            EventTypesFilter.of(StockCounted.class),
+            Tags.of("product", product)
+        ).backwards().limit(1);
+    }
+
+    @Override
+    public EventQuery eventQuery() {
+        return EventQuery.forEvents(
+            EventTypesFilter.of(StockAdded.class, StockPicked.class),
+            Tags.of("product", product)
+        );
+    }
+
+    @Override
+    public void when(Event<StockEvent> event) {
+        switch (event.data()) {
+            case StockCounted c  -> level = c.counted();
+            case StockAdded a    -> level += a.quantity();
+            case StockPicked p   -> level -= p.quantity();
+        }
+    }
+
+    public int level() { return level; }
+}
+```
+
+The `initQuery()` runs once on the first projector execution. If a savepoint is found, the projection initializes from it and the main `eventQuery()` processes only the events that occurred after. When no savepoint exists, the pattern degrades gracefully — the full stream is replayed.
+
+> When bookmarking is enabled, `initQuery()` is ignored. Bookmarked projections track their own position and must process every event.
+{: .prompt-warning }
+
+For a detailed discussion of the savepoint pattern — including design decisions, comparison with bookmarking, and strategies for when to create savepoints — see the dedicated [Savepoint Pattern](/posts/eventstore-savepoint-pattern/) article.
+
 ## Interpreting Metrics
 
 The Projector returns `ProjectorMetrics` containing detailed statistics about projection execution:
