@@ -193,10 +193,12 @@ In some scenarios, you want to create multiple eventstores, without configuring 
 
 For these scenario's, EventStore supports the usage of prefixes, in which all required database objects are uniquely identified by prefixing them.
 
-You can find a DDL script named `initialisation.sql`, which has exactly the same content as `quickstart.ddl.sql`, but with a "PREFIX_" before each object that you can replace by any tenant name you like, ending with "_":
+The library includes two DDL scripts with "PREFIX_" placeholders for multi-tenant deployments:
+
+**`ensure-schema.sql`** - Idempotent creation script using `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`. Safe to run repeatedly:
 
 ```sql
-CREATE TABLE PREFIX_events (
+CREATE TABLE IF NOT EXISTS PREFIX_events (
     -- Primary key and positioning
     event_position BIGSERIAL PRIMARY KEY,
 
@@ -228,7 +230,14 @@ CREATE TABLE PREFIX_events (
 -- Additional indexes, functions, and triggers...
 ```
 
-By replacing all occurences of "PREFIX_" in this file by e.g. "myapp_", you create a private eventstorage to be used by a specific application.
+**`drop-schema.sql`** - Teardown script for destroying an existing eventstore schema:
+
+```sql
+DROP TABLE IF EXISTS PREFIX_bookmarks CASCADE;
+DROP TABLE IF EXISTS PREFIX_events CASCADE;
+```
+
+By replacing all occurrences of "PREFIX_" in these files by e.g. "myapp_", you create a private eventstorage to be used by a specific application.
 
 
 ### Connecting to an EventStore database with prefixes
@@ -249,38 +258,37 @@ EventStore tenant2Store = PostgresEventStorage.newBuilder()
 
 **Security Best Practice**: Create the schema with a privileged database user (e.g., `eventstore_admin` with DDL rights), then run your application with a limited user (e.g., `eventstore_app` with only DML rights). This prevents applications from accidentally modifying the schema.
 
-## Auto-creating the Database Schema on Startup
+## Database Initialization Modes
 
-For development and testing environments, you can enable automatic schema creation:
+The `DatabaseInitMode` enum controls how the database schema is handled at startup. Set it via `.databaseInitMode(DatabaseInitMode.xxx)` or use one of the convenience methods on the builder:
+
+### ENSURE (default)
+
+Creates missing database objects if they don't exist, leaving existing objects untouched, then validates the schema. This is the default mode and is safe to run repeatedly:
 
 ```java
+// Default behavior — no need to specify
 EventStore eventStore = PostgresEventStorage.newBuilder()
-    .initializeDatabase()  // Enable auto-creation
+    .build();
+
+// Or explicitly
+EventStore eventStore = PostgresEventStorage.newBuilder()
+    .ensureDatabase()
     .build();
 ```
 
-This executes the initialization DDL automatically when the EventStore is built. The operation is idempotent—safe to run multiple times without affecting existing data.
+This is the recommended mode for most environments. It uses idempotent `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` statements, so existing data is never affected.
 
-**Warning**: Auto-creation requires the database user to have DDL privileges (CREATE TABLE, CREATE FUNCTION, CREATE TRIGGER, CREATE INDEX). This is generally not recommended for production environments where you should:
-- Limit application database users to DML operations only (SELECT, INSERT, UPDATE)
-- Manage schema changes through controlled migration processes
-- Separate schema management from application deployment
+> ENSURE mode requires the database user to have DDL privileges (CREATE TABLE, CREATE FUNCTION, CREATE TRIGGER, CREATE INDEX).
+{: .prompt-info }
 
-Disable auto-creation for production (it's disabled by default):
+### VALIDATE
 
-```java
-EventStore eventStore = PostgresEventStorage.newBuilder()
-    .initializeDatabase(false)  // Explicitly disable (default)
-    .build();
-```
-
-## Checking the Database Schema on Startup
-
-By default, the EventStore validates the database schema on startup to ensure all required objects exist and are properly configured:
+Validates that all required database objects exist and are correctly defined. No objects are created or modified — this is a read-only check:
 
 ```java
 EventStore eventStore = PostgresEventStorage.newBuilder()
-    .checkDatabase(true)  // Default behavior
+    .validateDatabase()
     .build();
 ```
 
@@ -292,29 +300,61 @@ The validation checks:
 
 If validation fails, an `EventStorageException` is thrown with details about missing or misconfigured objects. This provides early detection of schema issues before runtime failures occur.
 
-**Disabling Schema Checks:**
+> VALIDATE is useful when the schema is managed externally (e.g., by a DBA or migration tool) but you still want startup verification.
+{: .prompt-info }
+
+### NONE
+
+Skips all database operations. Trusts that the schema exists and is correct. Minimizes startup time:
 
 ```java
 EventStore eventStore = PostgresEventStorage.newBuilder()
-    .checkDatabase(false)  // Disable validation
+    .databaseInitMode(DatabaseInitMode.NONE)
     .build();
 ```
 
-Disable checks only when:
+Use this when:
 - The database user lacks permissions to query `information_schema`
-- You want to defer validation to a later time
 - Minimizing startup time is critical
+- You have full confidence in the schema being correct
 
-**Recommended Production Configuration:**
+### INITIALIZE
+
+Drops all event store objects and recreates them from scratch, then validates:
 
 ```java
 EventStore eventStore = PostgresEventStorage.newBuilder()
-    .initializeDatabase(false)  // No auto-creation in production
-    .checkDatabase(true)         // But validate schema exists
+    .initializeDatabase()
     .build();
 ```
 
-This ensures the schema is present without requiring DDL privileges.
+> **This mode is destructive** — all existing event data will be lost. Use only for test environments, fresh deployments, or when a clean slate is explicitly needed.
+{: .prompt-danger }
+
+### Recommended Configurations
+
+**Production with external schema management** (DML-only database user):
+
+```java
+EventStore eventStore = PostgresEventStorage.newBuilder()
+    .validateDatabase()         // Verify schema exists at startup
+    .build();
+```
+
+**Production with auto-managed schema** (DDL-capable database user):
+
+```java
+EventStore eventStore = PostgresEventStorage.newBuilder()
+    .build();                   // Default ENSURE mode
+```
+
+**Test environments:**
+
+```java
+EventStore eventStore = PostgresEventStorage.newBuilder()
+    .initializeDatabase()       // Fresh schema every test run
+    .build();
+```
 
 ## Configuring a Hard Limit on Query Result Size
 

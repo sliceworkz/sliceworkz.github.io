@@ -32,7 +32,7 @@ Add the EventStore BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventstore.version>0.6.3</sliceworkz.eventstore.version>
+    <sliceworkz.eventstore.version>0.6.4</sliceworkz.eventstore.version>
 </properties>
 ...
 <dependencyManagement>
@@ -131,7 +131,7 @@ EventStore eventstore = PostgresEventStorage.newBuilder()
 
 > **Note:** PostgreSQL requires a `db.properties` file with connection settings.  Have a look at the example <a href="https://github.com/sliceworkz/eventstore/tree/develop/sliceworkz-eventstore-infra-postgres/src/main/quickstart">quickstart configuration</a> for a template.
 
-> The `.initializeDatabase`{:.filepath} call drops and created the necessary tables and indexes.  The recommended way of working is to connect the DB with a user that only has DML rights, and create the database schema upfront with the DDL found in the <a href="https://github.com/sliceworkz/eventstore/tree/develop/sliceworkz-eventstore-infra-postgres/src/main/quickstart">quickstart configuration</a>
+> The `.initializeDatabase()`{:.filepath} call uses `DatabaseInitMode.INITIALIZE`, which drops and recreates the necessary tables and indexes. Without it, the default mode is `ENSURE`, which creates missing objects idempotently. For production, the recommended way of working is to connect the DB with a user that only has DML rights, use `.validateDatabase()`{:.filepath} to verify the schema, and create the database schema upfront with the DDL found in the <a href="https://github.com/sliceworkz/eventstore/tree/develop/sliceworkz-eventstore-infra-postgres/src/main/quickstart">quickstart configuration</a>
 {: .prompt-warning }
 
 
@@ -443,7 +443,7 @@ dataSource.setPassword("postgres");
 EventStorage storage = PostgresEventStorage.newBuilder()
     .dataSource(dataSource)
     .prefix("myapp_")		// if you want your tables prefixed
-    .initializeDatabase()	// drop/create the database - do this only in DEV
+    .initializeDatabase()	// drop/create the database - only in DEV/test
     .build();
 
 EventStore eventstore = EventStoreFactory.get().eventStore(storage);
