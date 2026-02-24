@@ -352,20 +352,15 @@ A specific event can be retrieved directly by its `EventId`:
 ```java
 EventId eventId = EventId.fromString("550e8400-e29b-41d4-a716-446655440000");
 
-Optional<Event<CustomerEvent>> event = stream.getEventById(eventId);
+List<Event<CustomerEvent>> events = stream.getEventById(eventId);
 
-event.ifPresent(e -> {
-    System.out.println("Found event: " + e.data());
-    System.out.println("Position: " + e.reference().position());
-});
+if (!events.isEmpty()) {
+    System.out.println("Found event: " + events.getFirst().data());
+    System.out.println("Position: " + events.getFirst().reference().position());
+}
 ```
 
-You can also query just the reference (without loading the full event):
-
-```java
-Optional<EventReference> ref = stream.queryReference(eventId);
-ref.ifPresent(r -> System.out.println("Event at position: " + r.position()));
-```
+`getEventById` returns a `List` rather than an `Optional`. For regular (non-upcasted) events the list contains exactly one element. When a stored event is upcasted into multiple sub-events via multi-event upcasting, the list contains all sub-events sharing that ID — each with the same id/position/tx but a distinct index.
 
 ## Querying untyped Event data
 
@@ -493,6 +488,8 @@ registrations.forEach(event -> {
 - Historical events matching the upcasted target type are automatically included
 - The upcasting is transparent—application code never sees historical event types
 - No special handling needed in query logic for legacy events
+- When a legacy event is upcasted into multiple current events (multi-event upcasting), all sub-events appear in query results in their correct position with distinct index values
+- When a legacy event is upcasted to zero events (filtering), it is silently skipped
 
 ## Complex Event Queries
 

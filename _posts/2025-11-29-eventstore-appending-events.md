@@ -88,13 +88,17 @@ System.out.println("Timestamp: " + event.timestamp());
 The `EventReference` combines identity and ordering:
 - **EventId**: Globally unique identifier (UUID-based)
 - **Position**: Sequential position within the stream (starts at 1, unique over all streams stored in the same storage)
+- **Tx**: The transaction during which this event was appended. Primary sort criterion before position
+- **Index**: Sub-event index within a single stored event (0 for regular events, 0..N for events produced by multi-event upcasting)
+
+Events are ordered by `(tx, position, index)`. For non-upcasted events the index is always 0. When a legacy event is upcasted into multiple current events, each sub-event shares the same id/position/tx but receives a distinct index (0, 1, 2, ...).
 
 This way, the `EventReference` provides a great reference to:
 - determine where you were in processing events in your stream (querying a next batch of Events after that reference next time)
 - version a projection built from events, to determine up until which event
 - passing a reference to a client to demand a view that has been updated to at least the information that was submitted by that specific client (consistency)
 - compare the sequence in which two events have happened, based on their `position` in the stream
-- etc... 
+- etc...
 
 EventReference is also crucial for implementing optimistic locking in the DCB pattern. It allows you to note the last relevant event when making a decision, then verify no new relevant facts have emerged when appending the result.
 

@@ -389,6 +389,7 @@ System.out.println("Events streamed: " + metrics.eventsStreamed());
 System.out.println("Events handled: " + metrics.eventsHandled());
 System.out.println("Queries done: " + metrics.queriesDone());
 System.out.println("Last event: " + metrics.lastEventReference());
+System.out.println("Most recent: " + metrics.mostRecentEventReference());
 ```
 
 ### Metrics from the Last Run
@@ -398,7 +399,8 @@ System.out.println("Last event: " + metrics.lastEventReference());
 - **eventsStreamed**: Total events retrieved from the event source (may include filtered events)
 - **eventsHandled**: Events actually processed by the projection handler
 - **queriesDone**: Number of batch queries executed against the event source
-- **lastEventReference**: Reference to the last processed event
+- **lastEventReference**: Reference to the last processed event (cursor position — the event the projector will resume after on the next run)
+- **mostRecentEventReference**: The chronologically newest event seen during this execution. For forward queries this equals `lastEventReference`. For backward queries it points to the first event encountered (which is the newest chronologically). This is useful for optimistic locking when using backward projections
 
 ```java
 ProjectorMetrics metrics = projector.run();
@@ -433,6 +435,7 @@ ProjectorMetrics total = projector.accumulatedMetrics();
 System.out.println("Total events handled: " + total.eventsHandled()); // 110
 System.out.println("Total queries: " + total.queriesDone());
 System.out.println("Current position: " + total.lastEventReference());
+System.out.println("Most recent event: " + total.mostRecentEventReference());
 ```
 
 Accumulated metrics are useful for:

@@ -322,17 +322,17 @@ public class CustomerRegisteredUpcaster
                       CustomerEvent.CustomerRegisteredV2> {
 
     @Override
-    public CustomerEvent.CustomerRegisteredV2 upcast(
+    public List<CustomerEvent.CustomerRegisteredV2> upcast(
             CustomerHistoricalEvent.CustomerRegistered legacy) {
-        return new CustomerEvent.CustomerRegisteredV2(
+        return List.of(new CustomerEvent.CustomerRegisteredV2(
             new Name(legacy.name()),
             Email.unknown()  // Default for new required field
-        );
+        ));
     }
 
     @Override
-    public Class<CustomerEvent.CustomerRegisteredV2> targetType() {
-        return CustomerEvent.CustomerRegisteredV2.class;
+    public Set<Class<? extends CustomerEvent.CustomerRegisteredV2>> targetTypes() {
+        return Set.of(CustomerEvent.CustomerRegisteredV2.class);
     }
 }
 ```
@@ -363,6 +363,68 @@ stream.query(EventQuery.matchAll())
 **Disadvantages:**
 - Upcaster implementations needed for each legacy event type
 - Slight runtime overhead during event deserialization
+
+### Multi-Event Upcasting
+
+The `Upcast` interface supports three patterns through its `List` return type:
+
+**One-to-one** (most common): A legacy event maps to exactly one current event. Wrap the result in `List.of()`:
+
+```java
+@Override
+public List<CustomerEvent.CustomerRegisteredV2> upcast(
+        CustomerHistoricalEvent.CustomerRegistered legacy) {
+    return List.of(new CustomerEvent.CustomerRegisteredV2(
+        new Name(legacy.name()),
+        Email.unknown()
+    ));
+}
+```
+
+**One-to-many (splitting)**: A legacy event is split into multiple current events. This is useful when a coarse-grained historical event needs to be decomposed into finer-grained events:
+
+```java
+public class OrderCreatedUpcaster
+    implements Upcast<OrderHistoricalEvent.OrderCreated,
+                      OrderEvent> {
+
+    @Override
+    public List<OrderEvent> upcast(OrderHistoricalEvent.OrderCreated legacy) {
+        return List.of(
+            new OrderEvent.OrderPlaced(legacy.orderId(), legacy.customerId()),
+            new OrderEvent.OrderLineAdded(legacy.productId(), legacy.quantity())
+        );
+    }
+
+    @Override
+    public Set<Class<? extends OrderEvent>> targetTypes() {
+        return Set.of(OrderEvent.OrderPlaced.class, OrderEvent.OrderLineAdded.class);
+    }
+}
+```
+
+When a stored event produces multiple sub-events, each sub-event shares the same `EventReference` id/position/tx but receives a distinct `index` (0, 1, 2, ...) to maintain ordering.
+
+**One-to-zero (filtering)**: An obsolete legacy event can be filtered out entirely by returning an empty list:
+
+```java
+public class ObsoleteEventUpcaster
+    implements Upcast<LegacyEvent.ObsoleteEvent,
+                      CurrentEvent> {
+
+    @Override
+    public List<CurrentEvent> upcast(LegacyEvent.ObsoleteEvent legacy) {
+        return List.of();  // Event is no longer relevant
+    }
+
+    @Override
+    public Set<Class<? extends CurrentEvent>> targetTypes() {
+        return Set.of();  // No target types
+    }
+}
+```
+
+Filtered events are silently skipped during queries and projection processing. The Projector automatically advances past these "vanished" events.
 
 ### Customizing to your application needs
 

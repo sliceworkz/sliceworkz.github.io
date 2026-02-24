@@ -69,16 +69,22 @@ EventStore exposes the following metrics through Micrometer. All metrics include
 | `typed` | Whether stream uses typed or raw events | `"true"`, `"false"` |
 | `storage` | Storage backend name | `"postgres"`, `"inmemory"` |
 
+Additionally, the `append.event` and `query.event` counters include an `eventtype` tag with the event type name, enabling per-event-type throughput analysis:
+
+| Tag | Description | Example Values |
+|-----|-------------|----------------|
+| `eventtype` | The event type name (on `append.event` and `query.event` only) | `"CustomerRegistered"`, `"OrderPlaced"` |
+
 ### Counters
 
 | Metric Name | Description | Unit |
 |-------------|-------------|------|
 | `sliceworkz.eventstore.stream.create` | Number of event stream objects created | count |
 | `sliceworkz.eventstore.append` | Number of successful append operations | count |
-| `sliceworkz.eventstore.append.event` | Total number of events appended | count |
+| `sliceworkz.eventstore.append.event` | Total number of events appended (tagged with `eventtype`) | count |
 | `sliceworkz.eventstore.append.optimisticlock` | Number of append operations rejected due to optimistic locking conflicts | count |
 | `sliceworkz.eventstore.query` | Number of query operations executed | count |
-| `sliceworkz.eventstore.query.event` | Total number of events retrieved by queries | count |
+| `sliceworkz.eventstore.query.event` | Total number of events retrieved by queries (tagged with `eventtype`) | count |
 | `sliceworkz.eventstore.get.event` | Number of individual event lookups by ID | count |
 | `sliceworkz.eventstore.bookmark.place` | Number of bookmark updates | count |
 | `sliceworkz.eventstore.bookmark.get` | Number of bookmark retrievals | count |
@@ -201,6 +207,12 @@ rate(sliceworkz_eventstore_append_optimisticlock_total[5m])
 ```promql
 rate(sliceworkz_eventstore_append_event_total[5m])
 ```
+
+**Panel: Events Appended per Second by Event Type**
+```promql
+rate(sliceworkz_eventstore_append_event_total[5m])
+```
+Group by `eventtype` label to see the per-event-type breakdown.
 
 **Panel: Highest Event Position by Stream**
 ```promql
