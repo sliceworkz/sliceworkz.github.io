@@ -36,7 +36,7 @@ Add the Eventmodeling BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventmodeling.version>0.2.0</sliceworkz.eventmodeling.version>
+    <sliceworkz.eventmodeling.version>0.3.0</sliceworkz.eventmodeling.version>
 </properties>
 ...
 <dependencyManagement>
@@ -128,7 +128,7 @@ public interface BankingDomain {
 
 The bounded context is the main entry point to your application. Create an interface that extends `BoundedContext`:
 
-Create `BankingBoundedContext.java`:
+Create `Banking.java`:
 
 ```java
 package com.example.banking;
@@ -138,11 +138,15 @@ import com.example.banking.BankingDomain.BankingDomainEvent;
 import com.example.banking.BankingDomain.BankingInboundEvent;
 import com.example.banking.BankingDomain.BankingOutboundEvent;
 
-public interface BankingBoundedContext
+public interface Banking
     extends BoundedContext<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> {
     // This interface provides execute() and read() capabilities
 }
 ```
+
+**Key concepts:**
+- `BoundedContext` itself extends `EventTypes<D,I,O>`, so your context interface acts as a single type parameter that groups all three event types
+- This allows the builder and feature slice APIs to use `Banking` as a single type parameter instead of repeating three event types everywhere
 
 ## Step 4: Create a STATE_CHANGE Feature Slice (Command)
 
@@ -155,13 +159,10 @@ Create `features/openaccount/OpenAccountFeatureSlice.java`:
 ```java
 package com.example.banking.features.openaccount;
 
-import org.sliceworkz.eventmodeling.boundedcontext.BoundedContextBuilder;
 import org.sliceworkz.eventmodeling.slices.FeatureSlice;
 import org.sliceworkz.eventmodeling.slices.FeatureSlice.Type;
-import org.sliceworkz.eventmodeling.slices.FeatureSliceConfiguration;
-import com.example.banking.BankingDomain.BankingDomainEvent;
-import com.example.banking.BankingDomain.BankingInboundEvent;
-import com.example.banking.BankingDomain.BankingOutboundEvent;
+import org.sliceworkz.eventmodeling.slices.Slice;
+import com.example.banking.Banking;
 
 @FeatureSlice(
     type = Type.STATE_CHANGE,
@@ -169,24 +170,7 @@ import com.example.banking.BankingDomain.BankingOutboundEvent;
     chapter = "Account management",
     tags = {"online"}
 )
-public class OpenAccountFeatureSlice
-    implements FeatureSliceConfiguration<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> {
-
-    @Override
-    public void configureCommand(
-        BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
-        // Commands are automatically discovered, no explicit registration needed
-    }
-
-    @Override
-    public void configureQuery(
-        BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
-    }
-
-    @Override
-    public void configureAutomation(
-        BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
-    }
+public class OpenAccountFeatureSlice implements Slice<Banking> {
 }
 ```
 
@@ -194,7 +178,9 @@ public class OpenAccountFeatureSlice
 - `@FeatureSlice` annotation marks this class for automatic discovery
 - `type = Type.STATE_CHANGE` indicates this feature handles commands
 - `context`, `chapter`, and `tags` provide organizational metadata
-- Each feature slice has three configuration methods for commands, queries, and automations
+- Feature slices implement `Slice<C>` with your bounded context type as the type parameter
+- `Slice` provides default no-op implementations for all lifecycle methods, so you only override what you need
+- For `STATE_CHANGE` slices, commands don't need explicit registration
 
 ### 4.2: Create the Command Implementation
 
@@ -263,34 +249,20 @@ package com.example.banking.features.accountdetails;
 import org.sliceworkz.eventmodeling.boundedcontext.BoundedContextBuilder;
 import org.sliceworkz.eventmodeling.slices.FeatureSlice;
 import org.sliceworkz.eventmodeling.slices.FeatureSlice.Type;
-import org.sliceworkz.eventmodeling.slices.FeatureSliceConfiguration;
-import com.example.banking.BankingDomain.BankingDomainEvent;
-import com.example.banking.BankingDomain.BankingInboundEvent;
-import com.example.banking.BankingDomain.BankingOutboundEvent;
+import org.sliceworkz.eventmodeling.slices.Slice;
+import com.example.banking.Banking;
 
 @FeatureSlice(
     type = Type.STATE_READ,
     context = "banking",
     tags = {"online"}
 )
-public class AccountDetailsFeatureSlice
-    implements FeatureSliceConfiguration<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> {
+public class AccountDetailsFeatureSlice implements Slice<Banking> {
 
     @Override
-    public void configureCommand(
-        BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
-    }
-
-    @Override
-    public void configureQuery(
-        BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
+    public void configureQuery(BoundedContextBuilder<Banking> builder) {
         // Register the read model
         builder.readmodel(AccountDetailsReadModel.class);
-    }
-
-    @Override
-    public void configureAutomation(
-        BoundedContextBuilder<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> builder) {
     }
 }
 ```
@@ -389,11 +361,13 @@ import org.sliceworkz.eventstore.EventStoreFactory;
 import org.sliceworkz.eventstore.events.Event;
 import org.sliceworkz.eventstore.events.EventReference;
 import org.sliceworkz.eventstore.infra.inmem.InMemoryEventStorage;
+import org.sliceworkz.eventstore.query.EventQuery;
+import org.sliceworkz.eventstore.query.EventTypesFilter;
+import org.sliceworkz.eventstore.events.Tags;
 import org.sliceworkz.eventstore.spi.EventStorage;
+import org.sliceworkz.eventstore.stream.EventStreamId;
 import com.example.banking.BankingDomain.BankingDomainEvent;
 import com.example.banking.BankingDomain.BankingDomainEvent.AccountOpened;
-import com.example.banking.BankingDomain.BankingInboundEvent;
-import com.example.banking.BankingDomain.BankingOutboundEvent;
 import com.example.banking.features.accountdetails.AccountDetailsReadModel;
 import com.example.banking.features.openaccount.OpenAccountCommand;
 
@@ -409,41 +383,40 @@ public class BankingApplication {
         Instance instance = InstanceFactory.determine("banking-app");
 
         // 3. Build the bounded context
-        BankingBoundedContext bc = BoundedContext.newBuilder(
-                BankingDomainEvent.class,
-                BankingInboundEvent.class,
-                BankingOutboundEvent.class
-            )
+        Banking bc = BoundedContext.newBuilder(Banking.class)
             .name("banking")
             .eventStorage(eventStorage)
             .instance(instance)
             .features()
                 .rootPackage(BankingApplication.class.getPackage())  // Scans for @FeatureSlice
                 .done()
-            .build(BankingBoundedContext.class);
+            .build();
 
-        // 4. Execute a command
+        // 4. Start the bounded context (triggers feature slice lifecycle)
+        bc.start();
+
+        // 5. Execute a command
         DomainConceptId customerId = DomainConceptId.create();
         Optional<EventReference> eventRef = bc.execute(new OpenAccountCommand(customerId));
 
         if (eventRef.isPresent()) {
             System.out.println("Account opened successfully!");
 
-            // 5. Retrieve the event that was raised
+            // 6. Retrieve the event that was raised
             var eventStream = eventStore.getEventStream(
-                org.sliceworkz.eventstore.stream.EventStreamId
-                    .forContext("banking")
-                    .withPurpose("domain"),
+                EventStreamId.forContext("banking").withPurpose("domain"),
                 BankingDomainEvent.class
             );
 
             AccountOpened accountOpened = eventStream
-                .getEventById(eventRef.get().id())
+                .query(EventQuery.forEvents(EventTypesFilter.of(AccountOpened.class), Tags.none()))
+                .filter(e -> e.reference().id().equals(eventRef.get().id()))
                 .map(Event::data)
                 .map(e -> (AccountOpened) e)
+                .findFirst()
                 .get();
 
-            // 6. Query the read model
+            // 7. Query the read model
             AccountDetailsReadModel readModel = bc.read(
                 AccountDetailsReadModel.class,
                 accountOpened.accountId()
@@ -475,7 +448,7 @@ Account opened successfully!
 Account Details:
   Account ID: <generated-uuid>
   Customer ID: <generated-uuid>
-  Open Date: 2025-11-21
+  Open Date: 2026-03-04
 ```
 
 ## Project Structure
@@ -485,14 +458,14 @@ Your final project structure should look like this:
 ```
 src/main/java/com/example/banking/
 ├── BankingDomain.java                           # Event definitions
-├── BankingBoundedContext.java                   # Bounded context interface
+├── Banking.java                                 # Bounded context interface
 ├── BankingApplication.java                      # Main application
 └── features/
     ├── openaccount/
-    │   ├── OpenAccountFeatureSlice.java         # Feature configuration
+    │   ├── OpenAccountFeatureSlice.java         # Feature slice (Slice<Banking>)
     │   └── OpenAccountCommand.java              # Command implementation
     └── accountdetails/
-        ├── AccountDetailsFeatureSlice.java      # Feature configuration
+        ├── AccountDetailsFeatureSlice.java      # Feature slice (Slice<Banking>)
         └── AccountDetailsReadModel.java         # Read model implementation
 ```
 
@@ -506,8 +479,10 @@ Now that you have a working Event Modeling application, you can:
 4. **Create automations** to implement automated activities
 5. **Add translators** to handle inbound events from external systems
 6. **Implement dispatchers** for the outbox pattern to publish outbound events
-7. **Switch to PostgreSQL** for production-ready event storage
-8. **Add observability** with Micrometer metrics for monitoring commands, events, and read models
-9. **Add tests** using the `sliceworkz-eventmodeling-testing` module
+7. **Use adapter/port bindings** to inject infrastructure dependencies into feature slices
+8. **Add feature slice lifecycle hooks** (`startCommand`, `startQuery`, `startAutomation`, `startProjection`) for post-build initialization
+9. **Switch to PostgreSQL** for production-ready event storage
+10. **Add observability** with Micrometer metrics for monitoring commands, events, and read models
+11. **Add tests** using the `sliceworkz-eventmodeling-testing` module
 
 For more examples, see the `sliceworkz-eventmodeling-examples` module in the repository.
