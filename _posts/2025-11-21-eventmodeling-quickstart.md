@@ -36,7 +36,7 @@ Add the Eventmodeling BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventmodeling.version>0.3.0</sliceworkz.eventmodeling.version>
+    <sliceworkz.eventmodeling.version>0.4.1</sliceworkz.eventmodeling.version>
 </properties>
 ...
 <dependencyManagement>
@@ -192,7 +192,6 @@ package com.example.banking.features.openaccount;
 import java.time.LocalDate;
 import org.sliceworkz.eventmodeling.commands.Command;
 import org.sliceworkz.eventmodeling.commands.CommandContext;
-import org.sliceworkz.eventmodeling.commands.CommandResult;
 import org.sliceworkz.eventmodeling.domain.DomainConceptId;
 import org.sliceworkz.eventmodeling.domain.DomainConceptTag;
 import org.sliceworkz.eventstore.events.Tags;
@@ -209,7 +208,7 @@ public class OpenAccountCommand implements Command<BankingDomainEvent> {
     }
 
     @Override
-    public CommandResult<BankingDomainEvent, BankingDomainEvent> execute(
+    public void execute(
         CommandContext<BankingDomainEvent, BankingDomainEvent> context) {
 
         var result = context.noDecisionModels();
@@ -218,7 +217,7 @@ public class OpenAccountCommand implements Command<BankingDomainEvent> {
         DomainConceptId accountId = DomainConceptId.create();
 
         // Raise the AccountOpened event with appropriate tags
-        return result.raiseEvent(
+        result.raiseEvent(
             new AccountOpened(accountId, customerId, LocalDate.now()),
             Tags.of(
                 DomainConceptTag.of(BankingDomain.CONCEPT_ACCOUNT, accountId),
@@ -231,15 +230,95 @@ public class OpenAccountCommand implements Command<BankingDomainEvent> {
 
 **Key concepts:**
 - Commands implement `Command<EVENT_TYPE>`
-- `execute()` method receives a `CommandContext` and returns a `CommandResult`
-- `raiseEvent()` returns the `CommandResult`, allowing fluent return statements
+- `execute()` method receives a `CommandContext` and returns `void`
+- `raiseEvent()` registers the event to be persisted after the command completes
 - Tag events with domain concepts for efficient querying
+- If you need to return a value to the caller (e.g., a generated ID), use `CommandWithResult<EVENT_TYPE, RESPONSE_TYPE>` instead — see Step 5 below
 
-## Step 5: Create a STATE_READ Feature Slice (Read Model)
+## Step 5: Create a STATE_CHANGE with CommandWithResult
+
+Sometimes a command needs to return a value to the caller — for example, a generated ID. `CommandWithResult` allows this while still guaranteeing the response is only delivered after events are persisted.
+
+### 5.1: Create the Feature Slice Configuration
+
+Create `features/openaccountwithresult/OpenAccountWithResultFeatureSlice.java`:
+
+```java
+package com.example.banking.features.openaccountwithresult;
+
+import org.sliceworkz.eventmodeling.slices.FeatureSlice;
+import org.sliceworkz.eventmodeling.slices.FeatureSlice.Type;
+import org.sliceworkz.eventmodeling.slices.Slice;
+import com.example.banking.Banking;
+
+@FeatureSlice(
+    type = Type.STATE_CHANGE,
+    context = "banking",
+    chapter = "Account management",
+    tags = {"online"}
+)
+public class OpenAccountWithResultFeatureSlice implements Slice<Banking> {
+}
+```
+
+### 5.2: Create the CommandWithResult Implementation
+
+Create `features/openaccountwithresult/OpenAccountWithResultCommand.java`:
+
+```java
+package com.example.banking.features.openaccountwithresult;
+
+import java.time.LocalDate;
+import org.sliceworkz.eventmodeling.commands.CommandContext;
+import org.sliceworkz.eventmodeling.commands.CommandWithResult;
+import org.sliceworkz.eventmodeling.domain.DomainConceptId;
+import org.sliceworkz.eventmodeling.domain.DomainConceptTag;
+import org.sliceworkz.eventstore.events.Tags;
+import com.example.banking.BankingDomain;
+import com.example.banking.BankingDomain.BankingDomainEvent;
+import com.example.banking.BankingDomain.BankingDomainEvent.AccountOpened;
+
+public class OpenAccountWithResultCommand
+    implements CommandWithResult<BankingDomainEvent, DomainConceptId> {
+
+    private final DomainConceptId customerId;
+
+    public OpenAccountWithResultCommand(DomainConceptId customerId) {
+        this.customerId = customerId;
+    }
+
+    @Override
+    public DomainConceptId execute(
+        CommandContext<BankingDomainEvent, BankingDomainEvent> context) {
+
+        var result = context.noDecisionModels();
+
+        DomainConceptId accountId = DomainConceptId.create();
+
+        result.raiseEvent(
+            new AccountOpened(accountId, customerId, LocalDate.now()),
+            Tags.of(
+                DomainConceptTag.of(BankingDomain.CONCEPT_ACCOUNT, accountId),
+                DomainConceptTag.of(BankingDomain.CONCEPT_CUSTOMER, customerId)
+            )
+        );
+
+        return accountId;  // Returned to caller after events are persisted
+    }
+}
+```
+
+**Key concepts:**
+- `CommandWithResult<EVENT_TYPE, RESPONSE_TYPE>` allows returning a value from command execution
+- The `execute()` method returns the response type directly
+- The response is only delivered to the caller after events have been successfully persisted
+- The caller receives a `CommandExecutionResult<RESPONSE_TYPE>` containing both the event reference and the response value
+
+## Step 6: Create a STATE_READ Feature Slice (Read Model)
 
 Read models project events into queryable views. We'll create a read model to view account details.
 
-### 5.1: Create the Feature Slice Configuration
+### 6.1: Create the Feature Slice Configuration
 
 Create `features/accountdetails/AccountDetailsFeatureSlice.java`:
 
@@ -267,7 +346,7 @@ public class AccountDetailsFeatureSlice implements Slice<Banking> {
 }
 ```
 
-### 5.2: Create the Read Model Implementation
+### 6.2: Create the Read Model Implementation
 
 Create `features/accountdetails/AccountDetailsReadModel.java`:
 
@@ -342,7 +421,7 @@ public class AccountDetailsReadModel implements ReadModel<BankingDomainEvent> {
 - `when()` method handles each event to build up the model's state
 - Read models are instantiated per query (pass parameters via constructor)
 
-## Step 6: Build and Initialize the Bounded Context
+## Step 7: Build and Initialize the Bounded Context
 
 Now tie everything together by creating and configuring the bounded context:
 
@@ -351,25 +430,15 @@ Create `BankingApplication.java`:
 ```java
 package com.example.banking;
 
-import java.util.Optional;
 import org.sliceworkz.eventmodeling.boundedcontext.BoundedContext;
+import org.sliceworkz.eventmodeling.commands.CommandExecutionResult;
 import org.sliceworkz.eventmodeling.domain.DomainConceptId;
 import org.sliceworkz.eventmodeling.events.Instance;
 import org.sliceworkz.eventmodeling.events.InstanceFactory;
-import org.sliceworkz.eventstore.EventStore;
-import org.sliceworkz.eventstore.EventStoreFactory;
-import org.sliceworkz.eventstore.events.Event;
-import org.sliceworkz.eventstore.events.EventReference;
 import org.sliceworkz.eventstore.infra.inmem.InMemoryEventStorage;
-import org.sliceworkz.eventstore.query.EventQuery;
-import org.sliceworkz.eventstore.query.EventTypesFilter;
-import org.sliceworkz.eventstore.events.Tags;
 import org.sliceworkz.eventstore.spi.EventStorage;
-import org.sliceworkz.eventstore.stream.EventStreamId;
-import com.example.banking.BankingDomain.BankingDomainEvent;
-import com.example.banking.BankingDomain.BankingDomainEvent.AccountOpened;
 import com.example.banking.features.accountdetails.AccountDetailsReadModel;
-import com.example.banking.features.openaccount.OpenAccountCommand;
+import com.example.banking.features.openaccountwithresult.OpenAccountWithResultCommand;
 
 public class BankingApplication {
 
@@ -377,7 +446,6 @@ public class BankingApplication {
 
         // 1. Create event storage (in-memory for this example)
         EventStorage eventStorage = InMemoryEventStorage.newBuilder().build();
-        EventStore eventStore = EventStoreFactory.get().eventStore(eventStorage);
 
         // 2. Create an instance identifier (for multi-tenancy/deployment)
         Instance instance = InstanceFactory.determine("banking-app");
@@ -395,45 +463,31 @@ public class BankingApplication {
         // 4. Start the bounded context (triggers feature slice lifecycle)
         bc.start();
 
-        // 5. Execute a command
+        // 5. Execute a command that returns a result
         DomainConceptId customerId = DomainConceptId.create();
-        Optional<EventReference> eventRef = bc.execute(new OpenAccountCommand(customerId));
+        CommandExecutionResult<DomainConceptId> result =
+            bc.execute(new OpenAccountWithResultCommand(customerId));
 
-        if (eventRef.isPresent()) {
-            System.out.println("Account opened successfully!");
+        DomainConceptId accountId = result.response();
+        System.out.println("Account opened with ID: " + accountId);
 
-            // 6. Retrieve the event that was raised
-            var eventStream = eventStore.getEventStream(
-                EventStreamId.forContext("banking").withPurpose("domain"),
-                BankingDomainEvent.class
-            );
+        // 6. Query the read model
+        AccountDetailsReadModel readModel = bc.read(
+            AccountDetailsReadModel.class,
+            accountId
+        );
 
-            AccountOpened accountOpened = eventStream
-                .query(EventQuery.forEvents(EventTypesFilter.of(AccountOpened.class), Tags.none()))
-                .filter(e -> e.reference().id().equals(eventRef.get().id()))
-                .map(Event::data)
-                .map(e -> (AccountOpened) e)
-                .findFirst()
-                .get();
-
-            // 7. Query the read model
-            AccountDetailsReadModel readModel = bc.read(
-                AccountDetailsReadModel.class,
-                accountOpened.accountId()
-            );
-
-            readModel.getAccountDetails().ifPresent(details -> {
-                System.out.println("Account Details:");
-                System.out.println("  Account ID: " + details.accountId());
-                System.out.println("  Customer ID: " + details.customerId());
-                System.out.println("  Open Date: " + details.openDate());
-            });
-        }
+        readModel.getAccountDetails().ifPresent(details -> {
+            System.out.println("Account Details:");
+            System.out.println("  Account ID: " + details.accountId());
+            System.out.println("  Customer ID: " + details.customerId());
+            System.out.println("  Open Date: " + details.openDate());
+        });
     }
 }
 ```
 
-## Step 7: Run Your Application
+## Step 8: Run Your Application
 
 Build and run your application:
 
@@ -444,11 +498,11 @@ mvn clean compile exec:java -Dexec.mainClass="com.example.banking.BankingApplica
 You should see output similar to:
 
 ```
-Account opened successfully!
+Account opened with ID: <generated-uuid>
 Account Details:
   Account ID: <generated-uuid>
   Customer ID: <generated-uuid>
-  Open Date: 2026-03-04
+  Open Date: 2026-03-22
 ```
 
 ## Project Structure
@@ -464,6 +518,9 @@ src/main/java/com/example/banking/
     ├── openaccount/
     │   ├── OpenAccountFeatureSlice.java         # Feature slice (Slice<Banking>)
     │   └── OpenAccountCommand.java              # Command implementation
+    ├── openaccountwithresult/
+    │   ├── OpenAccountWithResultFeatureSlice.java  # Feature slice (Slice<Banking>)
+    │   └── OpenAccountWithResultCommand.java    # CommandWithResult implementation
     └── accountdetails/
         ├── AccountDetailsFeatureSlice.java      # Feature slice (Slice<Banking>)
         └── AccountDetailsReadModel.java         # Read model implementation
