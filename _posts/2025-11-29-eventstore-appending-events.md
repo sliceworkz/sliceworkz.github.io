@@ -65,7 +65,7 @@ You can also add tags to annotate events with any application-level metadata you
 
 When an event is appended, the EventStore enriches it with metadata:
 
-- **EventReference**: A unique reference containing both a global `EventId` (UUID) and a `position` (sequential number starting at 1)
+- **EventReference**: A unique reference containing both a global `EventId` (UUIDv7) and a `position` (sequential number starting at 1)
 - **Timestamp**: When the event was persisted
 - **Stream**: The `EventStreamId` the event belongs to
 
@@ -86,7 +86,7 @@ System.out.println("Timestamp: " + event.timestamp());
 ### EventReference: A unique reference to your event
 
 The `EventReference` combines identity and ordering:
-- **EventId**: Globally unique identifier (UUID-based)
+- **EventId**: Globally unique identifier (UUIDv7 — time-ordered per [RFC 9562](https://www.rfc-editor.org/rfc/rfc9562#section-5.7), improving B-tree index locality for append-only workloads)
 - **Position**: Sequential position within the stream (starts at 1, unique over all streams stored in the same storage)
 - **Tx**: The transaction during which this event was appended. Primary sort criterion before position
 - **Index**: Sub-event index within a single stored event (0 for regular events, 0..N for events produced by multi-event upcasting)

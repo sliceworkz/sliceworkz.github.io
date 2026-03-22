@@ -350,7 +350,7 @@ stream.query(
 A specific event can be retrieved directly by its `EventId`:
 
 ```java
-EventId eventId = EventId.fromString("550e8400-e29b-41d4-a716-446655440000");
+EventId eventId = EventId.of("550e8400-e29b-41d4-a716-446655440000");
 
 List<Event<CustomerEvent>> events = stream.getEventById(eventId);
 
