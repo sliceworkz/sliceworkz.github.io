@@ -36,7 +36,7 @@ Add the Eventmodeling BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventmodeling.version>0.4.1</sliceworkz.eventmodeling.version>
+    <sliceworkz.eventmodeling.version>0.4.5</sliceworkz.eventmodeling.version>
 </properties>
 ...
 <dependencyManagement>
@@ -72,7 +72,7 @@ Add the Event Modeling implementation and an event storage provider to your `pom
 </dependencies>
 ```
 
-**Note:** For production use, replace `sliceworkz-eventstore-infra-inmem` with `sliceworkz-eventstore-infra-postgres` for PostgreSQL-based event storage.
+**Note:** For production use, replace `sliceworkz-eventstore-infra-inmem` with `sliceworkz-eventstore-infra-postgres` for PostgreSQL-based event storage. For local development with file persistence (events survive restarts without requiring PostgreSQL), use `sliceworkz-eventstore-infra-inmem-fs` instead.
 
 ## Step 2: Define Your Domain Events
 
@@ -538,8 +538,9 @@ Now that you have a working Event Modeling application, you can:
 6. **Implement dispatchers** for the outbox pattern to publish outbound events
 7. **Use adapter/port bindings** to inject infrastructure dependencies into feature slices
 8. **Add feature slice lifecycle hooks** (`startCommand`, `startQuery`, `startAutomation`, `startProjection`) for post-build initialization
-9. **Switch to PostgreSQL** for production-ready event storage
-10. **Add observability** with Micrometer metrics for monitoring commands, events, and read models
-11. **Add tests** using the `sliceworkz-eventmodeling-testing` module
+9. **Use SQL-backed read models** with `SqlReadModelProjector` and `SqlReadModelQuery` for persistent, database-backed read models (supports H2 for development and PostgreSQL for production)
+10. **Switch to PostgreSQL** for production-ready event storage
+11. **Add observability** with Micrometer metrics for monitoring commands, events, and read models
+12. **Add tests** using the `sliceworkz-eventmodeling-testing` module, including `satisfies()` for custom assertions on live model results and `SqlReadModelTest` for testing SQL read models against both H2 and PostgreSQL
 
 For more examples, see the `sliceworkz-eventmodeling-examples` module in the repository.

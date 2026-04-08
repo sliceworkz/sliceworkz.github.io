@@ -43,3 +43,4 @@ It builds upon the <a href="/eventstore/">Sliceworkz Eventstore</a> underneath.
 - Lightweight with **minimal dependencies**
 - **Postgres-based** database storage
 - **In-Memory storage** for development and unit-testing
+- **SQL-backed read models** with built-in support for H2 and PostgreSQL
