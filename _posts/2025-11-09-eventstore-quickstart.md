@@ -32,7 +32,7 @@ Add the EventStore BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventstore.version>0.7.2</sliceworkz.eventstore.version>
+    <sliceworkz.eventstore.version>0.7.5</sliceworkz.eventstore.version>
 </properties>
 ...
 <dependencyManagement>
@@ -70,6 +70,17 @@ For development and testing with in-memory storage:
         <scope>runtime</scope>
     </dependency>
 </dependencies>
+...
+```
+
+For local development with file persistence (events survive restarts without requiring PostgreSQL):
+
+```xml
+...
+<dependency>
+    <groupId>org.sliceworkz</groupId>
+    <artifactId>sliceworkz-eventstore-infra-inmem-fs</artifactId>
+</dependency>
 ...
 ```
 
@@ -115,6 +126,19 @@ import org.sliceworkz.eventstore.infra.inmem.InMemoryEventStorage;
 
 EventStore eventstore = InMemoryEventStorage.newBuilder().buildStore();
 ```
+
+For local development with file persistence:
+
+```java
+import org.sliceworkz.eventstore.EventStore;
+import org.sliceworkz.eventstore.infra.inmem.fs.InMemoryFsEventStorage;
+
+EventStore eventstore = InMemoryFsEventStorage.newBuilder()
+    .directory("eventstore-data")
+    .buildStore();
+```
+
+This stores events and bookmarks as human-readable JSON files on disk. Events are kept in memory for fast access and automatically reloaded on restart. The default directory is `eventstore-data`.
 
 For production with PostgreSQL:
 

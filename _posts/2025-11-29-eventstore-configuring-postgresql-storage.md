@@ -90,6 +90,8 @@ PostgreSQL's LISTEN/NOTIFY requires dedicated, long-lived connections that canno
 
 If you don't provide a separate monitoring DataSource, the regular DataSource is used for both purposes.
 
+The monitoring connections include built-in resilience: if a LISTEN connection drops, it automatically reconnects with exponential backoff (1 second up to 30 seconds) to avoid flooding logs or exhausting the connection pool during database outages.
+
 When connecting to a database through pbBouncer for the monitoring, you will find the realtime notification mechanism not to react to appends immediately, but only after 30 seconds or so.  While this functionally works, your expectations towards eventual consistency keeping up are without a doubt higher than that.
 
 ## Configuring an EventStore-managed DataSource (db.properties)

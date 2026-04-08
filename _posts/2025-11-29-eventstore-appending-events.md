@@ -100,6 +100,32 @@ This way, the `EventReference` provides a great reference to:
 - compare the sequence in which two events have happened, based on their `position` in the stream
 - etc...
 
+### Serializing and Deserializing EventReferences
+
+`EventReference` supports string serialization via `toString()` and `fromString()`, useful for passing references through APIs, storing them in external systems, or logging:
+
+```java
+EventReference ref = events.getLast().reference();
+
+// Serialize to string
+String serialized = ref.toString();
+// Format: "<id>:<tx>:<position>" e.g. "550e8400-e29b-41d4-a716-446655440000:10:42"
+
+// Deserialize back
+EventReference restored = EventReference.fromString(serialized);
+```
+
+For events produced by multi-event upcasting, the index is included as a fourth component:
+
+```java
+// Format with index: "<id>:<tx>:<position>:<index>"
+// e.g. "550e8400-e29b-41d4-a716-446655440000:10:42:3"
+```
+
+When the index is 0 (the common case for non-upcasted events), it is omitted from the string representation.
+
+`fromString()` throws `IllegalArgumentException` if the input is null, blank, has the wrong number of components, or contains non-numeric values where numbers are expected.
+
 EventReference is also crucial for implementing optimistic locking in the DCB pattern. It allows you to note the last relevant event when making a decision, then verify no new relevant facts have emerged when appending the result.
 
 ```java
