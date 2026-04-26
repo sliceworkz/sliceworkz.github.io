@@ -32,7 +32,7 @@ Add the EventStore BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventstore.version>0.7.5</sliceworkz.eventstore.version>
+    <sliceworkz.eventstore.version>0.8.0</sliceworkz.eventstore.version>
 </properties>
 ...
 <dependencyManagement>
@@ -94,6 +94,9 @@ For production use with PostgreSQL, you can replace the inmemory-storage with th
 </dependency>
 ...
 ```
+
+> **PostgreSQL version support.** Sliceworkz Eventstore targets **PostgreSQL 18+** as the default, leveraging the native server-side `uuidv7()` function for event ids. PostgreSQL 13–17 are still supported via a legacy code path that generates UUIDv7 ids in Java; this path requires the optional `com.github.f4b6a3:uuid-creator` dependency to be added explicitly to your application. The correct implementation is selected automatically at startup based on the connected server's major version. See the [PostgreSQL EventStorage guide](/posts/eventstore-configuring-postgresql-storage/#postgresql-version-support-and-uuidv7-generation) for the dependency snippet and details.
+{: .prompt-info }
 
 
 ## Quick Start Example

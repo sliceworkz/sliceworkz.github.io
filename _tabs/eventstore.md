@@ -30,7 +30,7 @@ Sliceworkz Eventstore is an **open source eventstore** implementation in Java.
 
 - **Pure Java** implementation
 - Lightweight with **minimal dependencies**
-- **Postgres-based** database storage
+- **Postgres-based** database storage — defaults to **PostgreSQL 18+** with native server-side `uuidv7()`, with a legacy fallback path for **PostgreSQL 13–17** (auto-detected at startup)
 - **In-Memory storage** for development and unit-testing
 - **File-persisted in-memory storage** for local development without PostgreSQL
 

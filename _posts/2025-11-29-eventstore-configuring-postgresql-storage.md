@@ -38,6 +38,54 @@ To use PostgreSQL as your event storage backend, add the following dependencies 
 
 The PostgreSQL driver is marked as `provided` scope in the library, allowing you to choose your preferred version. HikariCP is used for high-performance connection pooling.
 
+## PostgreSQL Version Support and UUIDv7 Generation
+
+From release `0.8.0` onwards, Sliceworkz Eventstore targets **PostgreSQL 18+** as the default. Event ids are stored as time-ordered `UUIDv7` values (per [RFC 9562](https://www.rfc-editor.org/rfc/rfc9562#section-5.7)), which improves B-tree index locality for append-heavy workloads. The way those ids are generated depends on the server version you connect to:
+
+| PostgreSQL version | UUIDv7 generation         | Implementation                  | Extra runtime dependency      |
+|--------------------|---------------------------|---------------------------------|-------------------------------|
+| **18+** (default)  | Server-side `uuidv7()`    | `PostgresEventStorageImpl`      | none                          |
+| 13–17 (legacy)     | Java-side via `uuid-creator` | `PostgresLegacyEventStorageImpl` | `com.github.f4b6a3:uuid-creator` (must be added explicitly) |
+
+The right implementation is **picked automatically at `build()` time**: `PostgresEventStorage.Builder.build()` borrows a connection, reads `getDatabaseMajorVersion()` and selects the matching impl. The same library binary therefore works against both PG17 and PG18 — no code or property changes required when you upgrade your database.
+
+The chosen path is logged at startup; grep your logs for `uuidv7` to verify which one was selected:
+
+```
+PostgreSQL major version 18 detected — using native server-side uuidv7() via PostgresEventStorageImpl
+```
+
+or, on older servers:
+
+```
+PostgreSQL major version 17 detected — using Java-side uuidv7 generation via PostgresLegacyEventStorageImpl
+```
+
+### Optional `uuid-creator` Dependency (for PostgreSQL 13–17)
+
+Because Java-side UUIDv7 generation is only needed when running against PostgreSQL 13–17, the `com.github.f4b6a3:uuid-creator` dependency is declared as **optional** in `sliceworkz-eventstore-infra-postgres`. Applications targeting **PG18+ only** can ignore it and benefit from a smaller dependency tree.
+
+Applications that may connect to **PG13–17** must declare it explicitly in their `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>com.github.f4b6a3</groupId>
+    <artifactId>uuid-creator</artifactId>
+</dependency>
+```
+
+> The version is managed by `sliceworkz-eventstore-bom`, so you don't need to specify one.
+{: .prompt-info }
+
+If the legacy code path is selected at runtime but `uuid-creator` is **missing** from the classpath, `Builder.build()` fails fast with an `EventStorageException` whose message tells you exactly how to remediate:
+
+> `… — Java-side uuidv7 generation is required, but the optional 'com.github.f4b6a3:uuid-creator' dependency is missing from the classpath. Either add it to your application's build (see PostgresEventStorage Javadoc for the dependency snippet), or upgrade the PostgreSQL server to version 18+ for native uuidv7() support.`
+
+This means you only ever pay for the dependency on the deployments that actually need it.
+
+> **Future-proofing.** Once PostgreSQL 17 reaches end of support and your deployments have moved to PG18+, the legacy path (and the `uuid-creator` dependency) can simply be dropped from your build. The library continues to function unchanged — `PostgresEventStorageImpl` remains the sole implementation under PG18+.
+{: .prompt-tip }
+
 ## Using Your Own DataSource
 
 If your application already manages database connections, pass your existing `DataSource` to the builder:

@@ -41,6 +41,6 @@ It builds upon the <a href="/eventstore/">Sliceworkz Eventstore</a> underneath.
 
 - **Pure Java** implementation
 - Lightweight with **minimal dependencies**
-- **Postgres-based** database storage
+- **Postgres-based** database storage — defaults to **PostgreSQL 18+** (native server-side `uuidv7()`), with a legacy fallback path for **PostgreSQL 13–17** auto-detected at startup
 - **In-Memory storage** for development and unit-testing
 - **SQL-backed read models** with built-in support for H2 and PostgreSQL
