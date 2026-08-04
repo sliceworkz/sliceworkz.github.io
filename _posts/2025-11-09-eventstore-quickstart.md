@@ -182,7 +182,7 @@ It also takes the sealed interfaces class as a parameter to allow typed access t
 All events in the EventStore are of course organised sequentially, an EventStream is actually a subset of the Events in the overall Event history managed by the Eventstore.
 
 
-This example allows to append and query CustomerEvents in an EventStream dedicated to that Customer:
+This example opens a stream in the `customer` context and gives typed access to the CustomerEvents in it:
 
 ```java
 import org.sliceworkz.eventstore.stream.EventStream;
@@ -192,7 +192,10 @@ EventStreamId streamId = EventStreamId.forContext("customer").withPurpose("123")
 EventStream<CustomerEvent> stream = eventstore.getEventStream(streamId, CustomerEvent.class);
 ```
 
-> There are multiple other approaches to working with EventStreams, but this basic approach already allows you to implement a classical eventsourced Aggregate.
+> **A stream is not an aggregate.** It is tempting to read this as "the stream for customer 123" and to rebuild one object per entity from it — the classic aggregate. Resist that. A stream is normally a whole bounded context; consistency comes from the **tags on the events**, not from the boundary of the stream, which is what lets a single decision span facts about several entities at once. The [Dynamic Consistency Boundary](#dynamic-consistency-boundary---optimistic-locking-with-tags) section below shows the shape to aim for, and it is the one this library is built around.
+{: .prompt-warning }
+
+> A `purpose` per entity is also expensive in practice: it is a metric tag, so a purpose per customer means a set of meters per customer. See [bounding meter cardinality](/posts/eventstore-observability-micrometer-prometheus-grafana/#bounding-meter-cardinality-the-purpose-tag). Use a purpose to separate *kinds* of stream within a context, not instances of an entity.
 {: .prompt-info }
 
 ### 4. Append Events
