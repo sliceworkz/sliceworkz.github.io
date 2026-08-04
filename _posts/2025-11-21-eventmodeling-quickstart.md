@@ -74,7 +74,7 @@ Add the Event Modeling implementation and an event storage provider to your `pom
 
 **Note:** For production use, replace `sliceworkz-eventstore-infra-inmem` with `sliceworkz-eventstore-infra-postgres` for PostgreSQL-based event storage. For local development with file persistence (events survive restarts without requiring PostgreSQL), use `sliceworkz-eventstore-infra-inmem-fs` instead.
 
-> **PostgreSQL version support.** From `0.5.0` onwards, EventModeling depends on Eventstore `0.8.0`, which targets **PostgreSQL 18+** by default and uses native server-side `uuidv7()` for event ids. PostgreSQL 13–17 are still supported through a legacy code path that requires the optional `com.github.f4b6a3:uuid-creator` dependency to be added explicitly to your application; the right implementation is picked automatically at startup. See the [PostgreSQL EventStorage guide](/posts/eventstore-configuring-postgresql-storage/#postgresql-version-support-and-uuidv7-generation) for the dependency snippet and runtime behaviour.
+> **PostgreSQL version support.** EventModeling stores its events through Sliceworkz Eventstore, so it inherits that library's database support: the oldest supported PostgreSQL is **16**, and **18+** uses the native server-side `uuidv7()` function for event ids. On 16 and 17 those ids are generated in Java instead, which requires the optional `com.github.f4b6a3:uuid-creator` dependency to be added explicitly to your application; the right implementation is picked automatically at startup. See the [PostgreSQL EventStorage guide](/posts/eventstore-configuring-postgresql-storage/#postgresql-version-support) for the dependency snippet and runtime behaviour.
 {: .prompt-info }
 
 ## Step 2: Define Your Domain Events

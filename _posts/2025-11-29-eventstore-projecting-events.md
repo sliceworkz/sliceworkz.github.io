@@ -309,6 +309,13 @@ The `subscribe()` method configures the projector to register itself as an event
 
 This subscription-based approach is ideal for keeping read models current with minimal latency. The projector automatically handles incremental updates, processing only events since its last run.
 
+> **A subscribed projector keeps its stream alive.** Subscribing registers the stream with the storage, which holds it until the stream is closed — so a subscribed stream that is never closed is retained for the lifetime of the storage. Close the stream when the projection is no longer needed, or close the store, which closes them all. See [Lifecycle and Shutdown](/posts/eventstore-lifecycle/#closing-a-stream).
+{: .prompt-warning }
+
+**A failing projection does not fail the append, and does not retry itself.** `run()` throws a `ProjectorException`, which is contained and logged at ERROR by the notification machinery: the appending caller is never told, other subscribers still get their notification, and nothing replays the notification this projector failed on. It is notified again on the next append.
+
+That is exactly why a subscribed projector doing work that must not be lost should also bookmark its progress — the bookmark, not the notification, is what makes the next run resume from the right place.
+
 Combine subscriptions with bookmarking for resilience across restarts:
 
 ```java
@@ -513,9 +520,12 @@ public class CustomerProjectionService {
         stream.subscribe(this::updateProjection);
     }
 
-	/*
-	 *  This method is called asynchronously each time the 
-	 */	
+    /*
+     * Called asynchronously each time events are appended to the stream.
+     * Returning the reference reached tells the store this listener has caught up;
+     * returning null means the same thing, and is what happens when the run
+     * matched no events.
+     */
     private EventReference updateProjection(EventReference atLeastUntil) {
 
         // Project new events, bookmark is fetched before this run (ref builder instructions above)

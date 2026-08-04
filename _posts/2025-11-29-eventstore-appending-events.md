@@ -28,6 +28,19 @@ stream.append(
 
 The `append()` method returns a list of fully-formed `Event` objects with assigned metadata (reference, position, timestamp).
 
+**That return value is the read-your-own-writes story.** The events come back typed, with their assigned references — the same list you would otherwise have had to query back. To act on your own append on the appending thread, write the code after the call rather than subscribing to anything:
+
+```java
+List<Event<CustomerEvent>> written = stream.append(
+    AppendCriteria.none(),
+    Event.of(new CustomerRegistered("John"), Tags.none()));
+
+EventReference justWritten = written.getLast().reference();
+return Response.accepted().header("X-Event-Reference", justWritten.toString()).build();
+```
+
+Note that `append` deserializes the events it just wrote in order to return them. A payload that serializes but cannot be read back therefore fails *here*, as an `EventDeserializationException`, with the event already stored — see [Error Handling](/posts/eventstore-error-handling/).
+
 ## Adding Tags
 
 Tags are key-value pairs that enable dynamic querying and correlation of events across different event types. They are central to the Dynamic Consistency Boundary (DCB) pattern.
@@ -60,6 +73,34 @@ Stream<Event<CustomerEvent>> customerEvents = stream.query(
 
 You can also add tags to annotate events with any application-level metadata you need, but that you don't like to put in your event definition payloads.
 
+### What a Tag May Contain
+
+A tag is stored and matched as a single flattened string, `"key:value"` — that string form is the wire format, not a debugging rendering. The PostgreSQL backend stores it in a `text[]` column and answers a tag query with array containment built from the same rendering.
+
+**Construction therefore rejects the shapes that would not survive that round trip.** `Tag.of(...)` throws `IllegalArgumentException` for:
+
+| Rejected | Why |
+|---|---|
+| a `':'` in the **key** — `Tag.of("a:b", "c")` | renders to `"a:b:c"`, which is also what `Tag.of("a", "b:c")` renders to: two logical tags, one stored string |
+| leading or trailing whitespace on either half | the read path strips it, so it would not come back as written |
+| an empty key or value | the read path maps an empty half to `null` |
+| a tag with neither key nor value | renders as `""` and reads back as nothing |
+
+Values may contain `':'` freely — parsing splits on the first colon only — and whitespace *inside* a key or value is fine. `Tag.of(null, "v")` stays legal.
+
+```java
+Tags.of("customer", "123")            // fine
+Tags.of("url", "https://example.com") // fine — colons in the value are allowed
+Tag.of("na:me", "x")                  // IllegalArgumentException — colon in the key
+Tag.of("name", " x ")                 // IllegalArgumentException — padded value
+```
+
+Whitespace is rejected rather than silently stripped so the mistake surfaces where it is made. Code handling untrusted input should `strip()` before constructing a tag.
+
+What this buys is that **a tag read off an event is the tag that was appended** — which matters, because re-tagging a new event with a tag read back from an old one is an ordinary pattern.
+
+> **Matching is exact containment, never key-prefix.** `Tag.of("customer")` and `Tag.of("customer", "123")` are two different tags, and a query for the first does **not** return events carrying the second. There is no wildcard form. Tag every event with `Tag.of("customer", id)` and query for that; a bare key is a flag, for when the presence of the tag is itself the fact.
+{: .prompt-warning }
 
 ## Appended Event Metadata
 
@@ -192,17 +233,29 @@ try {
 
 ### First Append (Empty Stream)
 
-When appending to an empty stream or when no previous relevant events exist, not EventReference can be obtained and passed:
+When appending to an empty stream, or when no previous relevant events exist, there is no `EventReference` to pass — so pass `null`:
 
 ```java
 stream.append(
     AppendCriteria.of(
         EventQuery.forEvents(EventTypesFilter.any(), Tags.of("customer", "123")),
-        null  // No last reference expected
+        null  // decided on an empty result
     ),
     Event.of(new CustomerRegistered("John"), Tags.of("customer", "123"))
 );
 ```
+
+**This is not the same as `AppendCriteria.none()`, and the difference is load-bearing.** An absent reference under a *real* filter means "I decided on an empty stream", which is still a consistency boundary: if any matching event exists, that is a new relevant fact and the append correctly fails with `OptimisticLockingException`. `AppendCriteria.none()` carries no filter at all and skips the check entirely.
+
+```java
+// checked: fails if any event tagged customer=123 exists
+AppendCriteria.of(EventQuery.forEvents(EventTypesFilter.any(), Tags.of("customer", "123")), null);
+
+// unchecked: appends unconditionally
+AppendCriteria.none();
+```
+
+`AppendCriteria.isNone()` is what distinguishes them — it is derived from the filter, independently of the reference. And `expectedLastEventReference()` is **never null** whichever factory produced the criteria: a null is normalised to `Optional.empty()`, so it is always safe to call `.isPresent()` on it.
 
 ## Idempotency
 
@@ -212,7 +265,7 @@ In that case, it is to be expected that the client assumes processing hasn't hap
 
 ### Idempotent append()
 
-The EventStore provides built-in idempotency support through idempotency keys. When appending an event with an idempotency key, if an event with the same key already exists, the append operation is silently ignored and returns an empty list.
+The EventStore provides built-in idempotency support through idempotency keys. When appending an event with an idempotency key, if an event with the same key already exists **on the same stream**, the append operation is silently ignored and returns an empty list.
 
 ```java
 String requestId = "req-2025-01-15-abc123";
@@ -235,6 +288,29 @@ assertEquals(0, events.size());
 ```
 
 **Important**: Idempotency keys can only be used when appending a single event. When appending multiple events in a batch, none of them may have an idempotency key.
+
+#### Keys Are Scoped Per Event Stream
+
+Deduplication is scoped to the logical stream — context **plus** purpose — not to the storage as a whole. The same key used on two unrelated streams does not collide:
+
+```java
+EventStream<OrderEvent>   orders    = eventstore.getEventStream(EventStreamId.forContext("order"),    OrderEvent.class);
+EventStream<InvoiceEvent> invoices  = eventstore.getEventStream(EventStreamId.forContext("invoice"), InvoiceEvent.class);
+
+// both succeed: same key, different streams
+orders.append(AppendCriteria.none(),
+    Event.of(new OrderPlaced("o-1"), Tags.none()).withIdempotencyKey("msg-42"));
+invoices.append(AppendCriteria.none(),
+    Event.of(new InvoiceIssued("i-1"), Tags.none()).withIdempotencyKey("msg-42"));
+```
+
+That is what makes a key drawn from an upstream source — a message id, a request id — usable directly, without prefixing it per context to avoid accidental collisions. It also means deduplication behaviour does not depend on how storage instances or table prefixes happen to be wired at runtime.
+
+On PostgreSQL this is enforced by a partial unique index on `(stream_context, stream_purpose, idempotency_key)`; see [PostgreSQL EventStorage](/posts/eventstore-configuring-postgresql-storage/#using-the-initialization-script).
+
+#### Reading the Key Back
+
+The idempotency key is persisted and surfaced on the SPI-level `StoredEvent` when reading. It is deliberately **not** exposed on the public `Event` record — application code decides idempotency at the boundary where the key comes from, and does not need it back on every event it handles. The key does survive an [import between stores](/posts/eventstore-importing-events/).
 
 ### DCB-style Idempotency
 

@@ -32,7 +32,7 @@ Add the EventStore BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventstore.version>0.8.0</sliceworkz.eventstore.version>
+    <sliceworkz.eventstore.version>0.10.0</sliceworkz.eventstore.version>
 </properties>
 ...
 <dependencyManagement>
@@ -95,8 +95,20 @@ For production use with PostgreSQL, you can replace the inmemory-storage with th
 ...
 ```
 
-> **PostgreSQL version support.** Sliceworkz Eventstore targets **PostgreSQL 18+** as the default, leveraging the native server-side `uuidv7()` function for event ids. PostgreSQL 13–17 are still supported via a legacy code path that generates UUIDv7 ids in Java; this path requires the optional `com.github.f4b6a3:uuid-creator` dependency to be added explicitly to your application. The correct implementation is selected automatically at startup based on the connected server's major version. See the [PostgreSQL EventStorage guide](/posts/eventstore-configuring-postgresql-storage/#postgresql-version-support-and-uuidv7-generation) for the dependency snippet and details.
+> **PostgreSQL version support.** The oldest supported PostgreSQL is **16**; **18+** is what the library is built around, using the native server-side `uuidv7()` function for event ids. On 16 and 17 those ids are generated in Java instead, which requires the optional `com.github.f4b6a3:uuid-creator` dependency to be added explicitly to your application. The right implementation is selected automatically at startup from the connected server's major version. See the [PostgreSQL EventStorage guide](/posts/eventstore-configuring-postgresql-storage/#postgresql-version-support) for the dependency snippet and details.
 {: .prompt-info }
+
+For testing your application against the event store, add the testing module in `test` scope — see [Testing Your Application](/posts/eventstore-testing/):
+
+```xml
+...
+<dependency>
+    <groupId>org.sliceworkz</groupId>
+    <artifactId>sliceworkz-eventstore-testing</artifactId>
+    <scope>test</scope>
+</dependency>
+...
+```
 
 
 ## Quick Start Example
@@ -324,8 +336,8 @@ Ensure no new relevant events exist before appending:
 
 ```java
 import org.sliceworkz.eventstore.events.EventReference;
-import org.sliceworkz.eventstore.exceptions.OptimisticLockingException;
-import java.util.Optional;
+import org.sliceworkz.eventstore.stream.OptimisticLockingException;
+import java.util.List;
 
 // 1. Query current state
 List<Event<CustomerEvent>> events = stream.query(
@@ -384,42 +396,41 @@ This would be useful to update any read models, for example, and realizes eventu
 An example of subscribing to newly appended events:
 
 ```java
-import org.sliceworkz.eventstore.listener.EventStreamEventuallyConsistentAppendListener;
+import org.sliceworkz.eventstore.events.Event;
 import org.sliceworkz.eventstore.events.EventReference;
-import org.sliceworkz.eventstore.utils.Handle;
-import org.sliceworkz.eventstore.query.Limit;
+import org.sliceworkz.eventstore.query.EventQuery;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 // Open read-only stream for all events
 EventStream<Object> stream = eventstore.getEventStream(EventStreamId.anyContext());
 
 // Get reference to last event as starting point
-Handle<EventReference> lastSeen = Handle.of(
+AtomicReference<EventReference> lastSeen = new AtomicReference<>(
     stream.query(EventQuery.matchAll().backwards().limit(1))
           .findFirst()
           .map(Event::reference)
           .orElse(null)
 );
 
-// Subscribe to new appends
-stream.subscribe(new EventStreamEventuallyConsistentAppendListener() {
-    @Override
-    public void eventsAppended(EventReference atLeastUntil) {
-        List<Event<Object>> newEvents = stream.query(
-            EventQuery.matchAll(),
-            lastSeen.get()
-        ).toList();
+// Subscribe to new appends. The listener is a functional interface:
+// it receives the reference appended to at least, and returns the one it reached.
+stream.subscribe(atLeastUntil -> {
+    List<Event<Object>> newEvents = stream.query(EventQuery.matchAll(), lastSeen.get()).toList();
 
-        newEvents.forEach(System.out::println);
+    newEvents.forEach(System.out::println);
 
-        if (!newEvents.isEmpty()) {
-            lastSeen.set(newEvents.getLast().reference());
-        }
-        return lastSeen.get();
+    if (!newEvents.isEmpty()) {
+        lastSeen.set(newEvents.getLast().reference());
     }
+    return lastSeen.get();
 });
 ```
 
 > **Note:** Notifications only tell you that Events were appended to **at least** a certain reference.  By the time you reach out to query new Events, it is perfectly possible that more have been appended.  Additionally, not all Event adds are notified individually per se.
+
+> Subscribing registers the stream with the storage, which then holds it until the stream is closed. Close a subscribed stream when you are done with it — or close the store, which closes them all. See [Lifecycle and Shutdown](/posts/eventstore-lifecycle/).
+{: .prompt-info }
 
 
 ## PostgreSQL Configuration
@@ -476,9 +487,36 @@ EventStorage storage = PostgresEventStorage.newBuilder()
 EventStore eventstore = EventStoreFactory.get().eventStore(storage);
 ```
 
+## Shutting Down
+
+`EventStorage`, `EventStore` and `EventStream` all implement `AutoCloseable`. A store that lives as long as the process needs no explicit close — but one created per tenant, per test or per hot reload does, because the PostgreSQL backend runs monitor threads that keep the whole storage reachable.
+
+```java
+try ( EventStore eventstore = PostgresEventStorage.newBuilder().buildStore() ) {
+    // ... use the store ...
+}   // stops the monitor threads and closes the pools the builder created
+```
+
+`buildStore()` returns a store that owns the storage it created, so closing it closes both. When you build a storage yourself and hand it to several stores, closing a store does **not** close the storage — see [Lifecycle and Shutdown](/posts/eventstore-lifecycle/).
+
 ## Testing
 
-For testing, use the in-memory storage:
+The `sliceworkz-eventstore-testing` module provides a `given / when / then` fixture over a fresh in-memory store:
+
+```java
+@Test
+void studentCannotSubscribeTwice() {
+    EventStoreFixture.inMemory(EventStreamId.forContext("learning"), LearningEvent.class)
+        .given(
+            event(new CourseDefined("abc001", "Java basics", 12)).tagged("course", "abc001"),
+            event(new StudentSubscribed("123", "abc001")).tagged("course", "abc001"))
+        .when(stream -> new Registrations(stream).subscribe("123", "abc001"))
+        .expectResult(false)
+        .expectNoEventsAppended();
+}
+```
+
+Or drive an in-memory store directly, if you prefer to write the assertions yourself:
 
 ```java
 @Test
@@ -498,12 +536,17 @@ void testCustomerNameChange() {
 }
 ```
 
+See [Testing Your Application](/posts/eventstore-testing/) for the full fixture API, including provoking DCB conflicts deterministically.
+
 ## Next Steps
 
 - Read the [DCB Specification](https://dcb.events/specification/) to understand the theoretical foundation
 - Explore the `sliceworkz-eventstore-examples` module for more complex scenarios
-- Review the API documentation for advanced features like projections and point-in-time queries
-- Consider implementing event upcasting for schema evolution
+- Learn about [projections](/posts/eventstore-projecting-events/) and [point-in-time queries](/posts/eventstore-querying-events/#querying-until-a-certain-moment-in-time)
+- Consider implementing [event upcasting](/posts/eventstore-defining-events/#approach-2-upcasting) for schema evolution
+- Understand [which exceptions to retry](/posts/eventstore-error-handling/) before writing your first retry loop
+- Plan [store lifecycle and shutdown](/posts/eventstore-lifecycle/) before going to production
+- Moving an existing store to another backend? See [Importing Events Between Stores](/posts/eventstore-importing-events/)
 
 ## License
 

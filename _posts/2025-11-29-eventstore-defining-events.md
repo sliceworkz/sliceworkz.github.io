@@ -80,6 +80,53 @@ public void when(CustomerEvent event) {
 }
 ```
 
+## Event Type Names Are Wire Format
+
+**An event class's simple name is stored data.** The name written into storage is `Class.getSimpleName()` — there is no annotation, registry or builder hook to override it. That one string is what goes in the stored event type, what `EventTypesFilter` matches on, and what keys the deserializer when reading events back.
+
+Using the *simple* name rather than the fully qualified one is deliberate, and worth knowing about: moving a class to another package, splitting a hierarchy across packages, or reorganising modules changes nothing on disk. **The package is not a wire commitment. The class name is.**
+
+### Renaming an Event Class Breaks Reads of Its History
+
+Stored events are immutable, so every event already written keeps the old name while the renamed class claims a new one. Reads then fail with:
+
+```
+No mapping found for event type 'CustomerRegistered'
+```
+
+Every IDE offers that rename as an ordinary refactor, and nothing at compile time objects. Three ways out, in the order you would normally reach for them:
+
+1. **Don't rename.** Pick the stored name deliberately when the event is created, and treat it afterwards the way you would a database column name.
+2. **Keep the old name alive in code.** Move a class carrying the old name into a legacy hierarchy, annotate it `@LegacyEvent(upcast = ...)`, and upcast it to the renamed class — see [Approach 2: Upcasting](#approach-2-upcasting) below. This leaves storage untouched and is the only option that needs no access to the database, but it costs a permanent extra class plus an upcaster for what was only a rename.
+3. **Rewrite the stored names.** On PostgreSQL this is a valid migration — no foreign key, check constraint or unique index is keyed on the event type:
+
+   ```sql
+   UPDATE <prefix>events SET event_type = 'CustomerEnrolled' WHERE event_type = 'CustomerRegistered';
+   ```
+
+   On a large table, budget for the row and index rewrite, and scope the statement by `stream_context` when the rename applies to one context only. [`EventStoreImporter`](/posts/eventstore-importing-events/) does the same during a copy, if you would rather rebuild the store than mutate it. Either way, history no longer reads exactly as it was written, and the change has to reach every environment, replica and restored backup — plus anything outside this library reading the same table.
+
+### Names Are Global to a Storage, Not Scoped to a Stream
+
+A stream scopes *reads*; it is not part of a type's identity. Two classes with the same simple name in different contexts write indistinguishable event type values into one table.
+
+- **On one stream this fails loudly.** Registering both throws `IllegalArgumentException: duplicate event name Created`. The message names the string only, not the two classes, so grep for the name to find them.
+- **Across streams nothing catches it.** No exception, no warning, at registration or at write time.
+
+**And a read spanning both contexts does not fail cleanly.** A wildcard stream, or a store-wide projection, resolves the payload by name alone. Unknown properties are rejected deliberately, so it looks like a mismatch would be caught — it usually is not. Reading one context's `Created` with the other context's class:
+
+| Reader record vs. stored payload | Outcome |
+|---|---|
+| more components — `Created(id, amount, dept)` reads `{id, amount}` | **succeeds**, `dept` defaulted to null |
+| same component names, different types (`int` → `String`, `int` → `short`) | **succeeds**, coerced |
+| same shape, different meaning | **succeeds**, wrong class |
+| fewer components — `Created(id)` reads `{id, amount}` | throws |
+
+Only the *narrower* reader is protected. The usual outcome is the wrong class silently populated with another context's data, which surfaces as bad numbers in a projection rather than as an error.
+
+> **Practical rule: keep event class simple names unique across an entire storage, not just per stream.** Two bounded contexts sharing a store cannot both have a `Created`, a `StatusChanged` or an `Updated`. Prefix them (`OrderCreated`, `VacancyCreated`) or give each context its own storage. If two contexts must share a name, keep every read scoped to one stream — no wildcard streams, no store-wide projections — and know that nothing enforces that from here on.
+{: .prompt-warning }
+
 ## Erasable Data in the event payload
 
 In principle, Event Sourcing states that events are immutable.  In some situations, however, this conflicts with with functional or non-functional (regulatory, ...) requirements where data needs to be deletable from the system.

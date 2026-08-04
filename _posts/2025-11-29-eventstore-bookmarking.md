@@ -83,6 +83,65 @@ bookmark.ifPresentOrElse(
 
 Returns `Optional.empty()` if no bookmark exists for that reader (first run scenario).
 
+## Retrieving All Bookmarks
+
+`getBookmarks()` returns every bookmark on the stream, with the metadata that `getBookmark()` does not carry:
+
+```java
+public record Bookmark (
+    String reader,             // the reader identifier
+    EventReference reference,  // the position it reached
+    Tags tags,                 // the tags supplied when it was placed
+    Instant updatedAt          // when it was last placed
+) { }
+```
+
+```java
+List<Bookmark> bookmarks = stream.getBookmarks();
+
+bookmarks.forEach(b -> System.out.printf(
+    "%-30s position %-8d updated %s %s%n",
+    b.reader(), b.reference().position(), b.updatedAt(), b.tags()));
+```
+
+This is the API behind an operational view of a system's readers. Where `getBookmark(reader)` answers "where is *this* processor", `getBookmarks()` answers "where is everything, and which of it has stopped moving":
+
+```java
+// which readers have fallen behind the head of the stream?
+EventReference head = stream.query(EventQuery.matchAll().backwards().limit(1))
+                            .findFirst().map(Event::reference).orElse(null);
+
+stream.getBookmarks().stream()
+    .filter(b -> head != null && b.reference().happenedBefore(head))
+    .forEach(b -> LOGGER.warn("reader {} is behind, last moved at {}", b.reader(), b.updatedAt()));
+
+// which readers have not moved in an hour?
+Instant cutoff = Instant.now().minus(Duration.ofHours(1));
+stream.getBookmarks().stream()
+    .filter(b -> b.updatedAt().isBefore(cutoff))
+    .forEach(b -> alertOnStalledReader(b.reader(), b.updatedAt()));
+```
+
+`updatedAt` is stamped at placement time, and `tags` are exactly the tags passed to `placeBookmark(...)` — which is what makes them worth populating with a hostname, an instance id or an application version. A reader that has stopped moving is much easier to chase down when its bookmark says which process last touched it.
+
+Bookmarks placed before the metadata was recorded read back with `Tags.none()` and an epoch `updatedAt`, so a filter on `updatedAt` should tolerate that rather than treat it as a stalled reader.
+
+## Removing a Bookmark
+
+`removeBookmark(reader)` deletes a reader's bookmark and returns the reference it held, or `Optional.empty()` if there was none:
+
+```java
+Optional<EventReference> removed = stream.removeBookmark("customer-analytics");
+```
+
+The usual reason to do this is a **projection rebuild**: dropping the read model and the bookmark together makes the next run replay from the beginning of the stream.
+
+```java
+readModel.truncate();
+stream.removeBookmark("customer-analytics");
+projector.run();                    // replays from the start
+```
+
 ## Typical Usage Scenario
 
 A complete example showing bookmark retrieval, event processing with append listeners, and periodic bookmark updates:
@@ -290,6 +349,5 @@ Some use Cases for Bookmark Listeners:
 - **Waiting for a Reader to process up to a certain point**
 - **Coordinating Multiple Readers**
 - etc ...
-```
 
-Bookmark listeners enable powerful monitoring and coordination patterns for eventually consistent event processing systems.
+Bookmark listeners enable powerful monitoring and coordination patterns for eventually consistent event processing systems. For a point-in-time view of every reader rather than a notification per change, use `getBookmarks()` as shown above.

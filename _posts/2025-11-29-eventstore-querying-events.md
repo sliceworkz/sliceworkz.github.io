@@ -173,6 +173,26 @@ allEvents.forEach(event -> System.out.println(event));
 
 **Important**: This approach can lead to performance and memory problems if the stream contains a large number of events. For long streams, use batched queries (described below) to retrieve events in manageable chunks.
 
+### `query()` Returns a Stream, but It Is Already in Memory
+
+This is the single most important thing to know about querying. `query()` hands back a `java.util.stream.Stream`, but **storage has finished reading by the time it returns**: the whole result set is fetched and the stream iterates a list.
+
+Three consequences follow directly:
+
+- **`findFirst()`, `.limit(10)` and `takeWhile` on the returned stream discard work already done.** They are cheap, but they save nothing at the database.
+- **An unbounded query against a large stream is an `OutOfMemoryError`, not a slow stream.** There is no back-pressure to arrive at. Bound the read with `EventQuery.limit(n)`, which is the limit storage is actually given.
+- **Nothing needs closing.** No database resource is held open behind the stream, so it is safe to abandon half-consumed. (`EventSource.close()` is about subscriptions, not queries.)
+
+```java
+// reads everything matching into heap before returning
+List<Event<CustomerEvent>> all = stream.query(EventQuery.matchAll()).toList();
+
+// reads 500 stored events
+List<Event<CustomerEvent>> page = stream.query(EventQuery.matchAll().limit(500)).toList();
+```
+
+**A full replay is a loop, not one unbounded query.** `Projector` already reads in batches of 500, carrying a cursor between them, and is the right tool for a stream of unknown size. By hand, page with `query(q.limit(n), cursor)` and advance the cursor to the last reference of each page — the pattern shown under [Querying in batches](#querying-in-batches). The unlimited path exists for callers who know their result set is small; it is not a way to process a large stream incrementally.
+
 ## Querying Domain Events on Type and Tags
 
 Events can be filtered by combining event type filters with tags. The matching semantics are:
@@ -268,6 +288,32 @@ while (true) {
 
 The cursor parameter is a technical optimization that tells the store where to start scanning. For forward queries it acts as an "after" cursor; for backward queries it acts as a "before" cursor. It doesn't affect which events match the query, only where the scan begins.
 
+### What a Limit Actually Counts
+
+**`limit(n)` means "read n stored events", and it is pushed into the storage query** — a SQL `LIMIT` on PostgreSQL, a short-circuiting `Stream.limit` in memory. It is not applied to the result after the fact, which is exactly what makes it bound memory as well as output.
+
+A cursor does not change this. `query(q.limit(500), cursor)` reads 500, the same as `query(q)` would with the limit set on `q`. To read to the end of a stream deliberately, pass `Limit.none()` to the three-argument overload.
+
+**Without upcasting, n stored events are n events back. With it, they are not.** An `@Upcast` method may turn one stored event into several or into none, and the limit is spent before it runs:
+
+```java
+// over an event that upcasts into two, this returns TWO events —
+// having read exactly one stored event
+stream.query(EventQuery.matchAll().limit(1)).toList();
+
+// over an event that upcasts into none, it returns ZERO —
+// also having read exactly one stored event
+```
+
+Trimming the surplus would return a fragment of a stored event and leave a cursor pointing into its middle, so the store does not do it. Where you need exactly n events, apply `.limit(n)` to the returned `Stream` — cheap, since those events are already in memory:
+
+```java
+List<Event<CustomerEvent>> exactlyTen =
+    stream.query(EventQuery.matchAll().limit(10)).limit(10).toList();
+```
+
+`Projector` counts stored events for the same reason.
+
 ## Querying backwards
 
 Backward queries return events in reverse chronological order (newest first). The direction is set on the `EventQuery` itself using `backwards()`, and a limit can be set using `limit()`:
@@ -344,6 +390,27 @@ stream.query(
         .until(EventReference.of(someEventId, 10L))
 ).forEach(event -> historicalState.apply(event));
 ```
+
+### How the `until` Boundary Behaves
+
+Three properties are worth being precise about:
+
+**It is inclusive.** The event named by the reference is returned.
+
+**It is direction-independent.** `until` is compared over the total `(tx, position, index)` order, not against the direction of travel, so `.backwards()` returns exactly the same events as forward — just newest first:
+
+```java
+EventQuery upTo = EventQuery.forEvents(EventTypesFilter.any(), Tags.of("customer", "123"))
+                            .until(checkpoint);
+
+List<Event<CustomerEvent>> forward  = stream.query(upTo).toList();
+List<Event<CustomerEvent>> backward = stream.query(upTo.backwards()).toList();
+// same events, opposite order
+```
+
+**It is part of the filter, so it also bounds a consistency boundary.** An `AppendCriteria` built from a query carrying an `until` will not raise `OptimisticLockingException` for an event past that boundary — such an event is, by construction, not a new relevant fact for a decision taken as of that moment.
+
+Note that the ordering compared is the tuple, not the position alone. Positions and transactions are assigned independently, so an event can hold a lower position and a higher transaction than one that committed before it. Comparing positions would silently drop such events.
 
 ## Querying by Event ID
 
@@ -599,16 +666,16 @@ Both queries must have:
 
 Attempting to combine queries with different "until" references throws an `IllegalArgumentException`.
 
-**Compatible direction and limit:**
+**Compatible direction:**
 
-When combining queries, both must have the same direction and the same limit:
+Both queries must have the same direction:
 
 ```java
-// Same direction and limit - OK
+// Same direction - OK
 EventQuery q7 = EventQuery.forEvents(EventTypesFilter.of(CustomerRegistered.class), Tags.none())
-    .backwards().limit(10);
+    .backwards();
 EventQuery q8 = EventQuery.forEvents(EventTypesFilter.of(OrderPlaced.class), Tags.none())
-    .backwards().limit(10);
+    .backwards();
 EventQuery combinedBackward = q7.combineWith(q8); // Success
 
 // Different direction - ERROR
@@ -616,14 +683,23 @@ EventQuery q9 = EventQuery.forEvents(EventTypesFilter.of(CustomerRegistered.clas
 EventQuery q10 = EventQuery.forEvents(EventTypesFilter.of(OrderPlaced.class), Tags.none())
     .backwards();
 // q9.combineWith(q10) throws IllegalArgumentException
+```
 
-// Different limits - ERROR
+**No limits at all:**
+
+A query carrying a limit cannot be combined, even with a query carrying the same limit:
+
+```java
 EventQuery q11 = EventQuery.forEvents(EventTypesFilter.of(CustomerRegistered.class), Tags.none())
     .limit(10);
 EventQuery q12 = EventQuery.forEvents(EventTypesFilter.of(OrderPlaced.class), Tags.none())
-    .limit(20);
-// q11.combineWith(q12) throws IllegalArgumentException
+    .limit(10);
+// q11.combineWith(q12) throws IllegalArgumentException — identical limits are still refused
 ```
+
+The reason is that a shared limit over a union does not preserve what either query meant on its own. Two `backwards().limit(1)` queries each ask for "the most recent event matching *me*"; combined into `(A OR B) limit 1` they ask for "the most recent event matching either", which answers neither. Since there is no correct way to fold them, they are refused rather than quietly reinterpreted.
+
+Combine the queries without limits and apply the limit afterwards, or run them separately.
 
 ### Practical Use Case: Dynamic Consistency Boundary
 
@@ -735,3 +811,55 @@ This matches events where:
 - Event type is `ErrorOccurred` (regardless of tags)
 
 This pattern is useful for debugging: retrieve all events in a specific correlation chain plus any error events.
+
+## Batch-Merging Many Queries
+
+`combineWith` folds two queries you chose yourself. `EventQuery.merge(...)` solves the other problem: you have been handed *x* queries — one per projection, one per decision, one per subscriber — and want to run as few database queries as possible without changing what any of them means.
+
+```java
+List<EventQuery> queries = projections.stream().map(Projection::eventQuery).toList();
+
+MergedEventQueries merged = EventQuery.merge(queries);
+
+System.out.println(queries.size() + " queries folded into " + merged.mergedCount());
+```
+
+`merge` returns a `MergedEventQueries` that records **which merged query absorbed each original**, so results can be re-filtered per original after running the merged set:
+
+```java
+for ( EventQuery mergedQuery : merged.mergedQueries() ) {
+    List<Event<CustomerEvent>> events = stream.query(mergedQuery).toList();
+
+    // one database round-trip serves every original in this group
+    for ( EventQuery original : merged.originalsFor(mergedQuery) ) {
+        List<Event<CustomerEvent>> forThisOne =
+            events.stream().filter(original::matches).toList();
+        dispatch(original, forThisOne);
+    }
+}
+```
+
+`merged.mergedFor(original)` goes the other way, for a caller holding one original query and wanting to know which merged query covers it.
+
+### The Merge Rules
+
+**Unlimited queries are grouped by `(direction, until)`** and folded via `combineWith`. Forward and backward queries never merge with each other, and neither do queries with different `until` boundaries.
+
+**Limited queries are always kept separate.** Each becomes its own merged query, for the reason described above: a shared limit over a union does not preserve per-query semantics.
+
+**A match-all in a group dominates it.** If any query in a group is match-all, the merged query is match-all with that group's direction and until. This guarantees the merged query is a superset of every original, which is what keeps per-original re-filtering correct.
+
+**Duplicate equal queries collapse.** Two identical queries share one entry in the mapping and route identically.
+
+Passing a query to `mergedFor(...)` that was not part of the merge input — or to `originalsFor(...)` a query that is not one of the merged results — throws `IllegalArgumentException`.
+
+### When This Is Worth It
+
+The saving is one database round-trip per group, at the cost of an in-memory filter pass per original. That trade favours merging when many subscribers watch overlapping slices of the same stream, and not when a handful of queries are already disjoint. A useful sanity check is the ratio `merge` reports:
+
+```java
+MergedEventQueries merged = EventQuery.merge(queries);
+if ( merged.mergedCount() == queries.size() ) {
+    // nothing merged — just run them individually
+}
+```
