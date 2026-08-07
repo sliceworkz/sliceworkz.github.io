@@ -260,10 +260,15 @@ public class MyBackend implements EventStoreBackend {
 
     @Override
     public boolean supports ( Capability capability ) {
-        return capability != Capability.IMPORT;   // everything except importEvents
+        return switch ( capability ) {                        // exhaustive on purpose
+            case TABLE_PREFIX, RESULT_LIMIT, LEASE -> true;
+            case IMPORT, RAW_STORAGE_ACCESS        -> false;  // importEvents not implemented
+        };
     }
 }
 ```
+
+The default implementation of `supports` is an exhaustive `switch` too, and that is deliberate: adding a capability to the enum breaks compilation in every backend that overrides it the same way, forcing a decision rather than letting a backend claim support it does not have. Capabilities whose SPI methods default to throwing are `false` by default (`LEASE`), so a backend written before the capability existed *skips* those scenarios instead of failing them.
 
 Backends are discovered with the `ServiceLoader`, so register it:
 
@@ -292,7 +297,7 @@ The TCK scenarios are main classes of the testing module, not test classes of yo
 </plugin>
 ```
 
-Every scenario now runs against your backend. Among what it pins down: basic append and query semantics, tag round-tripping over the full legal character set, the `until` boundary, query limits, concurrent optimistic locking, append-notification granularity, subscription and storage lifecycle, serde failure reporting, and — where supported — importing.
+Every scenario now runs against your backend. Among what it pins down: basic append and query semantics, tag round-tripping over the full legal character set, the `until` boundary, query limits, concurrent optimistic locking, append-notification granularity, subscription and storage lifecycle, serde failure reporting, bookmark rejection of a reference the store never stored, per-batch projector durability, and — where supported — importing and leases.
 
 ### Capabilities
 
@@ -304,6 +309,7 @@ Not every backend supports every optional part of the contract. Scenarios that n
 | `TABLE_PREFIX` | several independent stores can coexist, kept apart by a prefix |
 | `RESULT_LIMIT` | a store can be built with an absolute cap on query result size |
 | `RAW_STORAGE_ACCESS` | a test can reach the underlying storage directly (e.g. a `DataSource`) |
+| `LEASE` | `requestLease(...)`, `releaseLease(...)` and `getLeases()` are implemented — see [Leader Election with Leases](/posts/eventstore-leader-election/) |
 
 ### Writing Your Own Scenarios
 

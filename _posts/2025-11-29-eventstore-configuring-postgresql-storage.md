@@ -143,12 +143,14 @@ What the application role needs depends on the `DatabaseInitMode` it starts with
 Every mode needs these grants at runtime. They come for free when the role created the tables itself; when a DBA created them, they have to be granted:
 
 ```sql
-GRANT SELECT, INSERT                 ON <prefix>events    TO <role>;
-GRANT SELECT, INSERT, UPDATE, DELETE ON <prefix>bookmarks TO <role>;
+GRANT SELECT, INSERT                 ON <prefix>events           TO <role>;
+GRANT SELECT, INSERT, UPDATE, DELETE ON <prefix>bookmarks        TO <role>;
+GRANT SELECT, INSERT, UPDATE         ON <prefix>leases           TO <role>;
+GRANT SELECT, INSERT, UPDATE, DELETE ON <prefix>lease_contenders TO <role>;
 GRANT USAGE                          ON SEQUENCE <prefix>events_event_position_seq TO <role>;
 ```
 
-Events are never updated or deleted — the store only ever appends to that table.
+Events are never updated or deleted — the store only ever appends to that table. Lease rows are never deleted either — a release backdates the heartbeat so the fencing token survives — so the leases table needs no `DELETE`; contender rows *are* pruned, so that table does. See [Leader Election with Leases](/posts/eventstore-leader-election/).
 
 ## Using Your Own DataSource
 
@@ -356,6 +358,51 @@ Beyond the tables, the script creates two `plpgsql` functions and their triggers
 > Identifier length is a real constraint here. PostgreSQL truncates identifiers at 63 bytes, and the 32-character prefix cap keeps the longest generated index name at 61. Do not lengthen the generated names.
 {: .prompt-warning }
 
+### The Bookmarks Table and Its Foreign Key
+
+```sql
+CREATE TABLE IF NOT EXISTS bookmarks (
+    reader TEXT PRIMARY KEY,
+    event_position BIGINT NOT NULL,
+    event_id UUID NOT NULL,
+    event_tx xid8 NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_tags TEXT[] DEFAULT '{}',
+    CONSTRAINT fk_bookmarks_event_id
+        FOREIGN KEY (event_id)
+        REFERENCES events(event_id)
+);
+```
+
+The foreign key is what makes `placeBookmark` reject a reference this store never stored — the realistic mistake being a reference carried over from a *different* store or prefix. The store recognises the violation by the **constraint name** the server reports, exactly as it does for the idempotency index, so renaming it turns a clear `EventStorageException` back into an opaque SQL failure. The in-memory backends enforce the same rule against their own log, so the contract is identical on every backend — see [Bookmarking](/posts/eventstore-bookmarking/#the-reference-must-name-a-stored-event).
+
+### The Lease Tables
+
+Leader election is backed by two tables that sit deliberately **outside** the event log:
+
+```sql
+CREATE TABLE IF NOT EXISTS leases (
+    lease_name TEXT PRIMARY KEY,
+    lease_owner TEXT NOT NULL,
+    priority BIGINT NOT NULL,
+    fencing_token BIGINT NOT NULL,
+    ttl_millis BIGINT NOT NULL,
+    acquired_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    heartbeat_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lease_contenders (
+    lease_name TEXT NOT NULL,
+    contender TEXT NOT NULL,
+    priority BIGINT NOT NULL,
+    ttl_millis BIGINT NOT NULL,
+    heartbeat_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    PRIMARY KEY (lease_name, contender)
+);
+```
+
+Election traffic never touches the events table, takes no lock that any query or append takes, and neither pins nor waits on the `pg_snapshot_xmin` barrier — which is also why a lease is not modelled as events. Writes are serialized per lease by a transaction-scoped advisory lock, and every timestamp in these tables is written and compared with the **database server's clock**. See [Leader Election with Leases](/posts/eventstore-leader-election/).
+
 ### Append Notifications
 
 The trigger on the events table is `AFTER INSERT ... REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT`, and the function emits **one `pg_notify` per distinct stream touched by the statement**, not one per row. A 1000-event append therefore queues one notification per stream rather than 1000.
@@ -402,6 +449,8 @@ DROP TABLE    IF EXISTS PREFIX_bookmarks CASCADE;
 DROP TABLE    IF EXISTS PREFIX_events    CASCADE;
 DROP FUNCTION IF EXISTS PREFIX_notify_event_appended()  CASCADE;
 DROP FUNCTION IF EXISTS PREFIX_notify_bookmark_placed() CASCADE;
+DROP TABLE    IF EXISTS PREFIX_leases           CASCADE;
+DROP TABLE    IF EXISTS PREFIX_lease_contenders CASCADE;
 ```
 
 By replacing all occurrences of "PREFIX_" in these files by e.g. "myapp_", you create a private eventstorage to be used by a specific application.
@@ -475,15 +524,16 @@ EventStore eventStore = PostgresEventStorage.newBuilder()
 
 Validation checks that:
 
-- the required tables exist (`PREFIX_events`, `PREFIX_bookmarks`)
+- the required tables exist (`PREFIX_events`, `PREFIX_bookmarks`, `PREFIX_leases`, `PREFIX_lease_contenders`)
 - every expected column is present, with the right type and nullability
 - the expected indexes exist by name — including `idx_events_stream_tags` and `idx_events_stream_idempotency`
+- the bookmarks foreign key exists by name (`fk_bookmarks_event_id`)
 - the notification functions exist
 - each trigger exists **with the expected orientation** (row-level vs statement-level), not merely by name
 
 If validation fails, an `EventStorageException` names what is missing or misconfigured.
 
-> **What validation does not check.** It verifies that named objects *exist*; it does not check an index's method, columns or uniqueness, a column's default, or a function's body. So an index rebuilt as the wrong kind, or the idempotency index recreated without `UNIQUE`, passes validation. Where a DBA applies the DDL, apply the shipped script rather than hand-written equivalents.
+> **What validation does not check.** It verifies that named objects *exist*; it does not check an index's method, columns or uniqueness, a column's default, a foreign key's delete rule, or a function's body. So an index rebuilt as the wrong kind, or the idempotency index recreated without `UNIQUE`, passes validation. Where a DBA applies the DDL, apply the shipped script rather than hand-written equivalents.
 {: .prompt-warning }
 
 Checking the trigger's orientation is worth the extra query, because the failure it prevents is not loud: a statement-level trigger bound to a row-level function body does not raise in PostgreSQL. It emits a notification with every field null, which becomes a wildcard stream with a zero reference that every concrete subscriber rejects — live updates stop with nothing thrown and nothing logged.
@@ -518,24 +568,7 @@ EventStore eventStore = PostgresEventStorage.newBuilder()
 
 ### Schema Changes That No Mode Applies
 
-`ENSURE` only ever *creates* tables, columns and indexes. Anything needing `ALTER TABLE` — changing a column default, or dropping a constraint — is outside what any mode does, and has to be applied by hand.
-
-Two are worth checking against a schema that was not created by the shipped script:
-
-```sql
--- stream_purpose must default to 'default', matching EventStreamId.DEFAULT_PURPOSE.
--- only affects raw SQL inserts: events written through the library always bind it explicitly
-ALTER TABLE <prefix>events ALTER COLUMN stream_purpose SET DEFAULT 'default';
-
--- idempotency uniqueness must be the per-stream partial index, not a table-wide
--- UNIQUE on the column: a table-wide constraint rejects a key reused on a different stream
-ALTER TABLE <prefix>events DROP CONSTRAINT IF EXISTS <prefix>events_idempotency_key_key;
-CREATE UNIQUE INDEX IF NOT EXISTS <prefix>idx_events_stream_idempotency
-    ON <prefix>events (stream_context, stream_purpose, idempotency_key)
-    WHERE idempotency_key IS NOT NULL;
-```
-
-Neither needs a data migration.
+`ENSURE` only ever *creates* tables, columns and indexes. Anything needing `ALTER TABLE` — changing a column default, altering a constraint, rebuilding an index differently — is outside what any mode does, and has to be applied by hand. Combined with what [validation does not check](#validate), that is the argument for applying the shipped `quickstart.ddl.sql` / `ensure-schema.sql` rather than hand-written equivalents: a schema that differs from it in one of those ways starts cleanly and stays wrong.
 
 > **`VALIDATE` and `NONE` change nothing at all**, including the function bodies — and validation cannot detect a stale body, since it does not compare function source. Where a deployment is pinned to either mode, apply the shipped `quickstart.ddl.sql` / `ensure-schema.sql` as part of the release rather than expecting the application to bring the schema forward.
 {: .prompt-warning }

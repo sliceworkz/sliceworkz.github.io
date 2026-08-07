@@ -76,6 +76,7 @@ Note that this exception is also the mechanism behind [DCB-style idempotency](/p
 - schema validation failing at startup — fatal, and better fixed than retried
 - a query exceeding the configured `resultLimit` — a query-design problem, not a transient one
 - the LISTEN/NOTIFY channels failing to establish within the startup deadline — see [Lifecycle and Shutdown](/posts/eventstore-lifecycle/)
+- `placeBookmark` with a reference this store never stored — a caller error that a retry cannot clear; nothing is written and the reader's previous bookmark stands. See [Bookmarking](/posts/eventstore-bookmarking/#the-reference-must-name-a-stored-event)
 
 `EventStorageClosedException` is a subclass, and is the one case with no ambiguity: every read and write on a closed storage or store throws it, permanently. There is no reopening. If you see it, something closed a store that is still in use — usually a shutdown hook running while requests are still in flight.
 
@@ -174,6 +175,8 @@ try {
 
 > `ProjectorException.getEventReference()` is the last event **handled**, and the offending event never reached the projection. When the cause is a deserialization failure, `EventDeserializationException.getReference()` is the one that names the culprit.
 {: .prompt-warning }
+
+A `BatchAwareProjection` whose `afterBatch` throws — a commit that failed — arrives the same way: a `ProjectorException` carrying that failure as its cause. The batch did not land, so the projector's cursor goes back to where the batch started and those events are offered again on the next run. If the rollback in `cancelBatch` *also* threw, that second failure is attached as a **suppressed** exception rather than replacing the cause, so `getCause()` still names what actually went wrong. See [Batch-Aware Projections](/posts/eventstore-projecting-events/#what-the-batch-boundary-guarantees).
 
 ## Failures Inside a Listener
 

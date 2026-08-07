@@ -226,7 +226,7 @@ Projector.from(stream)
     .run();
 ```
 
-The Projector automatically handles pagination—your projection code remains simple regardless of stream size.
+The Projector automatically handles pagination—your projection code remains simple regardless of stream size. The batch boundary is also where a projection can commit its own work and where the bookmark is placed — see [Batch-Aware Projections](#batch-aware-projections).
 
 You can also configure where to start processing:
 
@@ -489,7 +489,7 @@ projector.run();
 The projector automatically:
 1. Reads the bookmark before each run to determine the starting position
 2. Processes events from that position forward
-3. Saves the updated bookmark after processing new events
+3. Saves the updated bookmark **after every batch**, not once at the end of the run — so a catch-up interrupted halfway resumes near where it stopped instead of replaying everything it had already processed
 
 ### Continuous Projection Updates
 
@@ -599,3 +599,77 @@ Projector<CustomerEvent> projector = Projector.from(stream)
 projector.readBookmark();
 projector.run();
 ```
+
+## Batch-Aware Projections
+
+A projection that writes to a durable store of its own usually wants to commit per batch rather than per event. Implement `BatchAwareProjection` instead of `Projection` and the projector calls three extra hooks around each batch — a batch being one query execution, so up to `inBatchesOf(...)` events:
+
+| Hook | When |
+|---|---|
+| `beforeBatch()` | once before the first event of a batch — begin a transaction, take a resource |
+| `afterBatch(Optional<EventReference>)` | after every event of the batch was handled — commit |
+| `cancelBatch()` | when anything threw while processing the batch — roll back |
+
+```java
+class CustomerListProjection implements BatchAwareProjection<CustomerEvent> {
+
+    private final EntityManager em;
+    private EntityTransaction tx;
+
+    @Override
+    public void beforeBatch() {
+        tx = em.getTransaction();
+        tx.begin();
+    }
+
+    @Override
+    public void when(Event<CustomerEvent> event) {
+        if (event.data() instanceof CustomerRegistered reg) {
+            em.persist(new CustomerEntity(reg.id(), reg.name()));
+        }
+    }
+
+    @Override
+    public void afterBatch(Optional<EventReference> lastEventReference) {
+        tx.commit();
+    }
+
+    @Override
+    public void cancelBatch() {
+        if (tx != null && tx.isActive()) {
+            tx.rollback();
+        }
+    }
+
+    @Override
+    public EventQuery eventQuery() {
+        return EventQuery.forEvents(EventTypesFilter.of(CustomerRegistered.class), Tags.none());
+    }
+}
+```
+
+`beforeBatch()` is not called for a batch in which nothing matched the projection's query.
+
+### What the Batch Boundary Guarantees
+
+The projection commits its own work in `afterBatch`; the bookmark saying how far it has come lives in the event store. No transaction spans the two, so the **ordering** is the whole guarantee:
+
+- **The batch is committed first and bookmarked second.** A crash in that window costs a re-projection of one batch, never a silent skip. At-least-once, deliberately in that direction.
+- **Throwing from `afterBatch` means the batch did not land.** The projector treats a failed commit exactly like a failure during processing: it is reported as a `ProjectorException`, and the projector's cursor is taken back to where the batch started, so those events are offered again on the next run. Never swallow a failed commit here — a projection reporting success for work it did not persist loses those events with nothing raised anywhere.
+- **A batch is ended exactly once.** `cancelBatch()` is *not* called after an `afterBatch` that threw, since that projection has already released what it held. And a `cancelBatch()` that throws is logged and attached to the original failure as a **suppressed** exception rather than replacing it, so a poison event whose rollback also failed is still reported as the poison event.
+
+### Being Exactly-Once Against Your Own Store
+
+`afterBatch` is handed the batch's last `EventReference` for one specific reason: where re-projecting a batch would *duplicate* rather than merely repeat work, the projection should hold its own position.
+
+```java
+@Override
+public void afterBatch(Optional<EventReference> lastEventReference) {
+    // same transaction, same store: position and data commit together
+    lastEventReference.ifPresent(ref ->
+        em.merge(new ProjectionCursor("customer-list", ref.toString())));
+    tx.commit();
+}
+```
+
+Resume from that cursor instead of from the event store's bookmark, and the projection's own store becomes the authority on how far it has come — the only way to be exactly-once across two stores that cannot share a transaction. The alternative is to make `when` idempotent, for example by ignoring any event whose position is not higher than the one already recorded alongside the read model.

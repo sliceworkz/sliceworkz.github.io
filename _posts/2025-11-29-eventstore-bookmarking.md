@@ -68,6 +68,21 @@ stream.placeBookmark("my-reader", ref1, Tags.none());
 stream.placeBookmark("my-reader", ref2, Tags.none());
 ```
 
+### The Reference Must Name a Stored Event
+
+A bookmark is a position in *this* store's log, so the reference has to name an event this store actually holds. One it has never seen — in practice a reference carried over from a **different** store or prefix — is a caller error: `placeBookmark` throws an `EventStorageException`, nothing is written, and any bookmark the reader already had stays exactly as it was, reference and tags included.
+
+```java
+// a reference obtained from another store, or fabricated in a test
+stream.placeBookmark("my-reader", referenceFromSomewhereElse, Tags.none());
+// -> EventStorageException; "my-reader" still points where it did before
+```
+
+This is the contract on **every** backend — PostgreSQL enforces it with the `fk_bookmarks_event_id` foreign key, the in-memory backends check their own log — and the TCK pins it per backend. Without it, a miswired multi-store setup poisons a reader's cursor silently, and the reader then resumes from a position that means nothing in the store it is reading.
+
+> The check is on the **event id alone**. The `(transaction, position)` pair that cursor comparisons actually order by is not cross-validated, so a reference pairing a stored id with a wrong position still passes. It says the event exists, not that the cursor is coherent.
+{: .prompt-info }
+
 ## Retrieving a Bookmark
 
 The `getBookmark()` method retrieves the last bookmarked position for a reader:
@@ -261,6 +276,8 @@ Optional<EventReference> bookmark = stream.getBookmark("order-fulfillment");
 ```
 
 Multiple instances can't process the same reader concurrently (sequential processing), but failover enables high availability.
+
+A bookmark says *where* a reader got to; it does not say *which* instance is entitled to move it. Deciding that is what [Leader Election with Leases](/posts/eventstore-leader-election/) is for: the standby instances hold the same reader name and take it over only once the lease says they own it.
 
 **Idempotent Processing with Larger Batches**: When combined with idempotent event handling, bookmarks can be updated less frequently for better performance:
 
