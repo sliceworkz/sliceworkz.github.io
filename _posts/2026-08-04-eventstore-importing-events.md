@@ -39,7 +39,7 @@ A storage deals in `StoredEvent`: an opaque JSON payload plus a type *name*. So 
 - needs **no domain classes on the classpath** — a migration tool does not have to be built against the application
 - does **no serialization round-trip**, so a payload cannot be subtly rewritten by a mapper on the way through
 - does **not upcast**, so legacy events arrive in the target as legacy events, not as their current equivalents
-- does **not re-split `@Erasable` fields** against annotations that may have changed since they were written
+- does **not decrypt**, so a sealed personal-data value moves as ciphertext, without keys and without the right to read it
 
 Going through an `EventStream` instead would rewrite legacy events into current ones and lose the idempotency key, which the public `Event` record does not carry.
 
@@ -63,7 +63,7 @@ source.close();
 | timestamp | **Preserved** |
 | idempotency key | **Preserved**, and still scoped per stream in the target |
 | event type, tags | **Preserved** |
-| immutable and erasable payloads | **Preserved** byte-for-byte |
+| event payload | **Preserved** byte-for-byte, sealed values included |
 | `position` and `tx` | **Reassigned by the target** |
 | `index` | Always 0 at rest — it is a read-time upcasting artifact |
 
@@ -71,6 +71,14 @@ An import reproduces the source *order*, never its ordering numbers. That is mod
 
 > Imported events arrive at new (high) positions carrying old timestamps, so "a later position implies a later timestamp" no longer holds in a store that has absorbed an import.
 {: .prompt-warning }
+
+### Sealed Values Move as Ciphertext, and the Keys Do Not Move With Them
+
+A [`Shreddable`](/posts/eventstore-erasing-personal-data/) value is stored as a sealed envelope inside the ordinary payload — opaque JSON like any other payload as far as an import is concerned. So the copy is verbatim, and needs no keys, no domain classes and no right to read the personal data.
+
+The consequence is the obvious one: **a store imported into a deployment whose key store does not hold those keys reads every protected value as erased.** Migrate the keys alongside the events, or accept the erasure as part of the migration.
+
+That cuts both ways, and the second direction is useful. Seeding an acceptance environment from production by copying the events *without* the keys leaves a history that is complete in every non-personal respect and permanently unreadable in every personal one — which is a stronger guarantee than any scrubbing script, since there is nothing left to scrub around.
 
 ## Import Modes
 
@@ -140,7 +148,7 @@ Some things this makes possible:
     : Optional.of(EventToImport.from(stored)))
 ```
 
-**Rewriting payloads** — `withImmutableData(...)` and `withErasableData(...)` take the raw JSON, so a mechanical schema change can be applied without domain classes.
+**Rewriting payloads** — `withImmutableData(...)` takes the raw JSON, so a mechanical schema change can be applied without domain classes.
 
 Events dropped by the transform are counted in `ImportReport.dropped()`.
 
@@ -215,8 +223,8 @@ EventToImport synthetic = new EventToImport(
     EventStreamId.forContext("customer").withPurpose("123"),
     EventType.ofType("CustomerRegistered"),
     EventId.of(UUID.randomUUID().toString()),
-    "{\"name\":\"John\"}",              // immutable payload
-    null,                                // erasable payload
+    "{\"name\":\"John\"}",              // event payload
+    null,
     Tags.of("customer", "123"),
     LocalDateTime.of(2024, 1, 15, 10, 30),
     null                                 // idempotency key

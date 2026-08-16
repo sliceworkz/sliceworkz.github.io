@@ -5,7 +5,7 @@ title: Defining Events
 description: Defining Domain Events in the Eventstore
 date: 2025-11-29 01:00:00
 categories: [Eventstore Documentation,Eventstore API]
-tags: [events,gdpr,erasable data]
+tags: [events,gdpr,crypto-shredding,personal data]
 ---
 
 This guide covers how to define domain events in your application to use with the Sliceworkz EventStore, As you'll want strongly-typed Events accessible from your event streams. 
@@ -127,179 +127,70 @@ Only the *narrower* reader is protected. The usual outcome is the wrong class si
 > **Practical rule: keep event class simple names unique across an entire storage, not just per stream.** Two bounded contexts sharing a store cannot both have a `Created`, a `StatusChanged` or an `Updated`. Prefix them (`OrderCreated`, `VacancyCreated`) or give each context its own storage. If two contexts must share a name, keep every read scoped to one stream — no wildcard streams, no store-wide projections — and know that nothing enforces that from here on.
 {: .prompt-warning }
 
-## Erasable Data in the event payload
+## Personal Data in the Event Payload
 
-In principle, Event Sourcing states that events are immutable.  In some situations, however, this conflicts with with functional or non-functional (regulatory, ...) requirements where data needs to be deletable from the system.
-The European GDRP (General Data Protection Regulation), for example requires the "right to be forgotten", leading to a functional requirement that any personal data must be deleted from the system.
+Event sourcing says events are immutable. GDPR's right to erasure says personal data must be removable on request. The EventStore reconciles those by **crypto-shredding**: personal data is encrypted in place under a key held for the person it belongs to, and erasure destroys that key rather than touching a stored event.
 
-Therefore, the Eventstore separates event data internally in an immutable and erasable (forgettable) part.  Those are combined for everyday usage, but when the erasable part is deleted, the event lives on with only the immutable data.
-It will be clear that your application logic will need to be able to process events that have been stripped off of this erasable data.
-
-The EventStore library provides annotations to mark personal data fields that must be erasable for GDPR compliance (right to be forgotten). These annotations enable selective data removal while preserving event structure and non-personal metadata.
-
-### The `@Erasable` Annotation
-
-The `@Erasable` annotation marks fields containing personal data that can be completely erased without losing the event's semantic meaning.
+A record component holding personal data is declared `Shreddable<T>` and bound to a `DataSubject`:
 
 ```java
 public record CustomerRegistered(
-    String customerId,           // Not erasable - needed for correlation
-
-    @Erasable
-    String name,                 // Personal data - can be erased
-
-    @Erasable
-    String email,                // Personal data - can be erased
-
-    LocalDateTime registeredAt   // Temporal metadata - not erasable
+    String customerId,                    // pseudonymous — survives erasure
+    Shreddable<String> name,              // personal data
+    Shreddable<String> email,             // personal data
+    LocalDateTime registeredAt            // temporal metadata — not personal
 ) implements CustomerEvent {}
 ```
 
-**After erasure:**
 ```java
-// CustomerRegistered(customerId="123", name=null, email=null, registeredAt=2024-01-15T10:30:00)
+DataSubject alice = DataSubject.of("customer", "alice-42");
+
+stream.append(AppendCriteria.none(), Event.of(
+        new CustomerRegistered("alice-42",
+                               Shreddable.of("Alice Martin", alice),
+                               Shreddable.of("alice@example.org", alice),
+                               LocalDateTime.now()),
+        Tags.of("customer", "alice-42")));
+
+// later
+eventStore.erase(alice, ErasureReason.of("GDPR art.17 request #4711"));
+
+// the event still reads; the personal data does not
+event.data().customerId();                    // "alice-42"
+event.data().name();                          // Shredded[customer/alice-42/default, k-7f2a91c4]
+event.data().name().orElse("[erased]");       // "[erased]"
 ```
 
-### The `@PartlyErasable` Annotation
+The wrapper, rather than an annotation on a plain field, is what makes this work in a record:
 
-The `@PartlyErasable` annotation marks fields containing nested objects that have some (but not all) erasable fields. This signals that erasure logic must recurse into the nested structure.
+- **A shredded value is never `null`**, so a record whose compact constructor validates its components still builds after its data is gone. Nulling a field instead turns any validating event into a *poison event* that fails every query and every projection over its stream, permanently.
+- **"Erased" is distinguishable from "never held any"** — `Shredded` is a state; `null` is not. Nor can a primitive express one, which is why `Shreddable<Integer>` works where an erased `int` would silently read as `0`.
+- **A `Shreddable` anywhere works** — nested records, `List` elements, `Map` values — because it is one serializer on one payload document.
+- **Two data subjects in one event each get their own key**, so erasing one leaves the other readable.
+- **Nothing declared personal can quietly fail to be erasable.** Registering an event type with a `Shreddable` component on a store with no shredding configured fails at `getEventStream`, rather than storing personal data in the clear.
+
+Because personal data is declared in the type system, your obligatory GDPR register of what personal data you hold — and why — is Java reflection over your domain events. Wrap the component in your own annotation to carry the purpose and the retention rule:
 
 ```java
-public record Address(
-    @Erasable
-    String street,          // Personal data
-
-    @Erasable
-    String houseNumber,     // Personal data
-
-    String zipCode,         // Not personal - aggregate data
-    String country          // Geographic metadata
-) {}
-
 public record CustomerRegistered(
     String customerId,
 
-    @Erasable
-    String name,
+    @PersonalData(purpose = "required for personal communication")
+    Shreddable<String> name,
 
-    @PartlyErasable         // Contains some erasable fields
-    Address address
+    @PersonalData(purpose = "required for sending transactional e-mails")
+    Shreddable<String> email,
+
+    @PersonalData(purpose = "sending physical mail")
+    Shreddable<Address> address
+
 ) implements CustomerEvent {}
 ```
 
-**After erasure:**
-```java
-// CustomerRegistered(
-//   customerId="123",
-//   name=null,
-//   address=Address(street=null, houseNumber=null, zipCode="12345", country="USA")
-// )
-```
-
-### When to Use Each Annotation
-
-**Use `@Erasable` when:**
-- The entire field value is personal data
-- The field can be set to `null` or a sentinel value without breaking semantics
-- Examples: name, email, phone number, social security number
-
-**Use `@PartlyErasable` when:**
-- The field contains a complex object (record, class, or collection)
-- Only some nested fields within the object are personal data
-- The structure must be preserved with selective field erasure
-- Examples: address objects, contact information blocks, nested value objects
-
-### Multi-Level Nesting
-
-```java
-public record ContactInfo(
-    @Erasable String email,
-    @Erasable String phone
-) {}
-
-public record Person(
-    @Erasable String name,
-    @PartlyErasable ContactInfo contactInfo
-) {}
-
-public record CustomerRegistered(
-    String customerId,
-    @PartlyErasable Person person
-) implements CustomerEvent {}
-```
-
-### Customizing to your application needs
-
-It could be a good idea to create your own application-level annotation that implies `@Erasable` but adds some documentation fields:
-
-```java
-@Target({ElementType.FIELD, ElementType.RECORD_COMPONENT})
-@Retention(RetentionPolicy.RUNTIME)
-@Erasable
-public @interface GdprErasable {
-    String purpose() default "";
-    Category category() default Category.PERSONAL;
-    
-    enum Category {
-        PERSONAL,      // Name, address, etc.
-        CONTACT,       // Email, phone
-        FINANCIAL,     // Payment info
-        HEALTH,        // Medical data
-        BIOMETRIC      // Fingerprints, facial recognition
-    }
-
-}
-```
-You can then use this annotation instead of `@Erasable`, adding the metadata about each field:
-
-```java
-public sealed interface CustomerEvent {
-	
-public record CustomerRegistered (  
-
-	String id,
-	
-	@GdprErasable(
-		category = Category.CONTACT, 
-		purpose = "required for personal communication")
-	String name,
-	
-	@GdprErasable(
-		category = Category.CONTACT, 
-		purpose = "required for sending transactional e-mails")
-	String email,
-	
-	@PartlyErasable
-	Address address
-	
-	) implements CustomerEvent {
-	
-}
-
-public record Address ( 
-	
-	@GdprErasable(
-		category = Category.PERSONAL, 
-		purpose="sending snail mail")
-	String street,
-	
-	@GdprErasable(
-		category = Category.PERSONAL, 
-		purpose="sending snail mail")
-	String number,
-	
-	String zip ) {
-	
-}
-	
-}
-```
-
-Generating your obligatory GDPR data register that lists all personal data held, along with the rationale for keeping it, now becomes just a matter of Java reflection on your domain events!
-
-> IMPORTANT: ErasableData can be used to "forget" data in your EventStore, but be aware that PII data will probably still exist in your projections and readmodels.
-Make sure to register a domain event that expresses that the right to be forgotten has been used, and remove that data from your readmodels in the projection logic.
+> Shredding erases the personal data **in the event log**. It does not reach your read models, caches, search indexes or downstream systems, and projections hold bookmarks so they never re-read the affected events on their own. Register a domain event expressing that the right to be forgotten was exercised, and remove the data from your read models in the projection logic.
 {: .prompt-warning }
+
+**See [Erasing Personal Data](/posts/eventstore-erasing-personal-data/)** for data subjects and retention categories, configuring a key store per backend, the audit view, and the contract an implementation must not get wrong.
 
 ## Versioning Events
 

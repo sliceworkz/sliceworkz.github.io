@@ -147,10 +147,13 @@ GRANT SELECT, INSERT                 ON <prefix>events           TO <role>;
 GRANT SELECT, INSERT, UPDATE, DELETE ON <prefix>bookmarks        TO <role>;
 GRANT SELECT, INSERT, UPDATE         ON <prefix>leases           TO <role>;
 GRANT SELECT, INSERT, UPDATE, DELETE ON <prefix>lease_contenders TO <role>;
+GRANT SELECT, INSERT, UPDATE         ON <prefix>shredding_keys   TO <role>;
 GRANT USAGE                          ON SEQUENCE <prefix>events_event_position_seq TO <role>;
 ```
 
 Events are never updated or deleted — the store only ever appends to that table. Lease rows are never deleted either — a release backdates the heartbeat so the fencing token survives — so the leases table needs no `DELETE`; contender rows *are* pruned, so that table does. See [Leader Election with Leases](/posts/eventstore-leader-election/).
+
+**The shredding key table needs no `DELETE` either, and deliberately so.** Erasing a data subject *updates* the row: it nulls `key_material` and stamps `shredded_at` and `shredded_reason`. Keeping the row is what leaves the erasure an audit trail — the events themselves record nothing about it — and what lets a key id keep resolving to "erased" rather than to "unknown". Granting `DELETE` here would let an erasure be made untraceable. See [Erasing Personal Data](/posts/eventstore-erasing-personal-data/).
 
 ## Using Your Own DataSource
 
@@ -290,7 +293,7 @@ The recommended approach is to create the database schema manually using DDL scr
 
 ### Using the Initialization Script
 
-The library includes a `quickstart.ddl.sql` script (unprefixed, ready to run) alongside the prefixed `ensure-schema.sql`. Both create the same objects:
+The library includes a `quickstart.ddl.sql` script (unprefixed, ready to run) alongside the prefixed `ensure-schema.sql`. Both create the same objects — the events table, the bookmarks table, the two lease tables, the shredding key table, their indexes, and the notification functions and triggers:
 
 ```sql
 CREATE TABLE IF NOT EXISTS events (
@@ -328,6 +331,8 @@ CREATE TABLE IF NOT EXISTS events (
 ```
 
 The `stream_purpose` default matches `EventStreamId.DEFAULT_PURPOSE`, a public constant — so an interop layer doing raw SQL inserts can bind the same value the library does rather than copy the literal out of a script.
+
+`event_erasable_data` is a reserved, unused column. Schema validation requires it to be present, so leave it in place when applying this DDL by hand.
 
 Five indexes are created on the events table:
 
@@ -403,6 +408,45 @@ CREATE TABLE IF NOT EXISTS lease_contenders (
 
 Election traffic never touches the events table, takes no lock that any query or append takes, and neither pins nor waits on the `pg_snapshot_xmin` barrier — which is also why a lease is not modelled as events. Writes are serialized per lease by a transaction-scoped advisory lock, and every timestamp in these tables is written and compared with the **database server's clock**. See [Leader Election with Leases](/posts/eventstore-leader-election/).
 
+### The Shredding Keys Table
+
+Personal data in event payloads is protected by [crypto-shredding](/posts/eventstore-erasing-personal-data/): values are encrypted under a key held per data subject, and an erasure destroys the key instead of touching an event. `PostgresEventStorage.newBuilder().shredding()` keeps those keys in this store's own database, on the same `DataSource` as the events — so a minted key and the append that seals under it commit together.
+
+```sql
+CREATE TABLE IF NOT EXISTS shredding_keys (
+    key_id TEXT PRIMARY KEY,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    subject_category TEXT NOT NULL,
+    key_material BYTEA,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    shredded_at TIMESTAMP WITH TIME ZONE,
+    shredded_reason TEXT
+);
+
+-- Serves both hot paths: resolving the active key for a subject on append, and finding every key a
+-- subject holds when erasing. Partial on the un-shredded rows, because that is what both look for and
+-- because the shredded rows accumulate for good.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shredding_keys_active
+    ON shredding_keys (subject_type, subject_id, subject_category)
+    WHERE key_material IS NOT NULL;
+
+-- Erasure looks up every key ever minted for a subject, shredded ones included: a subject appended for
+-- after an earlier erasure holds a second key, and missing it would leave that data readable.
+CREATE INDEX IF NOT EXISTS idx_shredding_keys_subject
+    ON shredding_keys (subject_type, subject_id, subject_category);
+```
+
+`key_material` is nullable and that is the whole mechanism: an erasure nulls it, stamps `shredded_at` and `shredded_reason`, and keeps the row. The unique index is partial on `key_material IS NOT NULL`, so a subject holds exactly one *live* key per category while every key it ever held stays on record.
+
+There is deliberately **no foreign key** between this table and the events table, in either direction. Events name their keys through ordinary `dek:` tags; a constraint would either block pruning events or cascade keys away with them — and a cascade here would erase data nobody asked to erase.
+
+#### Migrating a Database Created Before Shredding Existed
+
+`ENSURE` only ever creates tables, so it adds this one on the next start of an existing database and nothing else is needed. A `VALIDATE` or `NONE` deployment, where a DBA applies DDL by hand, needs the three statements above applied with the store's prefix.
+
+There is **no data migration**: the table starts empty, and events written before shredding existed carry no sealed values. Schema validation covers this table like the others, so an un-migrated database is reported at startup rather than at the first erasure request — which is the failure worth catching early, since an erasure with nowhere to destroy anything is a compliance problem rather than an outage.
+
 ### Append Notifications
 
 The trigger on the events table is `AFTER INSERT ... REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT`, and the function emits **one `pg_notify` per distinct stream touched by the statement**, not one per row. A 1000-event append therefore queues one notification per stream rather than 1000.
@@ -439,7 +483,8 @@ CREATE TABLE IF NOT EXISTS PREFIX_events (
     event_tags TEXT[] DEFAULT '{}'
 ) WITH (FILLFACTOR = 100);
 
--- indexes, the btree_gin guard, functions and triggers follow
+-- indexes, the btree_gin guard, functions and triggers follow,
+-- then the bookmarks, lease and shredding key tables
 ```
 
 **`drop-schema.sql`** — teardown for an existing eventstore schema. It drops the functions as well as the tables, because the triggers go with the tables via `CASCADE` but the functions do not:
@@ -451,6 +496,7 @@ DROP FUNCTION IF EXISTS PREFIX_notify_event_appended()  CASCADE;
 DROP FUNCTION IF EXISTS PREFIX_notify_bookmark_placed() CASCADE;
 DROP TABLE    IF EXISTS PREFIX_leases           CASCADE;
 DROP TABLE    IF EXISTS PREFIX_lease_contenders CASCADE;
+DROP TABLE    IF EXISTS PREFIX_shredding_keys   CASCADE;
 ```
 
 By replacing all occurrences of "PREFIX_" in these files by e.g. "myapp_", you create a private eventstorage to be used by a specific application.
@@ -524,7 +570,7 @@ EventStore eventStore = PostgresEventStorage.newBuilder()
 
 Validation checks that:
 
-- the required tables exist (`PREFIX_events`, `PREFIX_bookmarks`, `PREFIX_leases`, `PREFIX_lease_contenders`)
+- the required tables exist (`PREFIX_events`, `PREFIX_bookmarks`, `PREFIX_leases`, `PREFIX_lease_contenders`, `PREFIX_shredding_keys`)
 - every expected column is present, with the right type and nullability
 - the expected indexes exist by name — including `idx_events_stream_tags` and `idx_events_stream_idempotency`
 - the bookmarks foreign key exists by name (`fk_bookmarks_event_id`)

@@ -32,7 +32,7 @@ Add the EventStore BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventstore.version>0.10.1</sliceworkz.eventstore.version>
+    <sliceworkz.eventstore.version>0.10.2</sliceworkz.eventstore.version>
 </properties>
 ...
 <dependencyManagement>
@@ -549,6 +549,7 @@ See [Testing Your Application](/posts/eventstore-testing/) for the full fixture 
 - Consider implementing [event upcasting](/posts/eventstore-defining-events/#approach-2-upcasting) for schema evolution
 - Understand [which exceptions to retry](/posts/eventstore-error-handling/) before writing your first retry loop
 - Plan [store lifecycle and shutdown](/posts/eventstore-lifecycle/) before going to production
+- Holding personal data in your events? See [Erasing Personal Data](/posts/eventstore-erasing-personal-data/) before your first append, since it decides how the events are declared
 - Moving an existing store to another backend? See [Importing Events Between Stores](/posts/eventstore-importing-events/)
 
 ## License

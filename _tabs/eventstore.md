@@ -28,6 +28,7 @@ Sliceworkz Eventstore is an **open source eventstore** implementation in Java.
 - **Idempotent appends** scoped per event stream
 - **Import and migration** between storage backends, preserving event identity
 - **Leader election** on named leases, with fencing tokens and priority-based handover
+- **GDPR erasure by crypto-shredding** — personal data encrypted per data subject, erased by destroying keys, never by rewriting events
 
 ## Technical
 

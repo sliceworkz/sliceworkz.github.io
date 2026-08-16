@@ -22,6 +22,7 @@ Everything is unchecked. Nothing forces a `catch` you did not want.
 | `EventSerializationException` | `…eventstore.events` | `append`, for a payload that cannot be written | **Never** |
 | `EventDeserializationException` | `…eventstore.events` | reading a stored event this stream's mappings cannot read | **Never** |
 | `EventImportConflictException` | `…eventstore.spi` | `importEvents` hitting an existing id or idempotency key | **No** — change the mode or the data |
+| `ShreddingException` | `…eventstore.shredding` | the key store protecting personal data cannot be reached, or an envelope is malformed | **Maybe, with backoff** — an outage clears; a malformed envelope does not |
 | `ProjectorException` | `…eventstore.projection` | a `Projector` run — wraps whatever it caught | inspect `getCause()` |
 | `IllegalArgumentException` | — | a misconfigured `getEventStream(...)` call, an illegal `Tag`, an incompatible query combination | **No** — a code fix |
 
@@ -89,6 +90,22 @@ catch ( EventStorageClosedException e ) {
 ```
 
 `name()` keeps working on a closed storage, so log lines that identify the store do not themselves start throwing.
+
+## Key Store Failures
+
+`ShreddingException` means the key store behind [crypto-shredding](/posts/eventstore-erasing-personal-data/) could not answer: an unreachable Vault, an expired token, a timeout, a corrupt sealed envelope, an algorithm the codec does not implement.
+
+**It is never how an erased value is reported.** A key that has been destroyed is not a failure — it is the mechanism working, and it surfaces as `Shreddable.Shredded` on the event, with the read succeeding. `ShreddingException` is for everything else.
+
+That distinction decides your retry, and it is the reason this exception exists as its own type rather than being folded into deserialization. A key-store outage is transient: the same read succeeds once the store is reachable again. The typed serde therefore rethrows a `ShreddingException` **unwrapped** rather than letting it arrive as an `EventDeserializationException`, which means *never retry*.
+
+```java
+catch ( ShreddingException e ) {
+    // the key store is unhappy — back off and read again; do NOT treat this as erased data
+}
+```
+
+The stakes are highest on the projection side. Projections are at-least-once and advance a bookmark past what they have handled, so an outage misreported as erasure would be written into read models permanently and never revisited. Reported as an exception, the read fails loudly, the bookmark does not move, and the projector recovers on its next run.
 
 ## Payload Failures: Serialization and Deserialization
 

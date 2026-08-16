@@ -279,6 +279,17 @@ src/test/resources/META-INF/services/org.sliceworkz.eventstore.testing.EventStor
 com.example.MyBackend
 ```
 
+If your backend has somewhere durable to keep encryption keys, override `shreddingKeyStore(EventStorage)` so the [shredding](/posts/eventstore-erasing-personal-data/) scenarios exercise *your* key store rather than the in-memory one five times over:
+
+```java
+@Override
+public ShreddingKeyStore shreddingKeyStore ( EventStorage storage ) {
+    return new MyShreddingKeyStore(storage);
+}
+```
+
+The default is `InMemoryShreddingKeyStore`, which every backend can use, so a backend that does not override this still runs the scenarios.
+
 `destroyEventStorage(storage)` defaults to `storage.close()` — the SPI contract already requires that to release everything the storage created and to block until it has, so override it only to release something *you* handed the storage, such as a pool it deliberately will not close.
 
 ### Running the Suite
@@ -297,7 +308,7 @@ The TCK scenarios are main classes of the testing module, not test classes of yo
 </plugin>
 ```
 
-Every scenario now runs against your backend. Among what it pins down: basic append and query semantics, tag round-tripping over the full legal character set, the `until` boundary, query limits, concurrent optimistic locking, append-notification granularity, subscription and storage lifecycle, serde failure reporting, bookmark rejection of a reference the store never stored, per-batch projector durability, and — where supported — importing and leases.
+Every scenario now runs against your backend. Among what it pins down: basic append and query semantics, tag round-tripping over the full legal character set, the `until` boundary, query limits, concurrent optimistic locking, append-notification granularity, subscription and storage lifecycle, serde failure reporting, bookmark rejection of a reference the store never stored, per-batch projector durability, crypto-shredding of personal data against your own key store, and — where supported — importing and leases.
 
 ### Capabilities
 
@@ -342,6 +353,7 @@ class MyStorageQuirksTest extends AbstractEventStoreTest {
 - `storageOptions()` — override to ask the backend for a store with a result limit or a table prefix
 - `createEventStorage()` — override to supply a storage directly instead of going through a backend
 - `waitBecauseOfEventualConsistency(BooleanSupplier)` — an Awaitility helper for asynchronous listener assertions
+- `eventStoreWithShredding()` — a store over the same storage that can protect and erase personal data, built on the key store this backend supplies; `eventStoreWithShredding(ShreddingKeyStore)` takes one of your own, for asserting what an erasure recorded or standing in a key store that fails
 - `dataSource()` — direct database access, where the backend is SQL-backed
 
 `@ForEachBackend(excludingBackends = "...")` opts a backend out for **cost**, not capability — a scenario too slow to run against a particular store. It is also reported as skipped, so the gap stays visible.

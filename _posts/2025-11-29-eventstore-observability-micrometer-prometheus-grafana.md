@@ -82,6 +82,7 @@ Additionally, the `append.event` and `query.event` counters include an `eventtyp
 | `sliceworkz.eventstore.stream.create` | Number of event stream objects created | count |
 | `sliceworkz.eventstore.append` | Number of successful append operations | count |
 | `sliceworkz.eventstore.append.event` | Total number of events appended (tagged with `eventtype`) | count |
+| `sliceworkz.eventstore.append.deduplicated` | Number of events swallowed by storage as idempotency-key duplicates | count |
 | `sliceworkz.eventstore.append.optimisticlock` | Number of append operations rejected due to optimistic locking conflicts | count |
 | `sliceworkz.eventstore.query` | Number of query operations executed | count |
 | `sliceworkz.eventstore.query.event` | Total number of events retrieved by queries (tagged with `eventtype`) | count |
@@ -94,7 +95,7 @@ Additionally, the `append.event` and `query.event` counters include an `eventtyp
 
 | Metric Name | Description | Unit |
 |-------------|-------------|------|
-| `sliceworkz.eventstore.append.duration` | Time taken to append events (including optimistic locking check) | milliseconds |
+| `sliceworkz.eventstore.append.duration` | Time taken by the storage append itself, including the optimistic locking check — serialization and enrichment are outside it | milliseconds |
 | `sliceworkz.eventstore.query.duration` | Time taken to execute queries | milliseconds |
 
 ### Gauges
@@ -103,6 +104,18 @@ Additionally, the `append.event` and `query.event` counters include an `eventtyp
 |-------------|-------------|------|
 | `sliceworkz.eventstore.append.position` | Highest event position appended, per tag set | position |
 | `sliceworkz.eventstore.notifications.up` | Whether a LISTEN/NOTIFY channel is established (1) or not (0) | boolean |
+
+**`append.deduplicated`** exists because de-duplication is otherwise invisible in the meters. A duplicate [idempotency key](/posts/eventstore-appending-events/#dcb-style-idempotency) is swallowed by storage by design: the append succeeds and returns an empty list, nothing throws. But `append` counts *calls* and `append.event` counts *submitted* events, and one call can carry several events — so no subtraction over those two recovers what was dropped, and a caller ingesting through idempotency keys cannot tell "n events ingested" from "n calls, some silently deduplicated".
+
+The counter is incremented by submitted minus stored, on the stored events rather than on the enriched result whose size upcasting can change. It is tagged like the other stream meters and registered eagerly, so the series exists reading 0 from the first stream rather than appearing only once something is dropped — which is what makes it usable in an alert.
+
+```promql
+# ingestion is silently dropping more than 1% of submitted events
+rate(sliceworkz_eventstore_append_deduplicated_total[5m])
+  / rate(sliceworkz_eventstore_append_event_total[5m]) > 0.01
+```
+
+**`append.duration`** measures the storage append alone. Serializing the payload, sealing any protected values and enriching the result sit outside the timer, deliberately mirroring what `query.duration` measures on the read side — so the two are comparable, and a regression in either one names the storage rather than the mapper.
 
 **`append.position`** reads `NaN` until something is appended. Its state is held per tag set **on the store**, not per stream — a gauge cannot be re-registered, and Micrometer holds gauge state weakly, so a per-stream holder would leave the series permanently `NaN` as soon as the first stream for that tag set was collected. That matters in practice, because obtaining a stream per operation is the recommended usage.
 
