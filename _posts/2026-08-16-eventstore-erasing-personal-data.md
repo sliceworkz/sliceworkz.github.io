@@ -5,10 +5,10 @@ title: Erasing Personal Data
 description: Crypto-shredding — protecting personal data with Shreddable values, and erasing it by destroying keys rather than rewriting events
 date: 2026-08-16 01:00:00
 categories: [Eventstore Documentation,Eventstore API]
-tags: [gdpr,crypto-shredding,personal data,erasure,shreddable]
+tags: [gdpr,crypto-shredding,personal data,erasure,shreddable,entitlement]
 ---
 
-This guide covers how the EventStore holds personal data in event payloads, and how it erases that data on request — by destroying an encryption key, never by touching a stored event.
+This guide covers how the EventStore holds personal data in event payloads, how it erases that data on request — by destroying an encryption key, never by touching a stored event — and how a reader that may not see personal data reads the events anyway.
 
 The types you program against — `Shreddable`, `DataSubject`, `ErasureReason`, the two seams and the audit view — live in `org.sliceworkz.eventstore.shredding` in the **api** module, so no extra dependency is needed. The shipped key stores live with the backend they belong to: `org.sliceworkz.eventstore.infra.inmem.shredding`, `…infra.inmem.fs.shredding` and `…infra.postgres.shredding`.
 
@@ -23,8 +23,7 @@ Events are immutable historical facts. GDPR Article 17 gives an individual the r
 **Crypto-shredding takes the other route.** Personal data is encrypted, in place, under a key held for the person it belongs to. Erasure destroys the key. The event is never written to again, so it stays byte-identical wherever it has already been copied — and every one of those copies becomes unreadable at the same instant, with nothing to chase.
 
 ```java
-eventStore.erase(DataSubject.of("customer", "alice-42"),
-                 ErasureReason.of("GDPR art.17 request #4711"));
+eventStore.erase("customer", "alice-42", ErasureReason.of("GDPR art.17 request #4711"));
 ```
 
 That call writes **nothing** to the events table.
@@ -55,12 +54,15 @@ The wrapper does three things at once that no annotation on a plain field can:
 - **It binds that data to a data subject**, so the store knows *whose* it is and can therefore erase it.
 - **It makes "erased" a state the component can actually be in.** A shredded value is never `null`, so a record with a validating compact constructor still builds after its data is gone.
 
-`Shreddable<T>` is a sealed interface with exactly two implementations:
+`Shreddable<T>` is a sealed interface with exactly three implementations:
 
 | | Meaning | Components |
 |---|---|---|
 | `Shreddable.Present<T>` | the key still exists; the value is readable | `T value`, `DataSubject subject` |
 | `Shreddable.Shredded<T>` | the key was destroyed; the value never reads again | `DataSubject subject`, `KeyId key` |
+| `Shreddable.Withheld<T>` | the value exists, and *this reader* may not read it | `DataSubject subject`, `KeyId key` |
+
+A withheld value says nothing about erasure — a reader that may not decrypt a value cannot tell whether it was erased, and is not told. See [Readers That May Not See Personal Data](#readers-that-may-not-see-personal-data).
 
 ## Appending
 
@@ -70,7 +72,7 @@ The caller names whose data it is. The store mints a key per data subject on fir
 DataSubject alice = DataSubject.of("customer", "alice-42");
 DataSubject bob   = DataSubject.of("customer", "bob-77");
 
-payments.append(AppendCriteria.none(), Event.of(
+payments.append(Event.of(
         new TransferMade("t-9001", Money.eur("250.00"), "alice-42", "bob-77",
                          Shreddable.of(new PartyDetails("Alice Martin", "BE68 5390 0754 7034"), alice),
                          Shreddable.of(new PartyDetails("Bob Jansen",   "NL91 ABNA 0417 1643 00"), bob)),
@@ -89,31 +91,35 @@ The common path needs no ceremony:
 String payer = transfer.from().map(PartyDetails::name).orElse("[erased]");
 ```
 
-`Shreddable<T>` carries the small API you would expect — `isPresent()`, `isShredded()`, `toOptional()`, `map(...)`, `orElse(...)`, `orElseGet(...)` — plus `subject()`, which is available **whether or not the value still reads**. That is what lets a projection render `customer alice-42 (erased)` without consulting the key store at all.
+`Shreddable<T>` carries the small API you would expect — `isPresent()`, `isShredded()`, `isWithheld()`, `toOptional()`, `map(...)`, `orElse(...)`, `orElseGet(...)` — plus `subject()`, which is available **whether or not the value still reads**. That is what lets a projection render `customer alice-42 (erased)` without consulting the key store at all. Note that an `orElse("[erased]")` fallback covers a *withheld* value too; where a reader can be denied, render the two apart.
 
-Where the erased case deserves its own rendering, the sealed hierarchy makes the compiler ask:
+Where the erased and withheld cases deserve their own rendering, the sealed hierarchy makes the compiler ask:
 
 ```java
 String payer = switch ( transfer.from() ) {
     case Shreddable.Present<PartyDetails>(var party, var subject) -> party.name();
     case Shreddable.Shredded<PartyDetails>(var subject, var key)  -> "customer " + subject.id() + " (erased)";
+    case Shreddable.Withheld<PartyDetails>(var subject, var key)  -> "customer " + subject.id();
 };
 ```
 
 ## Erasing
 
-`EventStore.erase(subject, reason)` destroys every key held for a data subject and reports what it destroyed:
+`EventStore.erase(type, id, reason)` erases a **person**: it destroys every key held for that data subject, under every category their data was ever written under, and reports what it destroyed:
 
 ```java
-ErasureReport report = eventStore.erase(
-        DataSubject.of("customer", "alice-42"),
+SubjectErasureReport report = eventStore.erase(
+        "customer", "alice-42",
         ErasureReason.of("GDPR art.17 erasure request #4711, approved by DPO 2026-08-16"));
 
-report.keysShredded();   // 1
-report.shreddedKeys();   // [k-7f2a91c4]
-report.shreddedAt();     // 2026-08-16T14:22:07Z
-report.isNoop();         // false
+report.keysShredded();       // 2
+report.shreddedKeys();       // [k-7f2a91c4, k-19be03aa]
+report.categoriesErased();   // [default, marketing]
+report.categories();         // one ErasureReport per category that held live keys, each with its shreddedAt
+report.isNoop();             // false
 ```
+
+That is the erasure to reach for by default. An art.17 request names a person, not a retention category, and whoever answers it should not have to know which categories the person's data was ever written under. It takes a type and an id and no category, so it cannot be narrowed by accident. Erasing one category only is a [separate call](#categories-erasing-part-of-a-subjects-data).
 
 Everything else on the affected events keeps working:
 
@@ -128,6 +134,8 @@ Ledgers still reconcile, correlation still works, and the audit trail still hold
 **`ErasureReason` is not optional and may not be blank.** Shredding leaves the events untouched, so the key store row is the *only* record that an erasure happened, when, and on whose authority. Article 17 makes the erasure the obligation; the accountability principle of Article 5(2) is what makes the record worth keeping. Write something a data protection officer could act on, not `"erased"`.
 
 **Erasure is idempotent.** A subject holding no keys — never appended for, or erased already — reports `isNoop()` rather than failing.
+
+**Erasure is observed**, with the reason, when the store has an [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/): an `Observation.Erase` that completes with the number of keys shredded and the categories erased.
 
 **Data appended *after* an erasure is readable again.** The subject gets a fresh key; only what was sealed under the destroyed ones is gone. Erasing twice therefore destroys two keys, not one, which is why erasure matches on *every* key a subject has ever held rather than only the active one.
 
@@ -159,10 +167,12 @@ DataSubject marketing = DataSubject.of("customer", "alice-42").withCategory("mar
 DataSubject financial = DataSubject.of("customer", "alice-42").withCategory("financial");
 
 // erases the marketing data only; the financial history keeps decrypting
-eventStore.erase(marketing, ErasureReason.of("GDPR art.17 request #4711"));
+ErasureReport report = eventStore.eraseCategory(marketing, ErasureReason.of("marketing opt-out #812"));
 ```
 
-Most events need only `DataSubject.DEFAULT_CATEGORY` (`"default"`), which `DataSubject.of(type, id)` applies. Reach for a category when parts of a subject's data are governed by different retention rules.
+`eraseCategory(subject, reason)` destroys the keys of the category the `DataSubject` names, and no other — reporting success, because the erasure it names was performed. On a subject that also holds `financial` data it leaves that readable, which is right for "erase marketing, retain financial" and **wrong for an art.17 request**: that is `erase(type, id, reason)`. The two take different parameters precisely so that a call meaning one cannot silently become the other.
+
+Most events need only `DataSubject.DEFAULT_CATEGORY` (`"default"`), which `DataSubject.of(type, id)` applies. Reach for a category when parts of a subject's data are governed by different retention rules — or are read by different services, since a category is the unit of [access](#readers-that-may-not-see-personal-data) as well as of erasure. Each category is one more key row per subject and one more key lookup per append that carries it: a handful per subject is the intended scale, not one per field. A category is forward-only: a value sealed under `default` cannot be re-categorised without re-sealing it, which means rewriting the event.
 
 ## Configuring Shredding
 
@@ -188,19 +198,23 @@ EventStore store = InMemoryFsEventStorage.newBuilder()
         .buildStore();
 ```
 
-Or directly on the factory, when you build the store yourself:
+**The codec travels with the storage**, so `build()` honours `.shredding(...)` exactly as `buildStore()` does: a store built on that storage with `EventStore.on(storage).build()` seals and unseals with it. That matters on PostgreSQL in particular, where the no-argument `.shredding()` needs the `DataSource` the builder resolves. A store that must read the same storage differently gives the store builder a codec of its own, which wins:
 
 ```java
-ShreddingCodec codec = AesGcmShreddingCodec.over(new InMemoryShreddingKeyStore());
-EventStore store = EventStoreFactory.get().eventStore(storage, registry, MeterOptions.defaults(), codec);
+PostgresEventStorage storage = PostgresEventStorage.newBuilder().shredding().build();
+
+EventStore store     = EventStore.on(storage).build();                                         // the storage's codec
+EventStore reporting = EventStore.on(storage).shredding(ShreddingCodec.withholdingAll()).build();  // its own
 ```
 
-> **Configuration is required, and it fails fast.** Opening a stream whose registered event types declare a `Shreddable` component on a store with **no** shredding configured throws `IllegalArgumentException` at `getEventStream` — before anything is read or written. Personal data silently stored in the clear is not a failure mode worth having, so this is an error rather than a fallback.
+The storage never seals or unseals anything itself, which is what keeps raw reads, exports and imports seeing the envelope as stored.
+
+> **Configuration is required, and it fails fast.** Opening a stream whose registered event types declare a `Shreddable` component on a store with **no** shredding configured throws `IllegalArgumentException` at `getEventStream` — before anything is read or written. That check reads declarations, so it cannot see a `Shreddable` held behind a component declared as an interface; such a value fails the append instead, as an `EventSerializationException` with nothing stored. Personal data silently stored in the clear is not a failure mode worth having, so both are errors rather than fallbacks.
 {: .prompt-warning }
 
-`erase(...)` on a store with no codec throws `UnsupportedOperationException`: there are no keys to destroy.
+`erase(...)` and `eraseCategory(...)` on a store with no codec throw `UnsupportedOperationException`: there are no keys to destroy.
 
-Pair a file-backed store with a file-backed key store, or the events outlive the keys and every protected value reads as erased after a restart.
+Pair a file-backed store with a file-backed key store, or the events outlive the keys and, after a restart, every read of a protected value throws a `ShreddingException` naming a key the store never held.
 
 ## The Two Seams
 
@@ -218,22 +232,26 @@ PostgresEventStorage.newBuilder().shredding(myHsmCodec).buildStore();        // 
 
 ### The Key Store Contract
 
-- **`keyFor(subject)` creates on first sight and returns the same key afterwards.** It is called once per distinct subject per append, so it must be cheap and safe under concurrency: two threads appending for one subject at the same moment must end up with one key, not two.
-- **`resolve(keyId)` answers empty *only* for a destroyed key.** See below.
-- **`shred(subject, reason)` is idempotent** and returns what it actually destroyed.
-- **Key material is never resurrected.** Destroying a key means the bytes are gone — but keep the row, with the material nulled and the reason and timestamp stamped, so the erasure stays auditable and the key id keeps resolving to *shredded* rather than to *unknown*.
+- **`keyFor(subject)` creates on first sight and returns the same key afterwards.** It is called once per distinct subject per append, so it must be cheap and safe under concurrency: two threads appending for one subject at the same moment must end up with one key, not two. The key it returns must be durable before it is returned.
+- **`resolveKey(keyId)` answers a sealed `KeyResolution`**: `Resolved(key)`, `Erased()` for a key that was destroyed, or `Withheld(reason)` for a key this caller may not have. Anything else — including a key id the store has never held — throws. See below.
+- **`shred(subject, reason)` is idempotent** and returns what it actually destroyed. **`shredAllCategories(type, id, reason)`** is the whole-person erasure; its default throws `UnsupportedOperationException`, so a key store that does not implement it is told, rather than made to erase one category and report success.
+- **Key material is never resurrected.** Destroying a key means the bytes are gone — but keep the row, with the material nulled and the reason and timestamp stamped, so the erasure stays auditable and the key id keeps resolving to *erased* rather than to *unknown*.
 
-### Ordering, When the Key Store Is Not Transactional With the Events
+The outer seam mirrors it: `ShreddingCodec.open(sealed)` answers `Unsealed.Plaintext`, `Unsealed.Erased` or `Unsealed.Withheld`, and throws otherwise. The refusal carries the same name on the key store, the codec and the value, so one word follows a refused key from the key store to the reader.
 
-The key stores shipped with a SQL backend write keys on the same `DataSource` as the events, so a key mint and the append that seals under it commit together. An external key store cannot do that, and then the order is the whole guarantee:
+### A Key Is Committed Before the Event Sealed Under It
 
-**Mint the key first, append second.** A crash between the two leaves an orphan key, which decrypts nothing and costs nothing. The other order leaves an event whose key was never persisted — a value that can never be read, indistinguishable from an erasure nobody asked for.
+`keyFor` runs while the payload is sealed, before the storage is handed anything to append — and the shipped PostgreSQL key store takes a connection of its own for it, even though it writes to the same `DataSource` as the events. No key store puts a key and its event in one transaction; **the order is the guarantee**: mint the key, durable before it is returned, then append.
 
-## Empty Means Erased; Unavailable Means Throw
+A rolled-back or crashed append leaves an orphan key, which decrypts nothing and which the subject's next append seals under. The other order would leave an event whose key was never persisted — a value that can never be read, indistinguishable from an erasure nobody asked for. That cannot happen.
+
+## Erased Means Erased; Unavailable Means Throw
 
 This is the contract that matters most, and the one place an implementation can do real damage.
 
-`ShreddingCodec.unseal` and `ShreddingKeyStore.resolve` return an empty `Optional` **only** when the key has genuinely been destroyed. Every other failure — an unreachable Vault, an expired token, a timeout, a permissions problem, a corrupt envelope, an unsupported algorithm — must throw `ShreddingException`.
+`ShreddingKeyStore.resolveKey` answers `Erased` and `ShreddingCodec.open` answers `Unsealed.Erased` **only** when the key has genuinely been destroyed, and `Withheld` only for a deliberate refusal to this caller. Every other failure — an unreachable Vault, an expired token, a timeout, a corrupt envelope, an unsupported algorithm, **a key id the store has never held** — must throw `ShreddingException`.
+
+The last one deserves its own sentence. A shredded key keeps its row, so every shipped key store can tell "destroyed" from "never seen", and the second means the store is not the one the events were sealed against: the file-backed store pointed at the wrong directory, the PostgreSQL one at the wrong prefix or database, events imported without their keys. Reported as erased, that is the outage failure below applied to the *whole* store at once. The cost is that shredded rows must stay: pruning one turns that subject's events from "erased" into unreadable, with an error naming the key.
 
 Collapse the two and a five-minute key-store outage renders every protected value as erased. Projections are at-least-once and advance a bookmark past what they have handled, so they write those gaps into read models permanently and never revisit them. A transient blip becomes silent, irreversible data loss in every downstream copy.
 
@@ -246,10 +264,10 @@ Reported as an exception instead, the read fails loudly, the bookmark does not m
 Every event carries one `dek:` tag per distinct key its payload was sealed under, so "every event holding data protected by this key" is an ordinary tag query on the existing index — no extra column, no table scan:
 
 ```java
-ErasureReport report = eventStore.erase(alice, ErasureReason.of("art.17 request #4711"));
+SubjectErasureReport report = eventStore.erase("customer", "alice-42", ErasureReason.of("art.17 request #4711"));
 
 for ( KeyId key : report.shreddedKeys() ) {
-    stream.query(EventQuery.forEvents(EventTypesFilter.any(), Tags.of(KeyId.TAG_KEY, key.value())))
+    stream.query(EventQuery.forTags(Tags.of(KeyId.TAG_KEY, key.value())))
           .forEach(…);
 }
 ```
@@ -272,6 +290,8 @@ audit.totals();                                                // subjects with 
 audit.keys(KeyAuditQuery.forSubject("customer", "alice-42"));   // one person, every category
 audit.keys(KeyAuditQuery.all().onlyShredded());                 // the erasure log: what, when, on whose authority
 audit.keys(KeyAuditQuery.all().withCategory("marketing"));      // one retention category across subjects
+audit.categories();                                             // which categories exist, and how much under each
+audit.keys(KeyAuditQuery.forKeys(keysOnAnEvent));               // are the keys this event carries still live?
 ```
 
 A `KeyRecord` reports the key id, the subject, when it was minted, and — for a destroyed key — when and why:
@@ -282,8 +302,10 @@ for ( KeyRecord key : audit.keys(KeyAuditQuery.all().onlyShredded()) ) {
 }
 ```
 
-- **`KeyRecord` carries no key material, and no method here returns any.** That separation is the whole reason this is a second interface rather than another method on `ShreddingKeyStore`: a dashboard credential granted it can see *that* data is protected and *when* it was erased, and never *what* it was. The PostgreSQL implementation does not merely refrain from reading `key_material` — the column is absent from every statement it issues, so key bytes cannot reach a log or a heap dump through this path.
+- **`KeyRecord` carries no key material, and no method here returns any.** That separation is the whole reason this is a second interface rather than another method on `ShreddingKeyStore`: a dashboard credential granted it can see *that* data is protected and *when* it was erased, and never *what* it was. The PostgreSQL implementation does not merely refrain from reading `key_material` — the column is absent from every statement it issues, predicates included ("shredded" is judged by `shredded_at`), so key bytes cannot reach a log or a heap dump through this path, and the audit works for a [reporting role](/posts/eventstore-configuring-postgresql-storage/#a-role-that-must-not-read-personal-data) granted every column but that one.
 - **Every query is bounded, and there is no cursor.** `KeyAuditQuery` always carries a limit, `DEFAULT_LIMIT` being 500. A store running for years holds one row per subject per category and never prunes the shredded ones, and unlike an event query there is nothing to resume from — so an accidental full enumeration is not offered. Widen it explicitly with `withLimit(...)`.
+- **`categories()` is the inventory**: which categories of personal data the store holds, and how much under each (`CategoryTotals`: live subjects, live keys, shredded keys per category, most live subjects first). A category is the unit of erasure *and* of access, and only the key store knows which exist — so this is what an operator reads before deciding which categories a service is [restricted to](#readers-that-may-not-see-personal-data). An erased category stays listed, with zero live keys. Deriving it from `keys()` would be wrong on any store holding more keys than the query's limit, which is why it is a method rather than a recipe.
+- **`KeyAuditQuery.forKeys(Set<KeyId>)` is the join back from an event.** An event carries its keys as `dek:` tags and in each envelope, and nothing else; whether those keys still exist is the key store's to say. A dashboard rendering an event asks for exactly those keys and can tell "protected" from "erased on … because …" without holding a key of its own. On PostgreSQL it is a primary-key lookup; the limit defaults to the number of keys asked for, an empty set is refused, and a key the store never held simply answers nothing.
 - **`forSubject(type, null)` is legal** and narrows to a subject *type*; an id without a type is rejected, because it would match subjects of every type, which is never what is meant.
 - **Which *events* hold data under a key is not answered here** — the key store has never seen an event. That is the `dek:` tag query above.
 - **It is optional, like leases.** A key store fronting a KMS that cannot enumerate returns empty from `audit()` and callers do without. All three shipped key stores implement it.
@@ -299,6 +321,12 @@ So:
 - **A key-encrypting key can be rotated freely**, since that lives inside your own codec or key store and never touches the events. That is where a KMS's rotation story belongs.
 
 A codec must therefore dispatch on `Sealed.alg()` rather than assume its own current choice, and must throw rather than guess when it meets an algorithm it does not implement.
+
+### What the Shipped Codec Refuses When Sealing
+
+`AesGcmShreddingCodec` measures the key it is handed. The JCE encrypts under a 128-, 192- or 256-bit AES key alike, so a key store minting the wrong length would otherwise seal without complaint under an envelope recording `A256GCM`. `seal` refuses a key that is not 256-bit AES material — and one whose material it cannot see at all, an HSM-resident key, which belongs behind a `ShreddingCodec` of its own — with a `ShreddingException` naming the key, nothing sealed. `open` deliberately does not measure: what is sealed is sealed.
+
+The metadata GCM authenticates is the algorithm, key id, subject type, id and category joined with `|`, so `seal` also refuses a `|` in any of those fields — two labels differing only in where the `|` falls would otherwise authenticate as one. Keep subject types, ids and categories free of `|` with this codec.
 
 ### On Post-Quantum
 
@@ -343,10 +371,45 @@ EventStore store = PostgresEventStorage.newBuilder().prefix("acme_").shredding(k
 
 A key that was never seen is deliberately **not** cached as absent, so a shredded key still costs one query per read rather than reporting stale data as readable.
 
+**The cache is bounded in size too**: `DEFAULT_MAX_CACHED_KEYS`, 10.000 entries, least recently used evicted first. The TTL bounds how stale an entry can be, not how many there are, so a process resolving a key per subject over its lifetime — a projection replaying a stream of a million subjects — would otherwise hold every one of them for good. Below the bound nothing changes; above it, a key outside the working set costs one query when it comes round again. The four-argument constructor, `new PostgresShreddingKeyStore(dataSource, prefix, ttl, maxCachedKeys)`, sets the bound for a working set that is genuinely larger.
+
 > **Colocation is a threat-model decision, not a default to accept blindly.** Keys in the same database as the ciphertext means an attacker with the database has both. What crypto-shredding still buys, unconditionally, is that a *completed erasure* holds everywhere the ciphertext has already spread — old backups, WAL, replicas. Where the keys must also be out of reach of whoever holds the database, pass a key store backed by a KMS or an HSM instead.
 {: .prompt-warning }
 
 The file-backed key store makes the same trade more starkly: it keeps `keys.jsonl` next to the events it protects, rewriting the whole file through an atomic move on erasure so destroyed material actually leaves it. It does **not** promise the bytes are unrecoverable from the device — a rewrite leaves the old blocks in place on a copy-on-write filesystem, an SSD with wear levelling, or a snapshotted volume. It is meant for development and tests.
+
+## Readers That May Not See Personal Data
+
+Not every reader may read everything. Access to a protected value *is* the ability to resolve its key, so who may read what is decided on the key seams, never in the read path — and a reader that may not gets the third state, `Shreddable.Withheld`.
+
+**Why a third state rather than either existing answer.** Reported as `Shredded`, a projection renders "erased" for data that is not, and writes that into its read model for good. Reported as a `ShreddingException`, it means "retry later", so a projector that is merely not entitled fails its batch and never advances. Withheld is neither: the read completes, the projection decides how to render the gap, and everything the reader *is* entitled to still gets projected.
+
+Three ways to limit a reader, from cheap to hard:
+
+```java
+// A reporting service: typed events, none of the personal data. It still needs a codec --
+// registering a type that declares a Shreddable fails on a store with none
+PostgresEventStorage.newBuilder().shredding(ShreddingCodec.withholdingAll()).buildStore();
+
+// A service that reads names and never addresses: an in-process policy on the category
+PostgresEventStorage.newBuilder()
+    .shredding(AesGcmShreddingCodec.over(keyStore).restrictedTo(Set.of("identity")))
+    .buildStore();
+
+// The hard boundary: a key store that refuses keys this role is not granted
+public KeyResolution resolveKey(KeyId key) {
+    ...
+    return new KeyResolution.Withheld("vault: 403");
+}
+```
+
+- **`withholdingAll()`** withholds every value without touching a key store.
+- **`restrictedTo(categories)`** decides on the category the envelope carries in the clear, before any key lookup, so a denied category costs no key-store traffic. It is symmetric — the codec seals nothing outside its categories either, and such an append fails as an `EventSerializationException` with nothing stored — and it passes erasure and the audit through *whole*, because an erasure that silently left another category readable while reporting success is the worst outcome an erasure can have. It is a data-minimisation boundary a deployment declares for itself, not a security boundary: the process still holds the codec.
+- **The key store's refusal is the security boundary**: a KMS policy per service role, or on PostgreSQL a [role granted every column of the key table except `key_material`](/posts/eventstore-configuring-postgresql-storage/#a-role-that-must-not-read-personal-data), which `PostgresShreddingKeyStore` recognises by SQLSTATE `42501` and reports as `Withheld` (cached for the key TTL). The two compose.
+
+**The unit of access is the unit of encryption: the `Shreddable` value, partitioned by category.** "Name but not address" is two wrapped values under two categories, chosen when the event is written — not one `Shreddable<ContactDetails>` holding both. Nothing inside one sealed value can be handed out on its own.
+
+A withheld value **cannot be appended again**: this process never held the plaintext. And a withheld reader still sees the pseudonymous subject id, the category and the `dek:` tags — which is why the rule that subject ids and tags must not themselves be personal data carries the weight here.
 
 ## What Erasure Does Not Reach
 
@@ -376,9 +439,9 @@ class MyShreddingTest extends AbstractEventStoreTest {
 }
 ```
 
-`eventStoreWithShredding(ShreddingKeyStore)` takes a key store of your choosing — for asserting what an erasure recorded, or for standing in a key store that fails, to check that an outage is not reported as an erasure. A custom backend supplies its own by overriding `EventStoreBackend.shreddingKeyStore(EventStorage)`; the default is in-memory, which every backend can use.
+`eventStoreWithShredding(ShreddingCodec)` takes a whole codec — a withholding or restricted one, for entitlement tests. `eventStoreWithShredding(ShreddingKeyStore)` takes a key store of your choosing — for asserting what an erasure recorded, or for standing in a key store that fails, to check that an outage is not reported as an erasure. A custom backend supplies its own by overriding `EventStoreBackend.shreddingKeyStore(EventStorage)`; the default is in-memory, which every backend can use.
 
-The TCK's `ShreddableEventDataTest` pins the whole contract per backend: the two-subject erasure, collections, the validating record, category independence, idempotent erasure and the fresh key afterwards, the `dek:` tags, the audit view — and, load-bearing, that an unreachable key store throws instead of reporting the data as erased. See [Testing](/posts/eventstore-testing/).
+The TCK's `ShreddableEventDataTest` pins the whole contract per backend: the two-subject erasure, collections, the validating record, category independence and the whole-person erasure across every category, idempotent erasure and the fresh key afterwards, the `dek:` tags, the audit view, reader entitlement — and, load-bearing, that an unreachable key store, or one asked for a key it never held, throws instead of reporting the data as erased. See [Testing](/posts/eventstore-testing/).
 
 ## Generating a Data Register
 

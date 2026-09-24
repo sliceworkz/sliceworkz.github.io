@@ -19,6 +19,7 @@ The library hands you three things with a lifecycle, and they are not equally ex
 | `EventStorage` | Background threads, JDBC connections, possibly the connection pools it created | When the storage is no longer used — typically at application shutdown |
 | `EventStore` | Executors that dispatch notifications to subscribers | When the store is no longer used; does **not** close a storage you gave it |
 | `EventStream` | Its subscriptions, and nothing else | When you are done subscribing; never needed for a query/append-only stream |
+| `Subscription` | One listener on a stream | When that one listener should stop; the stream's other subscriptions carry on |
 
 All three implement `AutoCloseable`, and `close()` is declared without a checked exception, so try-with-resources needs no `catch`.
 
@@ -27,10 +28,12 @@ All three implement `AutoCloseable`, and `close()` is declared without a checked
 `build()` connects, applies the configured `DatabaseInitMode`, and — on the PostgreSQL backend — starts the two LISTEN/NOTIFY monitor threads and waits for them to register their channels.
 
 ```java
-EventStorage storage = PostgresEventStorage.newBuilder().build();
+PostgresEventStorage storage = PostgresEventStorage.newBuilder().build();
 ```
 
-That wait is **bounded**, 10 seconds by default. The monitors have no failure mode of their own: on a `SQLException` they log, back off and retry for as long as the storage lives, so waiting on them without a deadline is waiting on something that may never happen.
+Before the monitors start, `build()` also checks that the store was not [restored logically into a younger cluster](/posts/eventstore-configuring-postgresql-storage/#backup-and-restore) — one index probe, under every init mode — and refuses to start, closing the storage, if it was.
+
+The monitors' wait is **bounded**, 10 seconds by default. The monitors have no failure mode of their own: on a `SQLException` they log, back off and retry for as long as the storage lives, so waiting on them without a deadline is waiting on something that may never happen.
 
 ### Expiry Is Fatal
 
@@ -43,7 +46,7 @@ An event-sourced application that is never told when events are appended has rea
 Container orchestrators start applications and databases at the same time. Raise the deadline rather than lowering your expectations:
 
 ```java
-EventStorage storage = PostgresEventStorage.newBuilder()
+PostgresEventStorage storage = PostgresEventStorage.newBuilder()
     .notificationStartupTimeout(Duration.ofSeconds(30))
     .build();
 ```
@@ -55,16 +58,20 @@ Within the deadline, the monitors' own retry loop does the waiting, so a store r
 
 ### Which Configurations Can Actually Hit This
 
-With `ENSURE` or `VALIDATE`, the schema work runs before the monitors start and fails with a clear error, so an unreachable main `DataSource` never reaches the wait. The paths that can reach it are:
+With `ENSURE` or `VALIDATE`, the schema work runs before the monitors start and fails with a clear error; under `NONE`, the restored-history check is the first thing `build()` asks the database, and fails within the pool's connection timeout, naming the database. So an unreachable main `DataSource` never reaches the wait. The path that can reach it is a **reachable main DataSource with an unreachable monitoring one** — the realistic case, since the two are configured separately precisely because LISTEN/NOTIFY does not survive a transaction pooler. "Pooled works, direct is firewalled" is an ordinary misconfiguration.
 
-- `DatabaseInitMode.NONE`, where nothing touches the database before the monitors do
-- a **reachable main DataSource with an unreachable monitoring one** — the realistic case, since the two are configured separately precisely because LISTEN/NOTIFY does not survive a transaction pooler. "Pooled works, direct is firewalled" is an ordinary misconfiguration
+An interrupt during startup throws `EventStorageException` and closes the storage, rather than handing back a storage nobody can tell is unstarted. And `close()` releases a caller still waiting inside `build()`.
 
 ### Watching Notification Health
 
-`sliceworkz.eventstore.notifications.up` is a gauge reading 1 or 0, tagged `storage` and `channel` (`event_appended` / `bookmark_placed`). It is registered by the storage constructor, so the series exists reading 0 from the moment the storage does — a gauge that only appears once notifications work is no use for alerting on notifications *not* working. It drops back to 0 when a running store loses its monitoring connection, which is the same silence as never having had one.
+The storage reports the health of each channel (`EVENT_APPENDED` / `BOOKMARK_PLACED`) to its [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/#notification-channel-health) through `notificationChannelChanged`: **down from the constructor**, so an observer knows the channel from the moment the storage exists — a signal that only appears once notifications work is no use for alerting on notifications *not* working — up once the monitor listens, down again when a running store loses its monitoring connection (which is the same silence as never having had one), and down on close. Every transition is reported exactly once.
 
-For a health endpoint, `PostgresEventStorageImpl.isNotificationsAvailable()` exposes the same state, at the cost of a downcast from `EventStorage`.
+For a health endpoint, `isNotificationsAvailable()` answers the same state, on the `PostgresEventStorage` type the builder's `build()` returns — no downcast needed:
+
+```java
+PostgresEventStorage storage = PostgresEventStorage.newBuilder().build();
+healthChecks.register("eventstore-notifications", storage::isNotificationsAvailable);
+```
 
 ## Closing a Store
 
@@ -99,8 +106,8 @@ Closing an `EventStore` does **not** close a storage you handed it. A storage is
 ```java
 EventStorage storage = PostgresEventStorage.newBuilder().build();
 
-EventStore writeStore = EventStoreFactory.get().eventStore(storage);
-EventStore readStore  = EventStoreFactory.get().eventStore(storage);
+EventStore writeStore = EventStore.on(storage).build();
+EventStore readStore  = EventStore.on(storage).build();
 
 // ... application runs ...
 
@@ -121,7 +128,7 @@ You can build the same pairing yourself with `EventStore.owning(...)` when you c
 ```java
 EventStorage storage = PostgresEventStorage.newBuilder().build();
 EventStore eventStore = EventStore.owning(
-    EventStoreFactory.get().eventStore(storage, registry),
+    EventStore.on(storage).observer(observer).build(),
     storage
 );
 
@@ -144,12 +151,12 @@ A closed `EventStore`'s streams throw too, for the same reason a closed storage'
 ```java
 // no cleanup needed: nothing was registered
 EventStream<CustomerEvent> stream = eventStore.getEventStream(streamId, CustomerEvent.class);
-stream.append(AppendCriteria.none(), Event.of(new CustomerRegistered("John"), Tags.none()));
+stream.append(Event.of(new CustomerRegistered("John"), Tags.none()));
 ```
 
 ### A Stream You Subscribe To Is Held by the Storage
 
-Once subscribed, the storage holds the stream **strongly** until it is closed. That is what makes live updates survive the caller dropping the variable:
+Once subscribed, the storage holds the stream **strongly** for as long as it has a live subscription. That is what makes live updates survive the caller dropping the variable:
 
 ```java
 // this keeps working — the storage holds the stream, so the subscription cannot be collected
@@ -163,10 +170,22 @@ The cost of that guarantee is that nothing releases it on your behalf. A subscri
 
 ```java
 try ( EventStream<CustomerEvent> stream = eventStore.getEventStream(streamId, CustomerEvent.class) ) {
-    Projector.from(stream).towards(projection).subscribe().build();
+    Projector.from(stream).into(projection).subscribe().build();
     // ... application runs ...
 }   // subscriptions ended, registration released
 ```
+
+### Or Close One Subscription
+
+`subscribe(...)` returns a `Subscription`. Closing it ends that one listener and leaves the stream's other subscriptions going:
+
+```java
+Subscription subscription = stream.subscribe(reference -> { updateReadModel(); return reference; });
+// ...
+subscription.close();
+```
+
+The two ways compose, because **a stream is registered with the storage exactly while it has a live subscription**: closing its last `Subscription` releases the stream just as closing the stream does, and subscribing again after that re-registers it. Closing a handle is idempotent, and a handle the stream or the store already ended reads `isActive() == false` and closes as a no-op. A subscribed `Projector` keeps no handle — it ends with its source — so a projector that must be unsubscribed on its own is built without `.subscribe()` and subscribed by hand: `stream.subscribe(projector)`.
 
 ### Closing a Stream Is Not Terminal
 
@@ -174,7 +193,7 @@ Unlike closing a store or a storage, closing a stream ends its subscriptions and
 
 ### Streams Are Cheap Because the Expensive Part Is Shared
 
-`getEventStream()` allocates a stream object and resolves about ten Micrometer meters — roughly **2 µs and 1 KB**. The payload serializer/deserializer is *not* rebuilt per call: the store caches one per distinct set of event root classes and hands the same instance to every stream opened with that mapping.
+`getEventStream()` allocates a stream object and reports it to the observer — roughly **2 µs and 1 KB**. The payload serializer/deserializer is *not* rebuilt per call: the store caches one per distinct set of event root classes and hands the same instance to every stream opened with that mapping.
 
 That matters more than the construction cost suggests. Jackson caches its per-type serializers inside the mapper, so a serde per call would give every stream a cold type cache and re-run bean introspection on the first serialization of each record type. Measured on a 24-record sealed hierarchy, that difference was **~175 µs / 139 KB against ~36 µs / 69 KB** per query. With the serde shared, obtaining a fresh stream per operation costs the same as keeping one.
 
@@ -201,19 +220,16 @@ public class Application implements AutoCloseable {
             EventStreamId.forContext("customer"), CustomerEvent.class);
 
         Projector.from(subscribedStream)
-            .towards(new CustomerSummary())
+            .into(new CustomerSummary())
             .subscribe()
-            .bookmarkProgress()
-                .withReader("customer-summary")
-                .done()
+            .bookmarkAs("customer-summary")
             .build();
     }
 
     /** Per-operation streams need no lifecycle handling at all. */
     public void register ( String id, String name ) {
         eventStore.getEventStream(EventStreamId.forContext("customer"), CustomerEvent.class)
-                  .append(AppendCriteria.none(),
-                          Event.of(new CustomerRegistered(id, name), Tags.of("customer", id)));
+                  .append(Event.of(new CustomerRegistered(id, name), Tags.of("customer", id)));
     }
 
     @Override

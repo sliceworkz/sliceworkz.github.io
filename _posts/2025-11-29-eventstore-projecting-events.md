@@ -28,7 +28,7 @@ A projection queries relevant events and applies them sequentially to build stat
 ```java
 // Projection builds current customer state from events
 CustomerProjection projection = new CustomerProjection("123");
-Projector.from(stream).towards(projection).build().run();
+Projector.from(stream).into(projection).build().run();
 
 // Use the projection result for business logic
 if (!projection.isChurned()) {
@@ -38,18 +38,21 @@ if (!projection.isChurned()) {
 
 Projections are deterministic: replaying the same events in the same order always produces the same result.
 
-## Writing a Simple Event Handler
+## Writing an Event Handler
 
-The `EventHandler` interface processes domain events without metadata. Implement the `when()` method to handle events:
+`EventHandler` is the one handler interface, and `when(Event<E>)` its one method: the projector hands every matching event to it, one call per event, with its metadata — timestamp, tags, reference and stream — alongside the domain event in `data()`.
 
 ```java
 public class CustomerCounter implements EventHandler<CustomerEvent> {
     private int registrationCount = 0;
+    private int churnCount = 0;
 
     @Override
-    public void when(CustomerEvent event) {
-        if (event instanceof CustomerRegistered) {
-            registrationCount++;
+    public void when(Event<CustomerEvent> event) {
+        switch (event.data()) {
+            case CustomerRegistered r -> registrationCount++;
+            case CustomerChurned c -> churnCount++;
+            default -> {} // Ignore other events
         }
     }
 
@@ -57,38 +60,16 @@ public class CustomerCounter implements EventHandler<CustomerEvent> {
 }
 ```
 
-Use pattern matching with switch expressions for cleaner code:
+A handler that needs only the domain event switches on `event.data()`; one that needs the metadata reads it from the same argument:
 
 ```java
-@Override
-public void when(CustomerEvent event) {
-    switch(event) {
-        case CustomerRegistered r -> registrationCount++;
-        case CustomerChurned c -> churnCount++;
-        default -> {} // Ignore other events
-    }
-}
-```
-
-`EventHandler` is a functional interface, enabling lambda usage:
-
-```java
-EventHandler<CustomerEvent> logger = event ->
-    System.out.println("Event: " + event.getClass().getSimpleName());
-```
-
-## Writing an Event Handler with Access to Metadata
-
-The `EventWithMetaDataHandler` interface provides access to the full `Event` wrapper, including timestamp, tags, reference, and stream information:
-
-```java
-public class CustomerTimeline implements EventWithMetaDataHandler<CustomerEvent> {
-    private List<TimelineEntry> timeline = new ArrayList<>();
+public class CustomerTimeline implements EventHandler<CustomerEvent> {
+    private final List<TimelineEntry> timeline = new ArrayList<>();
 
     @Override
     public void when(Event<CustomerEvent> event) {
         timeline.add(new TimelineEntry(
-            event.timestamp(),
+            event.timestamp(),                       // an Instant
             event.reference().position(),
             event.data().getClass().getSimpleName()
         ));
@@ -98,16 +79,18 @@ public class CustomerTimeline implements EventWithMetaDataHandler<CustomerEvent>
 }
 ```
 
-**Use `EventWithMetaDataHandler` when you need:**
+`EventHandler` is a functional interface, enabling lambda usage:
+
+```java
+EventHandler<CustomerEvent> logger = event ->
+    System.out.println("Event: " + event.type().name() + " at " + event.reference());
+```
+
+The metadata is there when you need it:
 - Event timestamps for temporal information that is not in your event payload
-- Tags for correlation, filtering or additional information stored therein (audit logging log, ...)
+- Tags for correlation, filtering or additional information stored therein (audit logging, ...)
 - References for tracking position
 - Stream information for multi-stream projections
-
-**Use `EventHandler` when:**
-- You only need the business event data
-- Building simple state aggregations
-- Metadata is irrelevant to the projection logic
 
 ## Implementing a Readmodel
 
@@ -126,10 +109,7 @@ public class CustomerSummary implements Projection<CustomerEvent> {
     @Override
     public EventQuery eventQuery() {
         // Query all events for this specific customer
-        return EventQuery.forEvents(
-            EventTypesFilter.any(),
-            Tags.of("customer", customerId)
-        );
+        return EventQuery.forTags(Tags.of("customer", customerId));
     }
 
     @Override
@@ -148,30 +128,7 @@ public class CustomerSummary implements Projection<CustomerEvent> {
 
 The `eventQuery()` method defines which events are relevant. The Projector will only call `when()` for matching events.
 
-For projections that don't need metadata, use `ProjectionWithoutMetaData`:
-
-```java
-public class OrderTotal implements ProjectionWithoutMetaData<OrderEvent> {
-    private BigDecimal total = BigDecimal.ZERO;
-
-    @Override
-    public EventQuery eventQuery() {
-        return EventQuery.forEvents(
-            EventTypesFilter.of(OrderPlaced.class),
-            Tags.none()
-        );
-    }
-
-    @Override
-    public void when(OrderEvent event) {
-        if (event instanceof OrderPlaced placed) {
-            total = total.add(placed.amount());
-        }
-    }
-
-    public BigDecimal getTotal() { return total; }
-}
-```
+**`eventQuery()` is read once per run.** Storage is asked with that query and every event of the run is matched against it, so a projection that computes its query cannot answer differently halfway through a run — and is not asked once per event, either.
 
 ## Using the Projector
 
@@ -186,7 +143,7 @@ EventStream<CustomerEvent> stream = eventstore.getEventStream(
 CustomerSummary projection = new CustomerSummary("123");
 
 Projector.from(stream)
-    .towards(projection)
+    .into(projection)
     .build()
     .run();
 
@@ -196,9 +153,13 @@ System.out.println("Customer: " + projection.getName());
 
 The Projector:
 1. Queries events matching the projection's `eventQuery()`
-2. Streams them in batches to avoid memory issues
+2. Reads them in pages — batches — to avoid memory issues
 3. Calls `when()` for each matching event
 4. Returns metrics about the projection execution
+
+`Projector.from(stream).into(projection)` is the whole of a projector; every other setting below is an optional call on the same builder. `from(null)` is refused at the call, and `build()` refuses a missing projection with an `IllegalStateException` naming the call to make, rather than letting it fail from inside the first batch.
+
+A batch is read as one [`EventPage`](/posts/eventstore-querying-events/#paging-through-a-stream), deserialized whole before the first of its events is handed to `when()`. So a batch holding an event this stream cannot read hands none of its events to the projection, and fails the run — see [Error Handling](/posts/eventstore-error-handling/#failures-inside-a-projector).
 
 ## Configuring the Projector
 
@@ -207,26 +168,26 @@ The Projector handles complexity so your application doesn't need to. By default
 ```java
 // Use default batch size (500)
 Projector.from(stream)
-    .towards(projection)
+    .into(projection)
     .build()
     .run();
 
 // Configure smaller batches for memory-constrained environments
 Projector.from(stream)
-    .towards(projection)
+    .into(projection)
     .inBatchesOf(100)
     .build()
     .run();
 
 // Configure larger batches for better throughput
 Projector.from(stream)
-    .towards(projection)
+    .into(projection)
     .inBatchesOf(1000)
     .build()
     .run();
 ```
 
-The Projector automatically handles pagination—your projection code remains simple regardless of stream size. The batch boundary is also where a projection can commit its own work and where the bookmark is placed — see [Batch-Aware Projections](#batch-aware-projections).
+`inBatchesOf(n)` refuses a batch size below 1. The Projector automatically handles pagination—your projection code remains simple regardless of stream size. The batch boundary is also where a projection can commit its own work and where the bookmark is placed — see [Batch-Aware Projections](#batch-aware-projections).
 
 You can also configure where to start processing:
 
@@ -235,7 +196,7 @@ You can also configure where to start processing:
 EventReference checkpoint = // ... from somewhere ...
 
 Projector.from(stream)
-    .towards(projection)
+    .into(projection)
     .startingAfter(checkpoint)
     .build()
     .run();
@@ -251,7 +212,7 @@ A Projector instance tracks its position in the event stream and can be reused f
 CustomerSummary projection = new CustomerSummary("123");
 
 Projector<CustomerEvent> projector = Projector.from(stream)
-    .towards(projection)
+    .into(projection)
     .build();
 
 // Initial run - process all historical events
@@ -292,7 +253,7 @@ Instead of manually calling `run()` to update projections, you can subscribe a p
 CustomerSummary projection = new CustomerSummary("123");
 
 Projector<CustomerEvent> projector = Projector.from(stream)
-    .towards(projection)
+    .into(projection)
     .subscribe()
     .build();
 
@@ -305,11 +266,20 @@ stream.append(
 // The projection is updated asynchronously
 ```
 
-The `subscribe()` method configures the projector to register itself as an eventually consistent append listener on the stream. When events are appended, the projector's `eventsAppended()` method is invoked asynchronously, triggering a `run()` to process new events.
+The `subscribe()` method configures the projector to register itself as an append listener on the stream — a `Projector` *is* an `AppendListener`. When events are appended, the projector's `eventsAppended()` method is invoked asynchronously, triggering a `run()` to process new events.
+
+The projector keeps no `Subscription` handle of its own: it ends with its source. To end one projector's subscription without closing the stream, build it without `subscribe()` and subscribe it yourself, keeping the handle:
+
+```java
+Projector<CustomerEvent> projector = Projector.from(stream).into(projection).build();
+Subscription subscription = stream.subscribe(projector);
+// ...
+subscription.close();   // this projector stops; other subscriptions on the stream carry on
+```
 
 This subscription-based approach is ideal for keeping read models current with minimal latency. The projector automatically handles incremental updates, processing only events since its last run.
 
-> **A subscribed projector keeps its stream alive.** Subscribing registers the stream with the storage, which holds it until the stream is closed — so a subscribed stream that is never closed is retained for the lifetime of the storage. Close the stream when the projection is no longer needed, or close the store, which closes them all. See [Lifecycle and Shutdown](/posts/eventstore-lifecycle/#closing-a-stream).
+> **A subscribed projector keeps its stream alive.** Subscribing registers the stream with the storage, which holds it while it has a live subscription — so a subscribed stream that is never closed is retained for the lifetime of the storage. Close the stream when the projection is no longer needed, or close the store, which closes them all. See [Lifecycle and Shutdown](/posts/eventstore-lifecycle/#closing-a-stream).
 {: .prompt-warning }
 
 **A failing projection does not fail the append, and does not retry itself.** `run()` throws a `ProjectorException`, which is contained and logged at ERROR by the notification machinery: the appending caller is never told, other subscribers still get their notification, and nothing replays the notification this projector failed on. It is notified again on the next append.
@@ -320,12 +290,9 @@ Combine subscriptions with bookmarking for resilience across restarts:
 
 ```java
 Projector<CustomerEvent> projector = Projector.from(stream)
-    .towards(projection)
+    .into(projection)
     .subscribe()
-    .bookmarkProgress()
-        .withReader("customer-summary")
-        .readBeforeEachExecution()
-        .done()
+    .bookmarkAs("customer-summary")
     .build();
 ```
 
@@ -380,6 +347,8 @@ public class StockLevelProjection implements Projection<StockEvent> {
 
 The `initQuery()` runs once on the first projector execution. If a savepoint is found, the projection initializes from it and the main `eventQuery()` processes only the events that occurred after. When no savepoint exists, the pattern degrades gracefully — the full stream is replayed.
 
+A savepoint handler that throws fails the run as a `ProjectorException` naming the savepoint event, exactly as a failing batch does, and the cursor goes back to where the run started — so the next run re-runs `initQuery()` rather than starting the main query from a read model that was never initialised.
+
 > When bookmarking is enabled, `initQuery()` is ignored. Bookmarked projections track their own position and must process every event.
 {: .prompt-warning }
 
@@ -424,11 +393,11 @@ The difference between `eventsStreamed` and `eventsHandled` indicates filtering 
 
 ### Accumulated Metrics
 
-The Projector tracks total metrics across all runs:
+The Projector tracks total metrics across all runs. `accumulatedMetrics()` is also the way to read a *subscribed* projector's position from another thread: it is published by every run, whereas `run()`'s return value is only seen by the thread that called it — which, for a subscribed projector, is the storage's notification thread.
 
 ```java
 Projector<CustomerEvent> projector = Projector.from(stream)
-    .towards(projection)
+    .into(projection)
     .build();
 
 // Run 1
@@ -465,16 +434,14 @@ Optionally, you can add tags to add metadata (eg: application version, hostname,
 
 ### Basic Bookmarking
 
-Configure bookmarking using the fluent API:
+Name the reader whose bookmark records the projector's progress:
 
 ```java
 CustomerSummary projection = new CustomerSummary("123");
 
 Projector<CustomerEvent> projector = Projector.from(stream)
-    .towards(projection)
-    .bookmarkProgress()
-        .withReader("customer-summary-projection")
-        .done()
+    .into(projection)
+    .bookmarkAs("customer-summary-projection")
     .build();
 
 // First run processes all historical events and saves bookmark
@@ -485,6 +452,8 @@ projector.run();
 // Second run automatically reads bookmark and processes only new events
 projector.run();
 ```
+
+Projectors with different reader names keep independent positions; two built with the same name share one — which is what lets a restarted process resume where its predecessor left off. `bookmarkAs(reader, tags)` stores tags with the bookmark — a tenant, a schema version, the instance that placed it — which take no part in reading it back. A bookmarked projector ignores its projection's `initQuery()`, since the bookmark already says where to resume.
 
 The projector automatically:
 1. Reads the bookmark before each run to determine the starting position
@@ -500,6 +469,7 @@ public class CustomerProjectionService {
     private final EventStream<CustomerEvent> stream;
     private final CustomerSummary projection;
     private final Projector<CustomerEvent> projector;
+    private final Subscription subscription;
 
     public CustomerProjectionService(EventStore eventStore) {
         EventStreamId streamId = EventStreamId.forContext("customers");
@@ -508,16 +478,12 @@ public class CustomerProjectionService {
 
         // Configure projector with bookmarking
         this.projector = Projector.from(stream)
-            .towards(projection)
-            .bookmarkProgress()
-                .withReader("customer-summary")
-                .withTags(Tags.of("customer", "123"))
-                .readBeforeEachExecution()
-                .done()
+            .into(projection)
+            .bookmarkAs("customer-summary", Tags.of("customer", "123"))
             .build();
 
         // Subscribe to append notifications
-        stream.subscribe(this::updateProjection);
+        this.subscription = stream.subscribe(this::updateProjection);
     }
 
     /*
@@ -556,49 +522,52 @@ This pattern ensures your read model stays synchronized with the event stream:
 
 ### Bookmark Read Frequencies
 
-Control when bookmarks are read to match your use case:
+A bookmarked projector reads its bookmark **before every run** by default. That is what a distributed deployment needs: when another instance moved the bookmark — a takeover after [leader election](/posts/eventstore-leader-election/) — the next run starts where that instance left off. Two readings differ from the default, so those are the two settings that exist:
 
 ```java
-// Read before each execution (default) - for distributed systems
+// Default: read before every run - for distributed systems
 Projector.from(stream)
-    .towards(projection)
-    .bookmarkProgress()
-        .withReader("my-projection")
-        .readBeforeEachExecution()  // Default behavior
-        .done()
+    .into(projection)
+    .bookmarkAs("my-projection")
     .build();
 
-// Read once at creation - for single-instance applications
+// Read once, before the first run, then keep the projector's own cursor -
+// for a long-lived projector that is the only writer of its bookmark (saves a lookup per run)
 Projector.from(stream)
-    .towards(projection)
-    .bookmarkProgress()
-        .withReader("my-projection")
-        .readAtCreationOnly()
-        .done()
+    .into(projection)
+    .bookmarkAs("my-projection")
+    .readBookmarkOnce()
     .build();
 
-// Read before first execution - for delayed initialization
-Projector.from(stream)
-    .towards(projection)
-    .bookmarkProgress()
-        .withReader("my-projection")
-        .readBeforeFirstExecution()
-        .done()
-    .build();
-
-// Manual control - explicit bookmark management
+// Read only when asked - the projector starts from startingAfter(...) or the beginning
 Projector<CustomerEvent> projector = Projector.from(stream)
-    .towards(projection)
-    .bookmarkProgress()
-        .withReader("my-projection")
-        .readOnManualTriggerOnly()
-        .done()
+    .into(projection)
+    .bookmarkAs("my-projection")
+    .readBookmarkOnRequest()
     .build();
 
 // Explicitly read bookmark when needed
 projector.readBookmark();
 projector.run();
 ```
+
+Whichever is chosen, the bookmark is still *placed* after every batch. `readBookmarkOnRequest()` is the setting for a projection that holds its own position in its own store (see [Being Exactly-Once Against Your Own Store](#being-exactly-once-against-your-own-store)), and for a test that wants to decide when the bookmark is consulted. Choosing either without `bookmarkAs(...)` is refused at `build()` — there is no bookmark to read.
+
+**`readBookmark()` never overlaps a run.** Both take the projector's lock, so a manual read while a run is in progress — a subscribed projector runs on the storage's notification thread — waits for the run to finish and then resets the position, rather than moving a cursor the run is about to overwrite with its own progress.
+
+## Naming a Projector for Its Observations
+
+When the store is [observed](/posts/eventstore-observability-micrometer-prometheus-grafana/), each batch a projector runs is reported under the projection's class simple name (the full class name for an anonymous class). A framework that wraps its own components in one adapter class would otherwise report all of them under the adapter's name; `named(...)` says otherwise:
+
+```java
+Projector.from(stream)
+    .into(new ReadModelAdapter(customerList))
+    .named("customer-list")
+    .bookmarkAs("customer-list")
+    .build();
+```
+
+The name is for observation only and takes no part in bookmarking, which is keyed by the reader.
 
 ## Batch-Aware Projections
 

@@ -18,7 +18,8 @@ Appending is how an application writes new facts. Importing is for moving facts 
 - **Environment seeding**: copying a production store into an acceptance environment
 - **Store splitting or merging**: relocating one context's events into a store of their own, or consolidating several stores into one
 - **Schema migration at rest**: rewriting event types, tags or payloads across a whole history instead of carrying upcasters forever
-- **Archiving**: moving old events to a separate store, remapped onto an archive stream
+- **Archiving**: copying a closed period — one stream, or everything carrying a tag — to a separate store
+- **Moving a store to another PostgreSQL cluster**: the supported alternative to a logical dump, which a younger cluster cannot read
 
 ```java
 ImportReport report = EventStoreImporter.from(sourceStorage)
@@ -47,7 +48,7 @@ If you built your stores with `buildStore()`, keep a reference to the storage as
 
 ```java
 EventStorage source = InMemoryFsEventStorage.newBuilder().directory("prototype-data").build();
-EventStorage target = PostgresEventStorage.newBuilder().ensureDatabase().build();
+EventStorage target = PostgresEventStorage.newBuilder().build();   // ENSURE creates the schema
 
 EventStoreImporter.from(source).to(target).run();
 
@@ -76,9 +77,9 @@ An import reproduces the source *order*, never its ordering numbers. That is mod
 
 A [`Shreddable`](/posts/eventstore-erasing-personal-data/) value is stored as a sealed envelope inside the ordinary payload — opaque JSON like any other payload as far as an import is concerned. So the copy is verbatim, and needs no keys, no domain classes and no right to read the personal data.
 
-The consequence is the obvious one: **a store imported into a deployment whose key store does not hold those keys reads every protected value as erased.** Migrate the keys alongside the events, or accept the erasure as part of the migration.
+The consequence is the obvious one: **a store imported into a deployment whose key store does not hold those keys cannot read any protected value.** Every such read throws a `ShreddingException` naming a key the store never held — an unknown key is deliberately *not* reported as erased, since it far more often means a miswired key store than a deliberate erasure. Migrate the keys alongside the events.
 
-That cuts both ways, and the second direction is useful. Seeding an acceptance environment from production by copying the events *without* the keys leaves a history that is complete in every non-personal respect and permanently unreadable in every personal one — which is a stronger guarantee than any scrubbing script, since there is nothing left to scrub around.
+To accept the erasure deliberately — seeding an acceptance environment from production, say, with a history complete in every non-personal respect and permanently unreadable in every personal one — carry the key rows across *shredded*: material gone, reason stamped. The values then read as erased, and the audit says why. That is a stronger guarantee than any scrubbing script, since there is nothing left to scrub around.
 
 ## Import Modes
 
@@ -115,6 +116,28 @@ The catch-up run costs O(new events) rather than re-reading the whole history.
 
 Reads are always bounded at the **source head captured before the first write**. That is what makes `from(x).to(x)` — cloning inside one store — terminate instead of re-reading its own writes forever, and it is why events appended to the source *during* a run are excluded rather than partially included.
 
+## Selecting What to Copy
+
+`.stream(...)` and `.matching(...)` narrow the run to part of the source, and **both are pushed into the storage query** the source is paged with:
+
+```java
+// one logical stream -- a concrete id, or a wildcard
+ImportReport q1 = EventStoreImporter.from(live).to(cold)
+    .stream(EventStreamId.forContext("ledger").withPurpose("2024Q1"))
+    .run();
+
+// every event carrying a tag, of the given types
+ImportReport period = EventStoreImporter.from(live).to(cold)
+    .matching(EventFilter.forTags(Tags.of("period", "2024Q1")))
+    .run();
+```
+
+That is what makes the importer an archiving tool. On PostgreSQL a run over one closed period costs what that period's events cost, answered from the stream and tag indexes, not a walk over the table. The alternative — dropping unwanted events in `transform` — reads the whole source to discard most of it: fine against the in-memory store, a full pass over the table in production. The two compose, and the transformation only sees what the selection read.
+
+- **Types are matched by stored name**, since nothing is upcast on this path: select a legacy type by its legacy name, with `EventTypesFilter.of(Set.of(EventType.named("CustomerRegistered")))`.
+- **A filter carrying its own `until`** bounds the run there when it is earlier than the source head, and `ImportReport.sourceTo()` then names that boundary, so a later `.after(report.sourceTo())` continues correctly.
+- **Selecting does not touch the source.** An archive is a copy. Removing the copied range from the live store is a separate, deliberate operator act — and the bookmarks foreign key makes it fail loudly for a reader still pointing into that range.
+
 ## Transforming Events on the Way Through
 
 `.transform(...)` receives each `StoredEvent` and returns an `Optional<EventToImport>`. Returning an empty `Optional` drops the event; every field has a wither, so anything can be rewritten:
@@ -136,11 +159,13 @@ Some things this makes possible:
 ```java
 .transform(stored -> Optional.of(
     stored.type().name().equals("CustomerRegistered")
-        ? EventToImport.from(stored).withType(EventType.ofType("CustomerEnrolled"))
+        ? EventToImport.from(stored).withType(EventType.named("CustomerEnrolled"))
         : EventToImport.from(stored)))
 ```
 
-**Filtering a context out of a copy** — for a scrubbed acceptance environment:
+For a bare rename, [`@EventName`](/posts/eventstore-defining-events/#eventname-a-stored-name-that-is-not-the-class-name) on the renamed class is usually simpler: it needs no copy at all.
+
+**Filtering a context out of a copy** — for a scrubbed acceptance environment (`.stream(...)` selects *in*, which is cheaper; this drops):
 
 ```java
 .transform(stored -> stored.stream().context().equals("payments")
@@ -148,7 +173,7 @@ Some things this makes possible:
     : Optional.of(EventToImport.from(stored)))
 ```
 
-**Rewriting payloads** — `withImmutableData(...)` takes the raw JSON, so a mechanical schema change can be applied without domain classes.
+**Rewriting payloads** — `withPayload(...)` takes the raw JSON document, so a mechanical schema change can be applied without domain classes. The payload must stay a JSON document: every backend refuses one that is not, storing nothing of the batch.
 
 Events dropped by the transform are counted in `ImportReport.dropped()`.
 
@@ -196,15 +221,29 @@ public record ImportReport (
 
 **Listeners are notified** exactly as for appends, so merging into a live store wakes its projections. That is usually what you want — but it means a large import into a production store also drives that store's read models.
 
-**Check a target in raw mode.** If you probe the target for an event before importing, open the stream with no event root classes:
+**Check a target in raw mode.** If you probe the target for an event before importing, use a raw stream:
 
 ```java
 // raw: no mappings, so nothing can fail to deserialize
-EventStream<Object> raw = targetStore.getEventStream(EventStreamId.anyContext());
-boolean present = !raw.getEventById(someId).isEmpty();
+EventSource<String> raw = targetStore.getRawEventStream(EventStreamId.anyContext());
+boolean present = raw.getEventById(someId).isPresent();
 ```
 
-With domain classes registered, `getEventById` upcasts — and a legacy event whose upcast yields zero current events comes back as an empty list even though it exists, which reads as a false negative.
+A typed stream answers presence correctly too — a legacy event whose upcast yields zero current events is *present* with an empty list, not absent — but it needs the domain classes and throws on an event its mappings cannot read.
+
+## Moving a Store to Another Cluster
+
+A `pg_dump` restored into a fresh PostgreSQL cluster keeps the source's transaction ids, which the younger cluster reads as the future: the history is invisible, and new appends sort before it. The store [refuses to start](/posts/eventstore-configuring-postgresql-storage/#backup-and-restore) in that state. An import is the supported way to move: the target assigns both ordering columns, in source order, so the ordering is the new cluster's own.
+
+What the importer does *not* carry, and the runbook therefore has to:
+
+- **The `btree_gin` extension** on the target database. Let `ENSURE` create the target schema, or install the extension first.
+- **Bookmarks.** Copy `<prefix>bookmarks` across *after* the events. A bookmark stores only the event id, the import preserves ids, and the target answers a bookmark's position from its own events — so the copied table is valid as it stands and the foreign key holds.
+- **Shredding keys.** Copy `<prefix>shredding_keys` alongside, shredded rows included, so erased values still read as erased.
+- **Leases** are deliberately not migrated; they expire.
+- **Anything outside the store holding event references** — a read model's own cursor columns, say — holds the source's coordinates. Rebuild such read models on the target rather than resuming them.
+
+Import in batches with `SKIP_EXISTING_ID` so a failed run resumes, and feed `ImportReport.sourceTo()` into a later run's `.after(...)` to pick up events appended to the source during the cutover.
 
 ## PostgreSQL Specifics
 
@@ -221,19 +260,18 @@ The target requires no DDL change for importing: `event_id` is already a plain `
 ```java
 EventToImport synthetic = new EventToImport(
     EventStreamId.forContext("customer").withPurpose("123"),
-    EventType.ofType("CustomerRegistered"),
+    EventType.named("CustomerRegistered"),
     EventId.of(UUID.randomUUID().toString()),
-    "{\"name\":\"John\"}",              // event payload
-    null,
+    "{\"name\":\"John\"}",              // payload: a JSON document
     Tags.of("customer", "123"),
-    LocalDateTime.of(2024, 1, 15, 10, 30),
+    Instant.parse("2024-01-15T10:30:00Z"),
     null                                 // idempotency key
 );
 
 target.importEvents(List.of(synthetic), ImportMode.FAIL_ON_EXISTING_ID);
 ```
 
-> This bypasses `append()` and everything that path guarantees: no optimistic locking, no serialization from a typed domain event, no check that the payload matches the type name. It is a tool for fixtures and migrations, not a second write path for an application.
+> This bypasses `append()` and everything that path guarantees: no optimistic locking, no serialization from a typed domain event, no check that the payload matches the type name — only that it is a JSON document. It is a tool for fixtures and migrations, not a second write path for an application.
 {: .prompt-danger }
 
 For testing application code, prefer the [testing fixture](/posts/eventstore-testing/), which seeds history through the ordinary append path.

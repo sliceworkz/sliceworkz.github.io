@@ -35,7 +35,7 @@ Leases live on the **storage**, not on the `EventStore` or an `EventStream` — 
 
 ```java
 EventStorage storage = PostgresEventStorage.newBuilder().build();
-EventStore eventStore = EventStoreFactory.get().eventStore(storage);
+EventStore eventStore = EventStore.owning(EventStore.on(storage).build(), storage);
 ```
 
 Everything involved lives in the API module, so no extra dependency is needed: `Lease` in `org.sliceworkz.eventstore.events`, and `LeaseRequest`, `LeaseResponse` and `LeaseStatus` nested in `EventStorage` itself (`org.sliceworkz.eventstore.spi`).
@@ -108,8 +108,9 @@ That half is the caller's job and cannot be moved into the store: storage-clock 
 
 Every response carries the lease's current fencing token: the caller's own when it is the leader, the current holder's when it is standing by.
 
-- It **strictly increases on every change of ownership**, starting at 1 for the first owner
-- It is **stable across renewals** by the same owner
+- It **strictly increases on every acquisition**, starting at 1 for the first owner
+- It is **stable across renewals** — a request by the owner of a lease that is *still live*
+- **The same owner re-acquiring its own expired or released lease gets a new token.** That is an acquisition, not a renewal, and it is exactly the pause the token exists to expose: a holder paused beyond its ttl — or a restarted process reusing its predecessor's owner id — comes back under a token its earlier self never held, so anything the earlier self still stamps is recognisably stale
 - It **never resets** — releasing a lease does not delete it, it backdates the heartbeat, precisely so the token survives
 
 Stamp outgoing work with the token, and a downstream store can reject anything arriving with a token lower than the highest it has already seen. That is how a zombie leader — one that was paused past its ttl and woke up still believing it holds the lease — is recognised rather than merely hoped against.
@@ -182,7 +183,7 @@ Like bookmarks, leases are addressed globally by name, so the list spans the who
 
 ## Backend Support
 
-The lease methods are **optional** on the SPI: their defaults throw `UnsupportedOperationException`, and the TCK gates its lease scenarios on `Capability.LEASE` so a backend written before leases existed skips them rather than failing them. See [Testing](/posts/eventstore-testing/#capabilities).
+The lease methods are **optional** on the SPI: their defaults throw `UnsupportedOperationException`, and the TCK gates its lease scenarios on `Capability.LEASE` so a backend that does not implement leases skips them rather than failing them. See [Testing](/posts/eventstore-testing/#capabilities).
 
 | Backend | Leases |
 |---|---|
@@ -222,6 +223,6 @@ void tick() {
 }
 ```
 
-Reading the bookmark **after** winning the lease, rather than caching it at startup, is what makes a takeover correct — the previous owner moved it. That is what `readBeforeEachExecution()` does for a bookmarked projector; see [Bookmark Read Frequencies](/posts/eventstore-projecting-events/#bookmark-read-frequencies).
+Reading the bookmark **after** winning the lease, rather than caching it at startup, is what makes a takeover correct — the previous owner moved it. A projector built with `bookmarkAs(...)` does that by default, reading its bookmark before every run, so the explicit `readBookmark()` above only matters for one built with `readBookmarkOnRequest()`; see [Bookmark Read Frequencies](/posts/eventstore-projecting-events/#bookmark-read-frequencies).
 
 Note what is *not* claimed here: the lease does not make processing exactly-once. A takeover after a committed batch whose bookmark did not land re-projects that batch, as it always would. Where that matters, the projection holds its own position — see [Being Exactly-Once Against Your Own Store](/posts/eventstore-projecting-events/#being-exactly-once-against-your-own-store).

@@ -13,13 +13,15 @@ Listeners enable your application to react to activity in the EventStore without
 
 In single-instance deployments, listeners help decouple components—one part appends events while another reacts asynchronously. But listeners become truly powerful in multi-node deployments where several application instances share the same storage backend. When one node appends events, all subscribed nodes across the cluster receive notifications, enabling distributed coordination without additional messaging infrastructure.
 
-EventStore provides two listener interfaces, both eventually consistent:
+EventStore provides two listener interfaces, both in `org.sliceworkz.eventstore.stream`:
 
-**`EventStreamEventuallyConsistentAppendListener`** notifies you when new events are written to a stream.
+**`AppendListener`** notifies you when new events are written to a stream.
 
-**`EventStreamEventuallyConsistentBookmarkListener`** notifies you when readers update their processing position — useful for monitoring progress in distributed event processing pipelines.
+**`BookmarkListener`** notifies you when readers update their processing position — useful for monitoring progress in distributed event processing pipelines.
 
-Both are subscribed through the same `subscribe(...)` method on an `EventStream`, and both are functional interfaces, so a lambda is enough.
+Both are subscribed through the same `subscribe(...)` method on an `EventStream` (or any `EventSource`, a [raw stream](/posts/eventstore-querying-events/#raw-streams-reading-without-domain-classes) included), and both are functional interfaces, so a lambda is enough. There is only one kind of each, and every listener is told after the commit, on a notification thread — which is why the names carry no "eventually consistent" qualifier: it would distinguish them from nothing.
+
+`subscribe(...)` returns a **`Subscription`**, the handle that ends that one listener — see [Subscriptions Have a Lifecycle](#subscriptions-have-a-lifecycle).
 
 ## Why Everything Is Eventually Consistent
 
@@ -29,7 +31,6 @@ That is not a limitation to work around, because the case a synchronous listener
 
 ```java
 List<Event<CustomerEvent>> written = stream.append(
-    AppendCriteria.none(),
     Event.of(new CustomerRegistered("123", "Alice"), Tags.of("customer", "123")));
 
 // read-your-own-writes: no subscription involved
@@ -39,7 +40,7 @@ EventReference justWritten = written.getLast().reference();
 
 To react to your own append on the appending thread, write the code after the call. Subscriptions exist for what *other* threads, processes and nodes append.
 
-## Eventually Consistent Append Listeners
+## Append Listeners
 
 An append listener receives an `EventReference` pointing to **at least** the last appended event — not the event data itself, and not one notification per event. This lightweight model lets you query exactly the events you care about, and it collapses a burst of appends into a single wake-up.
 
@@ -58,14 +59,13 @@ EventStream<OrderEvent> stream = eventStore.getEventStream(streamId, OrderEvent.
 // Track last processed position
 AtomicReference<EventReference> lastProcessed = new AtomicReference<>();
 
-// Subscribe to eventually consistent notifications
-stream.subscribe((EventReference atLeastUntil) -> {
+// Subscribe to notifications
+Subscription subscription = stream.subscribe((EventReference atLeastUntil) -> {
     // Query new events since last processed
-    stream.query(EventQuery.matchAll(), lastProcessed.get())
-        .forEach(event -> {
-            System.out.println("Processing: " + event.type());
-            lastProcessed.set(event.reference());
-        });
+    for (Event<OrderEvent> event : stream.query(EventQuery.matchAll().limit(500), lastProcessed.get())) {
+        System.out.println("Processing: " + event.type());
+        lastProcessed.set(event.reference());
+    }
 
     // Update bookmark for resumability
     stream.placeBookmark("order-processor", atLeastUntil, Tags.none());
@@ -96,18 +96,30 @@ Each subscriber's exception is caught, logged at ERROR, and the next subscriber 
 
 ### Subscriptions Have a Lifecycle
 
-Subscribing registers the stream with the storage, which then holds it **strongly** until the stream is closed. That is what keeps live updates working after the caller drops the variable — and it means nothing releases the subscription on your behalf:
+Subscribing registers the stream with the storage, which then holds it **strongly** for as long as it has a live subscription. That is what keeps live updates working after the caller drops the variable — and it means nothing releases the subscription on your behalf.
+
+**Close the `Subscription` to end one listener**, and leave the stream's other subscriptions going:
+
+```java
+Subscription subscription = stream.subscribe(reference -> { updateReadModel(); return reference; });
+// ...
+subscription.close();          // this listener stops being told; subscription.isActive() is now false
+```
+
+**Close the stream to end all of them**, or the store, which closes every stream it handed out:
 
 ```java
 try ( EventStream<OrderEvent> stream = eventStore.getEventStream(streamId, OrderEvent.class) ) {
     stream.subscribe(reference -> { updateReadModel(); return reference; });
     // ... application runs ...
-}   // subscription ended, registration released
+}   // subscriptions ended, registration released
 ```
+
+The two compose, because **a stream is registered with the storage exactly while it has a live subscription**: closing its last `Subscription` releases the stream just as closing the stream does, and subscribing again re-registers it. A handle is identified by itself, not by its listener — the same listener subscribed twice has two subscriptions — and closing it is idempotent. A notification already being dispatched when a handle closes may still reach its listener.
 
 A stream you only query and append through registers nothing and needs no cleanup at all. See [Lifecycle and Shutdown](/posts/eventstore-lifecycle/) for the full contract.
 
-## Eventually Consistent Bookmark Listeners
+## Bookmark Listeners
 
 Bookmark listeners notify you when readers update their processing position by placing a bookmark. They're useful for monitoring distributed event processing systems, detecting lag, and coordinating multiple processors.
 
@@ -125,7 +137,7 @@ EventStream<OrderEvent> stream = eventStore.getEventStream(streamId, OrderEvent.
 // Monitor all readers
 Map<String, EventReference> readerPositions = new ConcurrentHashMap<>();
 
-stream.subscribe((String reader, EventReference processedUntil) -> {
+Subscription subscription = stream.subscribe((String reader, EventReference processedUntil) -> {
     System.out.println("Reader '" + reader + "' processed up to: " +
         processedUntil.position());
 
@@ -156,4 +168,8 @@ Bookmark placement is also typically done by autonomous background processors th
 
 **On PostgreSQL, one notification is emitted per stream per statement**, not per row — so a 1000-event append wakes a subscriber once per stream it touched. See [PostgreSQL EventStorage](/posts/eventstore-configuring-postgresql-storage/#append-notifications).
 
-**Across nodes, delivery depends on LISTEN/NOTIFY being established.** If the monitoring connection is unavailable, notifications stop while queries keep working — which is exactly the silent failure the `sliceworkz.eventstore.notifications.up` gauge exists to make visible. See [Eventstore Observability](/posts/eventstore-observability-micrometer-prometheus-grafana/).
+**What a notification announces, a query can see.** A listener that reads nothing is treated as caught up, so a notification delivered before its events were readable would leave the subscriber behind with nothing to wake it. On PostgreSQL, committed events can sit behind the cluster's visibility barrier while an older writing transaction is open, so the append monitor **holds a notification back until the event it names is readable**. A subscribed projection therefore catches up by itself when a stall ends; a notification withheld for more than 10 seconds is logged at WARN. See [What Can Stall Reads](/posts/eventstore-configuring-postgresql-storage/#what-can-stall-reads-the-visibility-barrier).
+
+**Across nodes, delivery depends on LISTEN/NOTIFY being established.** If the monitoring connection is unavailable, notifications stop while queries keep working. That is the one silent failure mode of the store, and it is reported: an [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/#notification-channel-health) is told through `notificationChannelChanged` whenever a channel goes up or down, and `PostgresEventStorage.isNotificationsAvailable()` answers the same state for a health endpoint. A monitoring connection that dies *silently* — a dropped NAT or firewall state — is detected by a probe after `notificationProbeInterval` of silence (30 seconds by default) and replaced.
+
+**A malformed notification cannot take a monitor down.** A `NOTIFY` channel is a database-wide name, and anything in the database can publish on it. A payload that does not parse is logged at ERROR and dropped, and the monitor reads on.
