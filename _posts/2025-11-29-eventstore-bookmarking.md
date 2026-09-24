@@ -89,9 +89,6 @@ So the reference you read back — and the one a bookmark notification carries �
 - **A bookmark cannot carry a cursor that disagrees with the event it names.** Storing the caller's `(tx, position)` beside the id would let a bookmark pass validation with a stored id and a wrong cursor, since the check is on the id.
 - **A bookmarks table is valid in another store holding the same events.** An [import](/posts/eventstore-importing-events/) preserves event ids and reassigns both ordering columns, so bookmarks copied across by id resolve to the target's own coordinates as they stand.
 
-> Upgrading a PostgreSQL database from 0.10 needs a one-line migration of the bookmarks table — see [Upgrading to 0.11](/posts/eventstore-upgrading-to-0-11/#the-bookmarks-table).
-{: .prompt-warning }
-
 ## Retrieving a Bookmark
 
 The `getBookmark()` method retrieves the last bookmarked position for a reader:
@@ -146,8 +143,6 @@ stream.getBookmarks().stream()
 ```
 
 `updatedAt` is stamped at placement time, and `tags` are exactly the tags passed to `placeBookmark(...)` — which is what makes them worth populating with a hostname, an instance id or an application version. A reader that has stopped moving is much easier to chase down when its bookmark says which process last touched it.
-
-Bookmarks placed before the metadata was recorded read back with `Tags.none()` and an epoch `updatedAt`, so a filter on `updatedAt` should tolerate that rather than treat it as a stalled reader.
 
 ## Removing a Bookmark
 

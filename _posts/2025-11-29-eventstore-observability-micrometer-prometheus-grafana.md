@@ -31,7 +31,7 @@ The alternative — a meter facade naming counters, timers and gauges — was re
 The observer travels with the storage, the same way the shredding codec does. Give it to the storage builder, and every store built on that storage reports to it:
 
 ```java
-EventStoreObserver observer = new MyMicrometerObserver(registry);   // see below
+EventStoreObserver observer = new MicrometerObserver(registry);   // an example observer, see below
 
 EventStore store = PostgresEventStorage.newBuilder()
     .observer(observer)
@@ -105,15 +105,15 @@ For a health endpoint rather than a metric, `PostgresEventStorage.isNotification
 
 - **Thread-safe.** A store is used from many threads at once, and so is its observer.
 - **Cheap.** Every call is on the caller's thread, inside the operation it describes: a slow observer is a slow store. Anything expensive belongs on a thread of the observer's own.
-- **Never throwing.** An operation never fails because its observation did: the library wraps every observer with `EventStoreObserver.contained(...)`, which catches what escapes — a `RuntimeException`, or a `LinkageError` from a binding whose library is missing — and logs it, at ERROR the first time with its stack trace and at DEBUG after. That is a guard, not a licence: an observer that throws loses what it was recording.
+- **Never throwing.** An operation never fails because its observation did: the library wraps every observer with `EventStoreObserver.contained(...)`, which catches what escapes — a `RuntimeException`, or a `LinkageError` from an observer whose library is missing at runtime — and logs it, at ERROR the first time with its stack trace and at DEBUG after. That is a guard, not a licence: an observer that throws loses what it was recording.
 
 ### Cardinality Is the Observer's Concern
 
-Every observation carries the stream id as it is, and `purpose` is often an entity id — a [stream per entity](/posts/eventstore-stream-design-and-performance/) is a legitimate, and often the faster, layout. A tracer or a log line wants that purpose uncapped. A **metrics** registry does not: it never evicts a meter, so an uncapped per-entity tag is a leak that fails nothing — the process just gets steadily heavier. An observer turning the purpose into a metrics tag must bound the values it admits, which is why the cap lives where the tag value is chosen, in the observer, and not in the store.
+Every observation carries the stream id as it is, and `purpose` can be an entity id where a context is [split into a stream per entity](/posts/eventstore-stream-design-and-performance/#when-a-stream-per-entity-is-worth-it). A tracer or a log line wants that purpose uncapped. A **metrics** registry does not: it never evicts a meter, so an uncapped per-entity tag is a leak that fails nothing — the process just gets steadily heavier. An observer turning the purpose into a metrics tag must bound the values it admits, which is why the cap lives where the tag value is chosen, in the observer, and not in the store.
 
 ## Example: a Micrometer Observer
 
-A ready-made Micrometer binding is provided separately from the eventstore library. What such an observer does fits on a page, and writing your own is a reasonable choice. A minimal one, timing every operation by kind and answer, and exposing channel health as a gauge:
+As an example of what you could build on the SPI, here is an observer that reports to Micrometer. It fits on a page: it times every operation by kind and answer, and exposes channel health as a gauge. Adapt it to the meters, tags and naming conventions your application already uses:
 
 ```java
 import io.micrometer.core.instrument.*;

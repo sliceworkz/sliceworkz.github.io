@@ -353,9 +353,6 @@ The recommended approach is to create the database schema manually using DDL scr
 
 The library includes a `quickstart.ddl.sql` script (unprefixed, ready to run) alongside the prefixed `ensure-schema.sql`. Both create the same objects — the events table, the bookmarks table, the two lease tables, the shredding key table, their indexes, and the notification functions and triggers.
 
-> **Upgrading a database created by 0.10?** The bookmarks table needs a hand-applied migration under every init mode, and a `VALIDATE`/`NONE` deployment has two new indexes and a function body to apply. See [Upgrading to 0.11](/posts/eventstore-upgrading-to-0-11/#4-postgresql-schema).
-{: .prompt-warning }
-
 ```sql
 CREATE TABLE IF NOT EXISTS events (
     -- Primary key and positioning
@@ -392,14 +389,12 @@ CREATE TABLE IF NOT EXISTS events (
 
 The `stream_purpose` default matches `EventStreamId.DEFAULT_PURPOSE`, a public constant — so an interop layer doing raw SQL inserts can bind the same value the library does rather than copy the literal out of a script.
 
-A database created by an earlier release may still carry an `event_erasable_data` column. Nothing reads or writes it and validation no longer checks it: it may stay, or go with `ALTER TABLE <prefix>events DROP COLUMN event_erasable_data;`.
-
 These indexes are created on the events table:
 
 | Index | Purpose |
 |---|---|
 | `idx_events_global_order` | B-tree on `(event_tx, event_position)` — the global order, for reads that bind **no** stream column: a wildcard stream, `head()` of the whole store, an unscoped import, the startup check. Partial on `event_position > 0` |
-| `idx_events_context_order` | B-tree on `(stream_context, event_tx, event_position)` — for reads that bind the context and leave the purpose open: a whole-context replay over a stream-per-entity layout. Partial on `event_tx > '0'::xid8` |
+| `idx_events_context_order` | B-tree on `(stream_context, event_tx, event_position)` — for reads that bind the context and leave the purpose open: a whole-context replay over a context split into a stream per entity. Partial on `event_tx > '0'::xid8` |
 | `idx_events_stream_type_position` | B-tree: stream + event type, ordered by `(event_tx, event_position)` |
 | `idx_events_stream_position` | B-tree: ordered stream replay, and `head()` of a stream |
 | `idx_events_tags` | GIN over the tag array, for tag-only lookups |
@@ -444,7 +439,7 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 CREATE INDEX IF NOT EXISTS idx_bookmarks_event_id ON bookmarks(event_id);
 ```
 
-**A bookmark stores the event id and nothing else about the event.** `getBookmark` and `getBookmarks` join the events row on its unique `event_id` index — one probe — to answer the bookmark's transaction and position, and the bookmark trigger does the same for its notification payload. So a bookmark always reads back with the store's own coordinates for the event it names, and a bookmarks table copied between stores by id is valid as it stands. A database created while this table still had `event_position` and `event_tx` columns must drop them — see [Upgrading to 0.11](/posts/eventstore-upgrading-to-0-11/#the-bookmarks-table).
+**A bookmark stores the event id and nothing else about the event.** `getBookmark` and `getBookmarks` join the events row on its unique `event_id` index — one probe — to answer the bookmark's transaction and position, and the bookmark trigger does the same for its notification payload. So a bookmark always reads back with the store's own coordinates for the event it names, and a bookmarks table copied between stores by id is valid as it stands.
 
 The foreign key deliberately does **not** cascade: an event deletion would otherwise silently remove the bookmarks of the readers still pointing into the deleted range — the lagging ones — and an absent bookmark means "replay from the beginning". With the default `NO ACTION`, deleting events out from under an outstanding bookmark fails loudly.
 
@@ -511,12 +506,6 @@ CREATE INDEX IF NOT EXISTS idx_shredding_keys_subject
 `key_material` is nullable and that is the whole mechanism: an erasure nulls it, stamps `shredded_at` and `shredded_reason`, and keeps the row. The unique index is partial on `key_material IS NOT NULL`, so a subject holds exactly one *live* key per category while every key it ever held stays on record.
 
 There is deliberately **no foreign key** between this table and the events table, in either direction. Events name their keys through ordinary `dek:` tags; a constraint would either block pruning events or cascade keys away with them — and a cascade here would erase data nobody asked to erase.
-
-#### Migrating a Database Created Before Shredding Existed
-
-`ENSURE` only ever creates tables, so it adds this one on the next start of an existing database and nothing else is needed. A `VALIDATE` or `NONE` deployment, where a DBA applies DDL by hand, needs the three statements above applied with the store's prefix.
-
-There is **no data migration**: the table starts empty, and events written before shredding existed carry no sealed values. Schema validation covers this table like the others, so an un-migrated database is reported at startup rather than at the first erasure request — which is the failure worth catching early, since an erasure with nowhere to destroy anything is a compliance problem rather than an outage.
 
 ### Append Notifications
 
@@ -616,7 +605,7 @@ What "brings up to date" means differs per kind of object, and the difference ma
 | Object | What ENSURE does |
 |---|---|
 | Tables, columns | **Created if absent**, never altered |
-| Indexes | **Created if absent**, never rebuilt — with one exception: the two superseded order indexes `idx_events_tx_position` and `idx_events_context_tx_position` are **dropped** (see [Upgrading to 0.11](/posts/eventstore-upgrading-to-0-11/#4-postgresql-schema)) |
+| Indexes | **Created if absent**, never rebuilt |
 | The `btree_gin` extension | Created if absent, skipped entirely when already present |
 | Functions | **`CREATE OR REPLACE`d every time** — the body always matches this release |
 | Triggers | Compared against the expected shape (timing, orientation, transition table, target function) and **recreated only when it differs** |
@@ -644,8 +633,7 @@ Validation checks that:
 
 - the required tables exist (`PREFIX_events`, `PREFIX_bookmarks`, `PREFIX_leases`, `PREFIX_lease_contenders`, `PREFIX_shredding_keys`)
 - every expected column is present, with the right type and nullability
-- the expected indexes exist by name — including `idx_events_stream_tags` and `idx_events_stream_idempotency` — and the two order indexes carry their admission predicates, while the two indexes they replaced are gone
-- the bookmarks table no longer carries the `event_position` and `event_tx` columns (the message names the migration)
+- the expected indexes exist by name — including `idx_events_stream_tags` and `idx_events_stream_idempotency` — and the two order indexes carry their admission predicates
 - the bookmarks foreign key exists by name (`fk_bookmarks_event_id`)
 - the notification functions exist
 - each trigger exists **with the expected orientation** (row-level vs statement-level), not merely by name
@@ -839,7 +827,7 @@ Things worth knowing about it:
 
 - **Only conditional appends take it.** An append without criteria reads nothing and so cannot observe a stale boundary, which keeps bulk ingestion fully parallel.
 - **The key is the stream, not the filter.** Hashing the filter would be finer grained and unsound: two overlapping-but-unequal filters hash differently and would not exclude each other.
-- **Cost.** Conditional appends to *one* stream serialize for the duration of a single INSERT, so a hot stream is a throughput ceiling: measured, writers sharing one stream's lock stay flat at ~1.4 appends/ms from one writer to sixteen, where writers spread over entities scale from 5.5 to 24. Stream layout is what buys the lock off — see [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/).
+- **Cost.** Conditional appends to *one* stream serialize for the duration of a single INSERT, so a hot stream is a throughput ceiling: measured, writers sharing one stream's lock stay flat at ~1.4 appends/ms from one writer to sixteen, where writers spread over entities scale from 5.5 to 24. Keeping each decision's hold on the lock short — take `head()` before reading, and present it as the reference — is what keeps a single context stream scaling; see [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/).
 - **The wait is bounded** by `lockTimeout` (10 seconds by default), so a stalled holder fails the appends queued behind it instead of draining the pool — see [Timeouts](#timeouts-a-stalled-lock-holder-and-a-socket-that-dies-silently).
 - **Key collisions are harmless.** They only make two unrelated streams take turns; they can never let a real conflict through.
 

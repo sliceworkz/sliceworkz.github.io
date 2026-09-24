@@ -2,7 +2,7 @@
 layout: post
 toc: true
 title: Stream Design and Performance
-description: A stream per context or a stream per entity, what a read and a consistency check cost, and what the in-memory store cannot tell you — the measured conclusions of the eventstore benchmark suite
+description: Why one stream per context is the DCB default, what a read and a consistency check cost, and what the in-memory store cannot tell you — the measured conclusions of the eventstore benchmark suite
 date: 2026-09-24 02:00:00
 categories: [Eventstore Documentation,Eventstore deployment]
 tags: [performance,benchmark,stream design,postgres,dcb,capacity]
@@ -13,29 +13,35 @@ This guide summarises what the eventstore's benchmark suite measured about the d
 > **Read the figures for direction and rough magnitude.** Unless marked otherwise, they come from PostgreSQL 18 in Testcontainers on a developer machine: good for "clearly faster" and "about ten times", not for a third digit. The ten-million-event figures come from a deliberately configured external server and are published in the repository under `sliceworkz-eventstore-benchmark/results/`.
 {: .prompt-info }
 
-## One Stream Per Context, or One Per Entity?
+## One Stream Per Context — and When to Split It
 
-The first layout question: a stream per bounded context, with entities told apart by tags (`inventory/default`, every event tagged `sku:…`), or a stream per entity, with the id as the purpose (`inventory/WIDGET-42`). Both are ordinary uses of `EventStreamId`. The suite measured the same 100.000-event corpus — 2000 entities — laid out both ways, so the difference is attributable to the layout alone.
+**The recommended DCB design is one stream per bounded context**, with entities told apart by tags: `EventStreamId.forContext("learning")`, every event tagged `student:…`, `course:…`. That is the layout DCB is built around, for one reason that outweighs every figure below: **the consistency check of a conditional append is scoped to the stream it appends to.** It sees the facts in that stream and no other, and within it the boundary is drawn with types and tags.
 
-**A stream per entity wins or ties everything except reading a whole context in order.** Per-entity ÷ per-context, where higher is better for per-entity:
+So a rule that spans entities — "a student takes at most five courses, a course at most its capacity" — is enforceable with one append exactly when the facts it depends on share a stream. In a single context stream they always do, and the boundary can follow the business rule wherever it goes, today and after the next requirement. [Aggregates and DCB](/posts/aggregates-and-dcb/) works through exactly such a rule.
+
+### The Cost of One Stream: a Shared Lock
+
+What a single stream costs is contention: conditional appends are serialized per stream by an advisory lock, so every conditional append in the context takes turns. The suite measured the same 100.000-event corpus — 2000 entities — laid out as one stream per context and as one stream per entity (the entity id as the purpose), so the difference is attributable to the layout alone. Per-entity ÷ per-context, where higher is better for per-entity:
 
 | Workload | 1 thread | 8 threads |
 |---|---|---|
 | conditional append (one type, one tag — the canonical DCB check) | 4.2× | **16.8×** |
-| decide, then append | 1.4× | 2.3× |
+| decide, then append (unbounded read, last relevant event as reference) | 1.4× | 2.3× |
 | read one entity's history, cold | 2.4× | 2.2× |
 | find one needle by tag | 1.5× | 1.4× |
 | read one entity's history, hot | 1.2× | 1.2× |
 | last event of an entity | 1.1× | 1.2× |
-| page a whole context in order (500 events) | 0.074 | 0.066 |
 | unconditional append (the control) | 1.04× | 0.98× |
 
-- **The 16.8× on conditional appends is the advisory lock, not an index.** Conditional appends are serialized per stream. With one stream per context, every conditional append in the context takes the *same* lock and eight writers take turns; with one stream per entity, writers to different entities take different locks and never meet. The gap growing with writers is the signature of contention rather than of a cheaper plan.
-- **The one loss is reading a context in order** — a whole-context replay, a `Projector` over a context, an export — because under a per-entity layout that is a *cross-entity* read. It was measured before `idx_events_context_order` existed, the index that serves exactly that read by giving it a start condition at the context; on the current schema a page is expected to cost the page.
+- **The 16.8× on conditional appends is the lock, not an index.** With one stream, eight writers take turns; with one stream per entity, writers to different entities take different locks. The gap growing with writers is the signature of contention rather than of a cheaper plan.
+- **Most of that gap closes when decisions are made the recommended way.** A decision that takes the stream's `head()` first, bounds its reads with it and presents the head as its reference holds the lock only for a sliver of the operation. Measured on a single stream at ten million events, such a decision is the one conditional write that scales with writers — see [The Consistency Check, and a Stale Cursor](#the-consistency-check-and-a-stale-cursor).
+- **Reading within one stream is already fast.** The read differences are small, and a single stream reads a whole context in order off its own index — a replay, a `Projector` over the context, an export — which is a cross-entity read in a per-entity layout.
 
-### Read an Entity Through Its Own Stream, or the Layout Buys Nothing
+### When a Stream Per Entity Is Worth It
 
-This is the trap, and it is entirely in the calling code. On a per-entity layout, `EventStreamId.forContext("inventory")` with a wildcard purpose and a tag query addresses one entity *the per-context way* — and lands on no index built for it. Measured on the same per-entity corpus, the "last event of an entity" probe was **23–29× slower** addressed by tag through the wildcard than addressed through the entity's own stream.
+Split a context into a stream per entity only when **every** decision in it concerns one entity at a time, and the shared lock has been *measured* to be the bottleneck. You then give up checking any rule that spans entities with one append — permanently, for every rule the context may acquire later. That is a steep price for a lock, which is why it is an optimisation, not a default.
+
+If you do split, **read an entity through its own stream.** Addressing one entity by tag through the wildcard `EventStreamId.forContext("inventory").anyPurpose()` lands on no index built for it: the "last event of an entity" probe measured **23–29× slower** that way than through the entity's own stream.
 
 ```java
 // per-entity layout: read the entity through its OWN stream
@@ -48,24 +54,13 @@ eventStore.getEventStream(EventStreamId.forContext("inventory").anyPurpose(), In
           .query(EventQuery.forTags(Tags.of("sku", "WIDGET-42")));
 ```
 
-Choosing a stream per entity and then querying by tag is the worst of both.
-
-### A Consistency Boundary Lives Inside One Stream
-
-A stream per entity is a storage layout, not an aggregate — and it has one hard consequence to design for. **The consistency check of a conditional append is scoped to the stream it appends to**: it sees the facts in that stream and no other. Within that stream, the boundary is still drawn with types and tags.
-
-So a rule that spans entities — "a student takes at most five courses, a course at most its capacity" — can only be checked by one append if the facts it depends on are in one stream. With a stream per student and a stream per course, no single append can see both, and the rule cannot be enforced with DCB. Choose the layout per context, from its rules:
-
-- where decisions are **about one entity at a time**, a stream per entity is the faster layout;
-- where decisions **span entities**, keep those facts in one stream — per context — and draw the boundary with tags, accepting that conditional appends in that stream share one lock. [Aggregates and DCB](/posts/aggregates-and-dcb/) works through exactly such a rule.
-
 ### The Cost the Benchmarks Do Not Include
 
-Every figure here is measured with no [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/). 2000 purposes are 2000 streams to an observer, and one turning the purpose into a metrics tag has to bound it — see [cardinality](/posts/eventstore-observability-micrometer-prometheus-grafana/#cardinality-is-the-observers-concern). That is the observer's cost, measured with the observer.
+Every figure here is measured with no [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/). With a stream per entity, 2000 purposes are 2000 streams to an observer, and one turning the purpose into a metrics tag has to bound it — see [cardinality](/posts/eventstore-observability-micrometer-prometheus-grafana/#cardinality-is-the-observers-concern). That is the observer's cost, measured with the observer.
 
 ## Where Writers Meet
 
-Three ways to put writers on one 100.000-event per-entity corpus, differing only in what they share. Conditional appends per millisecond:
+Three ways to put writers on one 100.000-event corpus, differing only in what they share: each writer on its own stream and boundary, all writers on one stream's lock with different boundaries, and all writers on one boundary. Conditional appends per millisecond:
 
 | Writers | spread over entities | sharing one stream (lock) | sharing one boundary | …of which useful |
 |---|---|---|---|---|
@@ -76,7 +71,7 @@ Three ways to put writers on one 100.000-event per-entity corpus, differing only
 
 - **A shared lock does not slow an append down; it stops throughput scaling at all.** Writers spread over entities go from 5.45 to 24 — 4.4× — from one to eight; writers sharing one stream's lock stay flat at ~1.4 across a sixteen-fold increase in writers.
 - **At one shared boundary, adding writers makes the system strictly worse.** Useful appends fall from 8.15 to 0.22 per ms from one writer to sixteen — a 37× collapse — while the conflict rate climbs from 0% to 82%. Raw throughput hides it: 1.24 ops/ms at sixteen writers still *looks* like work.
-- **What to do with it.** A coupon redeemed at most N times, a counter, a single aggregate everyone touches: a boundary that hot has a one-writer ceiling, and more instances behind it buy nothing. **Widen the boundary** — one per basket rather than one per coupon. The lock, by contrast, is bought off by stream layout.
+- **What to do with it.** A coupon redeemed at most N times, a counter, a single aggregate everyone touches: a boundary that hot has a one-writer ceiling, and more instances behind it buy nothing. **Widen the boundary** — one per basket rather than one per coupon. The shared lock of a single stream is a lesser ceiling, and the head-first decision below keeps it narrow.
 
 ## The Consistency Check, and a Stale Cursor
 
@@ -117,9 +112,9 @@ Keep using it for tests and for local development. Size the application against 
 
 ## Summary
 
-- Prefer a **stream per entity** where decisions concern one entity at a time — and then read each entity through its own stream.
-- **Keep the facts a decision spans in one stream**: a conditional append checks only the stream it appends to.
-- **Take the head before you decide**, bound your reads with it, and present it as the reference.
+- **One stream per bounded context**, entities told apart by tags, is the recommended DCB design: a conditional append checks only the stream it appends to, and one stream keeps every rule checkable.
+- **Take the head before you decide**, bound your reads with it, and present it as the reference — it keeps the shared lock narrow and the check cheap.
 - **Widen hot boundaries**; more writers on one boundary is strictly worse.
+- Split a context into **a stream per entity** only when every decision is about one entity and the lock is measured to be the bottleneck — and then read each entity through its own stream.
 - **Bound reads** with `limit(n)`; deserialization, not the database, is where a large read spends its time.
 - **Measure against PostgreSQL**, never against the in-memory store.

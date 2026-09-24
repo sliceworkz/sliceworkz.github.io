@@ -447,7 +447,7 @@ EventStream<CustomerEvent> allCustomers = eventstore.getEventStream(
 List<Event<CustomerEvent>> allCustomerEvents = allCustomers.query(EventQuery.matchAll().limit(500));
 ```
 
-> With a stream per entity, a context-wide read like this is a cross-entity read. It is served by its own index on PostgreSQL, so it pages efficiently in order — but reading **one** entity this way, by tag through the wildcard, rather than through its own stream, gives up everything the per-entity layout bought. See [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/).
+> Where a context is split into a stream per entity, a context-wide read like this is a cross-entity read. It is served by its own index on PostgreSQL, so it pages efficiently in order — but reading **one** entity this way, by tag through the wildcard, rather than through its own stream, gives up everything the split bought. See [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/).
 {: .prompt-warning }
 
 ### Query across all contexts

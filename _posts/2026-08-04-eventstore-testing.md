@@ -269,7 +269,7 @@ public class MyBackend implements EventStoreBackend {
 }
 ```
 
-The default implementation of `supports` is an exhaustive `switch` too, and that is deliberate: adding a capability to the enum breaks compilation in every backend that overrides it the same way, forcing a decision rather than letting a backend claim support it does not have. Capabilities whose SPI methods default to throwing are `false` by default (`LEASE`), so a backend written before the capability existed *skips* those scenarios instead of failing them.
+The default implementation of `supports` is an exhaustive `switch` too, and that is deliberate: adding a capability to the enum breaks compilation in every backend that overrides it the same way, forcing a decision rather than letting a backend claim support it does not have. Capabilities whose SPI methods default to throwing are `false` by default (`LEASE`), so a backend that does not implement them *skips* those scenarios instead of failing them.
 
 Backends are discovered with the `ServiceLoader`, so register it:
 
@@ -311,7 +311,7 @@ The TCK scenarios are main classes of the testing module, not test classes of yo
 
 Every scenario now runs against your backend. Among what it pins down: basic append and query semantics, tag round-tripping over the full legal character set, the `until` boundary, query limits and paging (`EventPageTest`), `head()` (`HeadTest`), the stream scope each wildcard reads (`StreamScopeTest`), raw streams, sealed-interface type filters, `@EventName`, upcast chains, event timestamps as instants, concurrent optimistic locking, idempotent batches at the stream and the SPI level, payloads that are not JSON documents, append-notification granularity, subscription and storage lifecycle — including that a stream whose last subscription closed becomes unreachable — serde failure reporting, bookmark rejection of a reference the store never stored and bookmarks answered with the store's own coordinates, per-batch projector durability, what each operation reports to an observer (`ObservationTest`), crypto-shredding and reader entitlement against your own key store, and — where supported — importing and leases.
 
-A storage built before an SPI method existed keeps compiling: `head()` has a default over `query()`, `unsubscribe` a no-op default, the lease methods defaults that throw. The TCK is what tells you a default is not good enough — `EventStreamSubscriptionLifecycleTest` catches a backend relying on the no-op `unsubscribe` by asserting a closed stream is released.
+Several SPI methods have defaults, so a storage need not implement everything to compile: `head()` has a default over `query()`, `unsubscribe` a no-op default, the lease methods defaults that throw. The TCK is what tells you a default is not good enough — `EventStreamSubscriptionLifecycleTest` catches a backend relying on the no-op `unsubscribe` by asserting a closed stream is released.
 
 ### Capabilities
 

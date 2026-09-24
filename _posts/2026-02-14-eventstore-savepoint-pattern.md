@@ -10,7 +10,7 @@ tags: [projection,projector,read model,savepoint,initQuery]
 
 # The Savepoint Pattern
 
-This guide covers the savepoint pattern — a technique for avoiding full event replays when initializing projections, using the `initQuery()` capability introduced in EventStore 0.6.3.
+This guide covers the savepoint pattern — a technique for avoiding full event replays when initializing projections, using the `initQuery()` method of a projection.
 
 ## The Problem: Full Replays
 

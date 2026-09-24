@@ -183,7 +183,7 @@ Like bookmarks, leases are addressed globally by name, so the list spans the who
 
 ## Backend Support
 
-The lease methods are **optional** on the SPI: their defaults throw `UnsupportedOperationException`, and the TCK gates its lease scenarios on `Capability.LEASE` so a backend written before leases existed skips them rather than failing them. See [Testing](/posts/eventstore-testing/#capabilities).
+The lease methods are **optional** on the SPI: their defaults throw `UnsupportedOperationException`, and the TCK gates its lease scenarios on `Capability.LEASE` so a backend that does not implement leases skips them rather than failing them. See [Testing](/posts/eventstore-testing/#capabilities).
 
 | Backend | Leases |
 |---|---|

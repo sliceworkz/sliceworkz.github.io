@@ -199,7 +199,7 @@ EventStream<CustomerEvent> stream = eventstore.getEventStream(streamId, Customer
 > **A stream is not an aggregate.** It is tempting to read this as "the stream for customer 123" and to rebuild one object per entity from it — the classic aggregate. Resist that. Consistency comes from the **tags on the events**, not from the boundary of the stream, which is what lets a single decision span facts about several entities at once. The [Dynamic Consistency Boundary](#dynamic-consistency-boundary---optimistic-locking-with-tags) section below shows the shape to aim for, and it is the one this library is built around.
 {: .prompt-warning }
 
-> Whether the purpose should be an entity id — a stream per customer rather than one stream for all customers — is a layout decision with measured consequences for both reads and write contention. On PostgreSQL a stream per entity wins or ties almost everything, provided you read an entity through its own stream — but a conditional append only checks the stream it appends to, so facts that one decision spans have to share a stream. See [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/) before settling on one.
+> **The recommended design is one stream per bounded context**, entities told apart by tags. A conditional append only checks the stream it appends to, so the facts one decision spans have to share a stream — and in a single context stream they always do. Use a purpose to separate *kinds* of stream within a context; a stream per entity is an optimisation with a steep price, weighed in [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/).
 {: .prompt-info }
 
 ### 4. Append Events
@@ -521,7 +521,6 @@ See [Testing Your Application](/posts/eventstore-testing/) for the full fixture 
 - Consider implementing [event upcasting](/posts/eventstore-defining-events/#approach-2-upcasting) for schema evolution
 - Choose your [stream layout](/posts/eventstore-stream-design-and-performance/) with the measured trade-offs in hand
 - Report what the store does to your metrics or tracing library through an [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/)
-- Upgrading from 0.10? Read [Upgrading to 0.11](/posts/eventstore-upgrading-to-0-11/) first
 - Understand [which exceptions to retry](/posts/eventstore-error-handling/) before writing your first retry loop
 - Plan [store lifecycle and shutdown](/posts/eventstore-lifecycle/) before going to production
 - Holding personal data in your events? See [Erasing Personal Data](/posts/eventstore-erasing-personal-data/) before your first append, since it decides how the events are declared
