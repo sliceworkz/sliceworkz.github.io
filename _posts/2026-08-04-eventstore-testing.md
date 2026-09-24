@@ -27,14 +27,14 @@ Everything lives in `src/main/java` rather than a test-jar: a test-jar is not tr
 | Package | For whom |
 |---|---|
 | `org.sliceworkz.eventstore.testing.fixture` | application authors — the `given / when / then` fixture |
-| `org.sliceworkz.eventstore.testing` | storage authors — the backend harness (`AbstractEventStoreTest`, `EventStoreBackend`, `@ForEachBackend`) |
+| `org.sliceworkz.eventstore.testing` | storage authors — the backend harness (`AbstractEventStoreTest`, `EventStoreBackend`, `@ForEachBackend`); everyone — `RecordingObserver` |
 | `org.sliceworkz.eventstore.testing.tck` | storage authors — the shared compliance scenarios |
 
 ## Testing Application Code with EventStoreFixture
 
 Almost every DCB application has the same shape: query the events relevant to a decision, decide, append conditionally. Three parts of that are awkward to test by hand:
 
-- **Seeding history** takes a loop of `append(AppendCriteria.none(), Event.of(...))`
+- **Seeding history** takes a loop of `append(Event.of(...))`
 - **Asserting on what was appended** means picking `data()` and `tags()` out of events whose reference and timestamp the store assigns
 - **Provoking an `OptimisticLockingException`** deterministically needs an append to land in the window between the decider's query and its own append
 
@@ -54,13 +54,14 @@ class Registrations {
     }
 
     boolean subscribe ( String studentId, String courseId ) {
-        EventQuery relevant = EventQuery.forEvents(EventTypesFilter.any(), Tags.of("course", courseId));
-        List<Event<LearningEvent>> facts = stream.query(relevant).toList();
+        EventQuery relevant = EventQuery.forTags(Tags.of("course", courseId));
+        EventReference head = stream.head().orElse(null);
+        List<Event<LearningEvent>> facts = stream.query(relevant.until(head));
 
         // ... decide from the facts ...
 
         stream.append(
-            AppendCriteria.of(relevant, facts.getLast().reference()),
+            AppendCriteria.of(relevant, head),
             Event.of(new StudentSubscribed(studentId, courseId),
                      Tags.of("student", studentId, "course", courseId)));
         return true;
@@ -226,13 +227,13 @@ void countsOnlySubscriptionsUpToTheBoundary ( ) {
 
     fixture.given(event(new StudentSubscribed("3", "abc001")).tagged("course", "abc001"))
            .project(new SubscriptionCount("abc001"))
-           .upTo(upToTheSecond)
-           .expectEventsProcessed(2)
+           .until(upToTheSecond)
+           .expectEventsHandled(2)
            .expectState(count -> assertEquals(2, count.count()));
 }
 ```
 
-Without `upTo(...)` the projection runs to the head of the store. `inBatchesOf(n)` sets the projector's batch size, `projection()` returns the projection itself and `metrics()` the `ProjectorMetrics` of the run.
+Without `until(...)` the projection runs to the head of the store. `inBatchesOf(n)` sets the projector's batch size, `projection()` returns the projection itself and `metrics()` the `ProjectorMetrics` of the run.
 
 ## Testing a Custom EventStorage: the TCK
 
@@ -308,7 +309,9 @@ The TCK scenarios are main classes of the testing module, not test classes of yo
 </plugin>
 ```
 
-Every scenario now runs against your backend. Among what it pins down: basic append and query semantics, tag round-tripping over the full legal character set, the `until` boundary, query limits, concurrent optimistic locking, append-notification granularity, subscription and storage lifecycle, serde failure reporting, bookmark rejection of a reference the store never stored, per-batch projector durability, crypto-shredding of personal data against your own key store, and — where supported — importing and leases.
+Every scenario now runs against your backend. Among what it pins down: basic append and query semantics, tag round-tripping over the full legal character set, the `until` boundary, query limits and paging (`EventPageTest`), `head()` (`HeadTest`), the stream scope each wildcard reads (`StreamScopeTest`), raw streams, sealed-interface type filters, `@EventName`, upcast chains, event timestamps as instants, concurrent optimistic locking, idempotent batches at the stream and the SPI level, payloads that are not JSON documents, append-notification granularity, subscription and storage lifecycle — including that a stream whose last subscription closed becomes unreachable — serde failure reporting, bookmark rejection of a reference the store never stored and bookmarks answered with the store's own coordinates, per-batch projector durability, what each operation reports to an observer (`ObservationTest`), crypto-shredding and reader entitlement against your own key store, and — where supported — importing and leases.
+
+A storage built before an SPI method existed keeps compiling: `head()` has a default over `query()`, `unsubscribe` a no-op default, the lease methods defaults that throw. The TCK is what tells you a default is not good enough — `EventStreamSubscriptionLifecycleTest` catches a backend relying on the no-op `unsubscribe` by asserting a closed stream is released.
 
 ### Capabilities
 
@@ -334,10 +337,9 @@ class MyStorageQuirksTest extends AbstractEventStoreTest {
         EventStream<CustomerEvent> stream =
             eventStore().getEventStream(EventStreamId.forContext("customer"), CustomerEvent.class);
 
-        stream.append(AppendCriteria.none(),
-                      Event.of(new CustomerRegistered("John"), Tags.none()));
+        stream.append(Event.of(new CustomerRegistered("John"), Tags.none()));
 
-        assertEquals(1, stream.query(EventQuery.matchAll()).count());
+        assertEquals(1, stream.query(EventQuery.matchAll()).size());
     }
 
     @ForEachBackend(requires = Capability.IMPORT)
@@ -353,10 +355,10 @@ class MyStorageQuirksTest extends AbstractEventStoreTest {
 - `storageOptions()` — override to ask the backend for a store with a result limit or a table prefix
 - `createEventStorage()` — override to supply a storage directly instead of going through a backend
 - `waitBecauseOfEventualConsistency(BooleanSupplier)` — an Awaitility helper for asynchronous listener assertions
-- `eventStoreWithShredding()` — a store over the same storage that can protect and erase personal data, built on the key store this backend supplies; `eventStoreWithShredding(ShreddingKeyStore)` takes one of your own, for asserting what an erasure recorded or standing in a key store that fails
+- `eventStoreWithShredding()` — a store over the same storage that can protect and erase personal data, built on the key store this backend supplies; `eventStoreWithShredding(ShreddingKeyStore)` takes one of your own, for asserting what an erasure recorded or standing in a key store that fails; `eventStoreWithShredding(ShreddingCodec)` takes a whole codec — a [restricted or withholding](/posts/eventstore-erasing-personal-data/#readers-that-may-not-see-personal-data) one, say
 - `dataSource()` — direct database access, where the backend is SQL-backed
 
-`@ForEachBackend(excludingBackends = "...")` opts a backend out for **cost**, not capability — a scenario too slow to run against a particular store. It is also reported as skipped, so the gap stays visible.
+`@ForEachBackend(excludingBackends = "...")` opts a backend out for **cost**, not capability — a scenario too slow to run against a particular store. It is also reported as skipped, so the gap stays visible. It is not allowed inside the TCK: a compliance scenario that skips a backend proves nothing about it, so a TCK scenario declares a capability with `requires` instead.
 
 ### Narrowing a Local Run
 
@@ -368,9 +370,25 @@ mvn test -Deventstore.testing.backends=mystorage
 
 The same property partitions a CI run across separate JVMs, which is the supported way to parallelise: in-JVM parallelism is not an option while per-test isolation works by dropping and recreating a store's objects, since two scenarios sharing a backend concurrently would tear down each other's state mid-test.
 
+## Asserting What the Store Reports: RecordingObserver
+
+`RecordingObserver` is an [`EventStoreObserver`](/posts/eventstore-observability-micrometer-prometheus-grafana/) that keeps everything it is told, published for application tests as much as for storage authors:
+
+```java
+RecordingObserver observer = new RecordingObserver();
+EventStore store = EventStore.on(storage).observer(observer).build();
+
+stream.head();
+
+Recording head = observer.last(Observation.Head.class);
+assertInstanceOf(Outcome.HeadRead.class, head.outcome().orElseThrow());
+```
+
+Every operation is a `Recording`: what was started, what it answered or failed with, whether it was closed, and the recording it was started inside of — so a test can check that a projector's page query nests under its batch. Lifecycle and health signals are kept as `Signal`s. It also checks the contract a store owes an observer — a scope completed twice, or both completed and failed, or closed twice — and keeps what it finds in `violations()`, so a test asserting that list is empty has checked the store along the way.
+
 ## What Cannot Be Asserted
 
-**Timestamps.** Events are stamped by the JVM clock in memory and by the server clock on PostgreSQL, with no `Clock` seam in either. Assert on them with a tolerance window, or not at all. The one path that writes a chosen timestamp is `importEvents`, which bypasses `append()` — see [Importing Events Between Stores](/posts/eventstore-importing-events/).
+**Timestamps.** Events are stamped by the JVM clock in memory and by the server clock on PostgreSQL, with no `Clock` seam in either. The stamp is an `Instant`, so compare it against the instants either side of the append, as the TCK's `EventTimestampTest` does, or not at all. The one path that writes a chosen timestamp is `importEvents`, which bypasses `append()` — see [Importing Events Between Stores](/posts/eventstore-importing-events/).
 
 **Positions as absolute numbers.** A position is unique across a storage, not per stream, so a test that seeds two streams cannot predict the numbers. Compare references with `happenedBefore` / `happenedAfter` instead of comparing positions.
 

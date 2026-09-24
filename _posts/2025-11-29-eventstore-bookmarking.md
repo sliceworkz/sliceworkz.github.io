@@ -27,7 +27,7 @@ Eventual consistency allows readers and processors to move independently from th
 CustomerSummary projection = new CustomerSummary("123");
 
 // Process all historical events
-Projector.from(stream).towards(projection).build().run();
+Projector.from(stream).into(projection).build().run();
 
 // Now caught up with history
 ```
@@ -80,8 +80,17 @@ stream.placeBookmark("my-reader", referenceFromSomewhereElse, Tags.none());
 
 This is the contract on **every** backend — PostgreSQL enforces it with the `fk_bookmarks_event_id` foreign key, the in-memory backends check their own log — and the TCK pins it per backend. Without it, a miswired multi-store setup poisons a reader's cursor silently, and the reader then resumes from a position that means nothing in the store it is reading.
 
-> The check is on the **event id alone**. The `(transaction, position)` pair that cursor comparisons actually order by is not cross-validated, so a reference pairing a stored id with a wrong position still passes. It says the event exists, not that the cursor is coherent.
-{: .prompt-info }
+### A Bookmark Stores the Event Id, and Nothing Else About the Event
+
+A bookmark records *which* event the reader reached, by id. Its position and transaction — the coordinates cursor comparisons order by — are answered from the stored event itself whenever the bookmark is read: on PostgreSQL by joining the events row on its unique id, in memory by resolving the reference from the log.
+
+So the reference you read back — and the one a bookmark notification carries — is always the store's own for that event, whatever the caller passed in. Two things follow:
+
+- **A bookmark cannot carry a cursor that disagrees with the event it names.** Storing the caller's `(tx, position)` beside the id would let a bookmark pass validation with a stored id and a wrong cursor, since the check is on the id.
+- **A bookmarks table is valid in another store holding the same events.** An [import](/posts/eventstore-importing-events/) preserves event ids and reassigns both ordering columns, so bookmarks copied across by id resolve to the target's own coordinates as they stand.
+
+> Upgrading a PostgreSQL database from 0.10 needs a one-line migration of the bookmarks table — see [Upgrading to 0.11](/posts/eventstore-upgrading-to-0-11/#the-bookmarks-table).
+{: .prompt-warning }
 
 ## Retrieving a Bookmark
 
@@ -123,11 +132,10 @@ This is the API behind an operational view of a system's readers. Where `getBook
 
 ```java
 // which readers have fallen behind the head of the stream?
-EventReference head = stream.query(EventQuery.matchAll().backwards().limit(1))
-                            .findFirst().map(Event::reference).orElse(null);
+Optional<EventReference> head = stream.head();
 
 stream.getBookmarks().stream()
-    .filter(b -> head != null && b.reference().happenedBefore(head))
+    .filter(b -> head.isPresent() && b.reference().happenedBefore(head.get()))
     .forEach(b -> LOGGER.warn("reader {} is behind, last moved at {}", b.reader(), b.updatedAt()));
 
 // which readers have not moved in an hour?
@@ -180,28 +188,27 @@ if (startAfter == null) {
 }
 
 // Register listener for new events appended to stream
-stream.subscribe((EventReference atLeastUntil) -> {
-    // Process new events since last bookmark
-    stream.query(EventQuery.matchAll(), startAfter, Limit.to(100))
-        .forEach(event -> {
-            processEvent(event);
+Subscription subscription = stream.subscribe((EventReference atLeastUntil) -> {
+    // Process new events since the last bookmark
+    EventReference from = stream.getBookmark(readerName).orElse(null);
+    for (Event<CustomerEvent> event : stream.query(EventQuery.matchAll().limit(100), from)) {
+        processEvent(event);
 
-            // Update bookmark after processing
-            stream.placeBookmark(
-                readerName,
-                event.reference(),
-                Tags.of("processed-at", Instant.now().toString())
-            );
-        });
+        // Update bookmark after processing
+        stream.placeBookmark(
+            readerName,
+            event.reference(),
+            Tags.of("processed-at", Instant.now().toString())
+        );
+    }
     return null;
 });
 
 // Initial catch-up: process all existing events
-stream.query(EventQuery.matchAll(), startAfter)
-    .forEach(event -> {
-        processEvent(event);
-        stream.placeBookmark(readerName, event.reference(), Tags.none());
-    });
+for (Event<CustomerEvent> event : stream.query(EventQuery.matchAll(), startAfter)) {
+    processEvent(event);
+    stream.placeBookmark(readerName, event.reference(), Tags.none());
+}
 ```
 
 When the application starts:
@@ -229,36 +236,33 @@ EventStream<OrderEvent> stream = eventstore.getEventStream(
 // Retrieve bookmark
 Optional<EventReference> lastProcessed = stream.getBookmark(readerName);
 
-// Query events after bookmark
-EventQuery query = EventQuery.matchAll();
+// Query events after bookmark, 500 stored events at a time
+EventQuery query = EventQuery.matchAll().limit(500);
 EventReference after = lastProcessed.orElse(null);
-int batchSize = 500;
 
 while (true) {
-    List<Event<OrderEvent>> batch = stream.query(
-        query,
-        after,
-        Limit.to(batchSize)
-    ).toList();
+    EventPage<OrderEvent> page = stream.page(query, after);
 
-    if (batch.isEmpty()) {
+    if (page.isExhausted()) {
         break; // Caught up
     }
 
     // Process batch
-    batch.forEach(event -> processEvent(event));
+    page.events().forEach(event -> processEvent(event));
 
-    // Update bookmark after batch
-    EventReference lastInBatch = batch.getLast().reference();
+    // Update bookmark after batch: the last stored event read, even if it upcast into nothing
+    EventReference lastInBatch = page.lastStoredEventReference().orElseThrow();
     stream.placeBookmark(
         readerName,
         lastInBatch,
-        Tags.of("batch-size", String.valueOf(batch.size()))
+        Tags.of("batch-size", String.valueOf(page.events().size()))
     );
 
     after = lastInBatch;
 }
 ```
+
+This hand-written loop is what a bookmarked [`Projector`](/posts/eventstore-projecting-events/#bookmarking-for-process-restart-and-progress-tracking) does for you — `Projector.from(stream).into(projection).bookmarkAs(readerName).build().run()` — including rolling its cursor back when a batch fails.
 
 **Restart Behavior**: If the process crashes and restarts, the bookmark is a persisted pointer indicating where to resume. The reader queries events after the bookmark and continues processing.
 
@@ -282,21 +286,22 @@ A bookmark says *where* a reader got to; it does not say *which* instance is ent
 **Idempotent Processing with Larger Batches**: When combined with idempotent event handling, bookmarks can be updated less frequently for better performance:
 
 ```java
-int batchSize = 1000;
 int bookmarkEvery = 100; // Update bookmark every 100 events
 int processedCount = 0;
+EventReference lastEventRef = null;
 
-stream.query(query, after, Limit.to(batchSize)).forEach(event -> {
+for (Event<OrderEvent> event : stream.query(EventQuery.matchAll().limit(1000), after)) {
     processEventIdempotently(event); // Idempotent handler
     processedCount++;
+    lastEventRef = event.reference();
 
     if (processedCount % bookmarkEvery == 0) {
-        stream.placeBookmark(readerName, event.reference(), Tags.none());
+        stream.placeBookmark(readerName, lastEventRef, Tags.none());
     }
-});
+}
 
 // Place final bookmark
-if (processedCount > 0) {
+if (lastEventRef != null) {
     stream.placeBookmark(readerName, lastEventRef, Tags.none());
 }
 ```
@@ -347,7 +352,7 @@ These are the "readers" placing their bookmarks. They operate independently on t
 Register a listener to receive real-time notifications when bookmarks are updated:
 
 ```java
-stream.subscribe((String reader, EventReference processedUntil) -> {
+Subscription subscription = stream.subscribe((String reader, EventReference processedUntil) -> {
     System.out.println(
         reader + " processed up to position " + processedUntil.position()
     );
@@ -357,7 +362,7 @@ stream.subscribe((String reader, EventReference processedUntil) -> {
 });
 ```
 
-The listener is invoked asynchronously (eventually consistent) whenever any reader places or updates a bookmark.
+The listener — a `BookmarkListener` — is invoked asynchronously (eventually consistent) whenever any reader places or updates a bookmark. The reference it receives carries the store's own coordinates for the bookmarked event. Close the returned `Subscription` to stop listening.
 
 Some use Cases for Bookmark Listeners:
 

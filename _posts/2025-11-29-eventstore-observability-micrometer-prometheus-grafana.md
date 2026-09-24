@@ -2,175 +2,207 @@
 layout: post
 toc: true
 title: Eventstore Observability
-description: Eventstore Observability with Micrometer, Prometheus and Grafana
+description: Observing the Eventstore with the metrics or tracing library of your choice, through the EventStoreObserver SPI — with Micrometer, Prometheus and Grafana as the worked example
 date: 2025-11-29 08:00:00
 categories: [Eventstore Documentation,Eventstore deployment]
-tags: [observability,monitoring,micrometer,prometheus,grafana]
+tags: [observability,monitoring,observer,tracing,micrometer,prometheus,grafana]
 ---
 
 ## EventStore Observability
 
 Understanding how your EventStore deployment performs in production is critical for maintaining a healthy event-sourced system. Observability enables you to:
 
-- **Track operational health**: Monitor append and query rates to detect unusual activity patterns
-- **Identify performance bottlenecks**: Measure operation durations to find slow queries or contention
-- **Optimize resource usage**: Understand which event streams are most active and resource-intensive
-- **Debug production issues**: Correlate metrics with application behavior during incident investigation
-- **Capacity planning**: Use historical metrics to predict growth and plan infrastructure scaling
+- **Track operational health**: Monitor append and query rates, conflicts and de-duplications
+- **Identify performance bottlenecks**: Measure operation durations, and how much of each is spent in the storage
+- **Trace a request end to end**: See an append, its key-store lookups and its JDBC calls nested under one span
+- **Detect the silent failure**: Know when append notifications have stopped, which nothing else will tell you
+- **Capacity planning**: Use historical figures to predict growth and plan infrastructure scaling
 
-## Micrometer Integration
+## An SPI of Its Own, and No Metrics Library
 
-EventStore uses [Micrometer](https://micrometer.io/) as its metrics collection framework. Micrometer provides a vendor-neutral facade similar to SLF4J for logging, allowing you to emit metrics once and send them to various monitoring backends (Prometheus, Grafana Cloud, Datadog, etc.).
+**The store reports what it does to an `EventStoreObserver`, in its own terms, and names no metrics or tracing library.** An application that wants meters, spans, log lines or an audit trail provides an observer that turns observations into them. `sliceworkz-eventstore-api` therefore carries no Micrometer, no OpenTelemetry — nothing but SLF4J — and you bind the library you already use.
 
-When creating an EventStore instance, provide a `MeterRegistry` to enable metrics collection:
+The alternative — a meter facade naming counters, timers and gauges — was rejected because it can express nothing but meters: a tracer needs to know where an operation starts and ends and what it answered, which is exactly what an observation is.
 
-```java
-// Option 1: Use the global registry (simplest approach)
-EventStorage storage = PostgresEventStorage.newBuilder().build();
-EventStore store = EventStoreFactory.get().eventStore(storage);
+**Observation is opt-in.** A store or storage given no observer uses `EventStoreObserver.NOOP`, which records nothing and allocates nothing.
 
-// Option 2: Provide a custom registry with specific configuration
-MeterRegistry registry = new SimpleMeterRegistry();
-EventStore store = EventStoreFactory.get().eventStore(storage, registry);
-```
+## Configuring an Observer
 
-### Adding Custom Tags for Drill-Down Analysis
-
-To enable drill-down analysis by deployment context, add common tags to your registry:
+The observer travels with the storage, the same way the shredding codec does. Give it to the storage builder, and every store built on that storage reports to it:
 
 ```java
-MeterRegistry registry = new SimpleMeterRegistry();
+EventStoreObserver observer = new MyMicrometerObserver(registry);   // see below
 
-// Add tags for deployment context
-registry.config().commonTags(
-    "instance", "eventstore-01",           // Instance identifier
-    "deployment", "production-eu-west",    // Deployment unit/region
-    "app.version", "1.2.3",                // Application version
-    "environment", "production"             // Environment name
-);
+EventStore store = PostgresEventStorage.newBuilder()
+    .observer(observer)
+    .buildStore();
 
-EventStore store = EventStoreFactory.get().eventStore(storage, registry);
+// the in-memory backends take one the same way
+EventStore store = InMemoryEventStorage.newBuilder().observer(observer).buildStore();
 ```
 
-These tags are automatically applied to all metrics, enabling you to:
-- Compare performance across different instances
-- Identify version-specific issues after deployments
-- Separate production from staging metrics
-- Analyze regional performance differences
+Or give it to one store built on a storage you hold, which takes precedence over the storage's own:
 
-## Available Metrics
-
-EventStore exposes the following metrics through Micrometer. All metrics include these automatic tags:
-
-| Tag | Description | Example Values |
-|-----|-------------|----------------|
-| `context` | Event stream context | `"customer"`, `"order"`, `""` (empty for any-context) |
-| `purpose` | Event stream purpose | `"123"`, `"aggregate-id"`, `""` (empty for any-purpose) |
-| `typed` | Whether stream uses typed or raw events | `"true"`, `"false"` |
-| `storage` | Storage backend name | `"postgres"`, `"inmemory"` |
-
-Additionally, the `append.event` and `query.event` counters include an `eventtype` tag with the event type name, enabling per-event-type throughput analysis:
-
-| Tag | Description | Example Values |
-|-----|-------------|----------------|
-| `eventtype` | The event type name (on `append.event` and `query.event` only) | `"CustomerRegistered"`, `"OrderPlaced"` |
-
-### Counters
-
-| Metric Name | Description | Unit |
-|-------------|-------------|------|
-| `sliceworkz.eventstore.stream.create` | Number of event stream objects created | count |
-| `sliceworkz.eventstore.append` | Number of successful append operations | count |
-| `sliceworkz.eventstore.append.event` | Total number of events appended (tagged with `eventtype`) | count |
-| `sliceworkz.eventstore.append.deduplicated` | Number of events swallowed by storage as idempotency-key duplicates | count |
-| `sliceworkz.eventstore.append.optimisticlock` | Number of append operations rejected due to optimistic locking conflicts | count |
-| `sliceworkz.eventstore.query` | Number of query operations executed | count |
-| `sliceworkz.eventstore.query.event` | Total number of events retrieved by queries (tagged with `eventtype`) | count |
-| `sliceworkz.eventstore.get.event` | Number of individual event lookups by ID | count |
-| `sliceworkz.eventstore.bookmark.place` | Number of bookmark updates | count |
-| `sliceworkz.eventstore.bookmark.get` | Number of bookmark retrievals | count |
-| `sliceworkz.eventstore.bookmark.list` | Number of `getBookmarks()` calls | count |
-
-### Timers
-
-| Metric Name | Description | Unit |
-|-------------|-------------|------|
-| `sliceworkz.eventstore.append.duration` | Time taken by the storage append itself, including the optimistic locking check — serialization and enrichment are outside it | milliseconds |
-| `sliceworkz.eventstore.query.duration` | Time taken to execute queries | milliseconds |
-
-### Gauges
-
-| Metric Name | Description | Unit |
-|-------------|-------------|------|
-| `sliceworkz.eventstore.append.position` | Highest event position appended, per tag set | position |
-| `sliceworkz.eventstore.notifications.up` | Whether a LISTEN/NOTIFY channel is established (1) or not (0) | boolean |
-
-**`append.deduplicated`** exists because de-duplication is otherwise invisible in the meters. A duplicate [idempotency key](/posts/eventstore-appending-events/#dcb-style-idempotency) is swallowed by storage by design: the append succeeds and returns an empty list, nothing throws. But `append` counts *calls* and `append.event` counts *submitted* events, and one call can carry several events — so no subtraction over those two recovers what was dropped, and a caller ingesting through idempotency keys cannot tell "n events ingested" from "n calls, some silently deduplicated".
-
-The counter is incremented by submitted minus stored, on the stored events rather than on the enriched result whose size upcasting can change. It is tagged like the other stream meters and registered eagerly, so the series exists reading 0 from the first stream rather than appearing only once something is dropped — which is what makes it usable in an alert.
-
-```promql
-# ingestion is silently dropping more than 1% of submitted events
-rate(sliceworkz_eventstore_append_deduplicated_total[5m])
-  / rate(sliceworkz_eventstore_append_event_total[5m]) > 0.01
+```java
+EventStore store = EventStore.on(storage).observer(observer).build();
 ```
 
-**`append.duration`** measures the storage append alone. Serializing the payload, sealing any protected values and enriching the result sit outside the timer, deliberately mirroring what `query.duration` measures on the read side — so the two are comparable, and a regression in either one names the storage rather than the mapper.
+A `Projector` finds the observer through its source, so a projector is observed exactly when its stream is, with nothing to configure on the projector.
 
-**`append.position`** reads `NaN` until something is appended. Its state is held per tag set **on the store**, not per stream — a gauge cannot be re-registered, and Micrometer holds gauge state weakly, so a per-stream holder would leave the series permanently `NaN` as soon as the first stream for that tag set was collected. That matters in practice, because obtaining a stream per operation is the recommended usage.
+## Operations: a Scope From Start to Close
 
-**`notifications.up`** is specific to the PostgreSQL backend and tagged `storage` and `channel` (`event_appended` / `bookmark_placed`) rather than by stream. It is registered by the storage constructor, so the series exists reading 0 from the moment the storage does — a gauge that only appears once notifications work would be no use for alerting on notifications *not* working.
+Every operation the store performs on behalf of a caller is reported through `start(Observation)`, which describes what is about to be done and returns an `Observation.Scope`. The store then reports exactly one of `completed(outcome)` or `failed(throwable)`, and closes the scope in a `finally` — **all synchronously, on the caller's thread**. So an observer may make a span current between `start` and `close`, and the JDBC calls, key-store lookups and a projector batch's page query nest beneath it with nothing propagated.
 
-This is the metric that makes the store's one silent failure mode visible. When notifications stop, the store is **degraded, not broken**: queries, appends and bookmarks all keep working, but nothing wakes a subscriber, so projections only advance when something runs them explicitly. Nothing throws and nothing else in these metrics changes.
+| Observation | Reported for | Completes with |
+|---|---|---|
+| `Append` | an append: the types submitted, whether it is conditional, how many idempotency keys | `Appended`, `Conflicted` or `Duplicated` |
+| `Query` | a query or a page, a projector's pages among them | `Read`: stored events read per stored type, events returned |
+| `GetEvent` | `getEventById` | `Found` |
+| `Head` | `head()` | `HeadRead` |
+| `PlaceBookmark` / `GetBookmark` / `ListBookmarks` | the bookmark operations | `Done` / `Found` / `Counted` |
+| `ProjectorBatch` | one projector batch; phase `INIT` for the savepoint read, `BATCH` for every page | `Projected`: stored events read, events handled, the last reference, whether it bookmarked |
+| `Erase` | an erasure, with its reason | `Erased`: keys shredded, categories erased |
 
-```promql
-# alert: notifications down for more than a minute
-min_over_time(sliceworkz_eventstore_notifications_up[1m]) == 0
-```
+The records carry the caller's own arguments, and the stream as a `StreamInfo` — storage name, `EventStreamId`, and whether the stream is typed. `Observation` and `Outcome` are sealed: an observer switching over them with a `default` branch keeps compiling when an operation is added.
 
-The same state is available to a health endpoint via `PostgresEventStorageImpl.isNotificationsAvailable()`, at the cost of a downcast from `EventStorage`. It returns to 1 on its own once the database is reachable again — the monitors retry with backoff.
+**The outcomes of stream operations carry `storageTime`**, the share of the operation spent inside the `EventStorage`. The scope spans the whole call, so the rest is serialization, upcasting and unsealing — which on an ordinary page is most of the wait.
 
-> This gauge does **not** reveal a read stall caused by a long-running write transaction elsewhere in the PostgreSQL cluster. During such a stall every call the store makes keeps succeeding, so nothing here moves. Detecting that is done on the database — see [What Can Stall Reads](/posts/eventstore-configuring-postgresql-storage/#what-can-stall-reads-the-visibility-barrier).
+### A Completion Is an Answer, Not Only a Success
+
+An admitted append answers one of three things:
+
+- **`Appended`** — the batch was stored.
+- **`Conflicted`** — a DCB conflict: nothing stored, and the caller receives the `OptimisticLockingException` to re-decide on. It is the store working as intended, so it is an answer rather than a failure. The lock check runs first, so a stale retry answers `Conflicted` too.
+- **`Duplicated`** — every idempotency key in the batch was stored before: a retry, swallowed whole. A batch is stored whole or not at all, so there is no partly de-duplicated answer.
+
+`failed` is for an operation that could not answer: a storage error, a poison event, a key store that is down, an `IdempotencyKeyConflictException`, a projection that threw — with the throwable the caller receives. Argument refusals (an append through a wildcard stream, a legacy type in a filter, a repeated key) happen before an observation starts and are not reported.
+
+## Lifecycle and Health
+
+The observer's other methods report what is *held*, so an observer can count it and release what it registered for it. Each has an empty default, so you override what you care about:
+
+| Method | Reported when |
+|---|---|
+| `storageStarted(storage)` / `storageClosed(storage)` | a backend finished `build()` / was closed — channels are reported down first |
+| `subscriptionOpened(stream)` / `subscriptionClosed(stream)` | once per subscription, so opened minus closed is the live count — and a count that only rises is a subscribed stream nobody closes |
+| `notificationChannelChanged(storage, channel, listening)` | a LISTEN/NOTIFY channel went up or down (PostgreSQL) |
+| `streamOpened(stream)` | a stream handle was opened |
+
+There is deliberately no `streamClosed`: a handle used only to query and append holds nothing and is never closed, so a counterpart would climb forever. What a stream holds is a subscription.
+
+### Notification Channel Health
+
+This is the signal to alert on. When append notifications stop, the store is **degraded, not broken**: queries, appends and bookmarks all keep working, but nothing wakes a subscriber, so every subscribed projection quietly stops advancing. Nothing throws, and nothing else changes.
+
+The PostgreSQL backend reports each channel — `NotificationChannel.EVENT_APPENDED` and `BOOKMARK_PLACED` — as **down from its constructor**, so an observer knows the channel from the moment the storage exists; up once its listener is registered; down whenever it loses it (a dropped connection, or one found silently dead by the liveness probe) and up again when it recovers; and down on close. Every transition is reported exactly once. The in-memory backends notify in-process, have no channels, and never call it.
+
+For a health endpoint rather than a metric, `PostgresEventStorage.isNotificationsAvailable()` answers the same state.
+
+> A channel reported up does **not** rule out a read stall caused by a long-running write transaction elsewhere in the PostgreSQL cluster. During such a stall every call the store makes keeps succeeding. Detecting that is done on the database — see [What Can Stall Reads](/posts/eventstore-configuring-postgresql-storage/#what-can-stall-reads-the-visibility-barrier).
 {: .prompt-warning }
 
-## Bounding Meter Cardinality: the `purpose` Tag
+## What an Observer Must Honour
 
-`context` is a code-level concept, so its cardinality is a property of your application. **`purpose` is not.** It is an optional secondary identifier, and the natural way to use it is per entity — `forContext("customer").withPurpose("123")` — which gives it one value per customer.
+- **Thread-safe.** A store is used from many threads at once, and so is its observer.
+- **Cheap.** Every call is on the caller's thread, inside the operation it describes: a slow observer is a slow store. Anything expensive belongs on a thread of the observer's own.
+- **Never throwing.** An operation never fails because its observation did: the library wraps every observer with `EventStoreObserver.contained(...)`, which catches what escapes — a `RuntimeException`, or a `LinkageError` from a binding whose library is missing — and logs it, at ERROR the first time with its stack trace and at DEBUG after. That is a guard, not a licence: an observer that throws loses what it was recording.
 
-**Nothing evicts a meter.** A Micrometer registry keeps every meter it has ever registered, so the cost follows the number of distinct purposes the process has *ever seen*, not how many streams are alive. Dropping the stream handle releases none of it.
+### Cardinality Is the Observer's Concern
 
-Measured per distinct purpose, on an in-memory store with two event types: **15 meters, ~5.5 KB of heap, 18 Prometheus series** and ~2.4 KB of scrape body. At 10.000 purposes that is 150.000 meters, 53 MB and a 23 MB scrape. Nothing fails — the numbers stay correct and the process just gets steadily heavier.
+Every observation carries the stream id as it is, and `purpose` is often an entity id — a [stream per entity](/posts/eventstore-stream-design-and-performance/) is a legitimate, and often the faster, layout. A tracer or a log line wants that purpose uncapped. A **metrics** registry does not: it never evicts a meter, so an uncapped per-entity tag is a leak that fails nothing — the process just gets steadily heavier. An observer turning the purpose into a metrics tag must bound the values it admits, which is why the cap lives where the tag value is chosen, in the observer, and not in the store.
 
-**So the `purpose` tag is capped.** A store tags the first `MeterOptions.maxPurposeTagValues()` distinct purposes it sees (**default 1000**) and reports every purpose after that as `_other`, logging one WARN naming the purpose that tripped the cap. Below the cap nothing changes — that is exactly where a per-purpose breakdown is worth having — and above it the meters stay flat while the events are still counted, pooled under `_other`.
+## Example: a Micrometer Observer
 
-Admission is first-come-first-served and **permanent**: a purpose that got its own tag value keeps it for the life of the store, so a dashboard built on that series does not lose it when traffic widens. The flip side is that *which* purposes get through is arrival order, and not stable across restarts.
-
-### Configuring It
+A ready-made Micrometer binding is provided separately from the eventstore library. What such an observer does fits on a page, and writing your own is a reasonable choice. A minimal one, timing every operation by kind and answer, and exposing channel health as a gauge:
 
 ```java
-// purpose is an entity id here: never break down by it
-EventStoreFactory.get().eventStore(storage, registry, MeterOptions.withoutPurposeBreakdown());
+import io.micrometer.core.instrument.*;
+import org.sliceworkz.eventstore.observability.*;
 
-// a broad but genuinely bounded set of purposes
-EventStoreFactory.get().eventStore(storage, registry, MeterOptions.withMaxPurposeTagValues(5000));
+public final class MicrometerObserver implements EventStoreObserver {
 
-// same thing through the storage builders
-InMemoryEventStorage.newBuilder()
-    .meterOptions(MeterOptions.withoutPurposeBreakdown())
-    .buildStore();
+    private static final int MAX_PURPOSES = 1000;
 
-PostgresEventStorage.newBuilder()
-    .meterRegistry(registry)
-    .meterOptions(MeterOptions.withMaxPurposeTagValues(5000))
-    .buildStore();
+    private final MeterRegistry registry;
+    private final Set<String> admittedPurposes = ConcurrentHashMap.newKeySet();
+    private final Map<String, AtomicInteger> channels = new ConcurrentHashMap<>();
+
+    public MicrometerObserver ( MeterRegistry registry ) {
+        this.registry = registry;
+    }
+
+    @Override
+    public <O extends Outcome> Observation.Scope<O> start ( Observation<O> observation ) {
+        long started = System.nanoTime();
+        return new Observation.Scope<>() {
+            private String answer = "unknown";
+
+            @Override public void completed ( O outcome ) {
+                answer = switch ( outcome ) {
+                    case Outcome.Conflicted c -> "conflicted";
+                    case Outcome.Duplicated d -> "duplicated";
+                    default -> "ok";
+                };
+            }
+
+            @Override public void failed ( Throwable failure ) {
+                answer = "error";
+            }
+
+            @Override public void close ( ) {
+                Timer.builder("eventstore.operation")
+                     .tag("operation", observation.getClass().getSimpleName())
+                     .tag("outcome", answer)
+                     .tags(streamTags(observation))
+                     .register(registry)
+                     .record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
+            }
+        };
+    }
+
+    @Override
+    public void notificationChannelChanged ( String storage, NotificationChannel channel, boolean listening ) {
+        channels.computeIfAbsent(storage + "/" + channel, key -> {
+            AtomicInteger state = new AtomicInteger();
+            Gauge.builder("eventstore.notifications.up", state, AtomicInteger::get)
+                 .tag("storage", storage).tag("channel", channel.name().toLowerCase())
+                 .register(registry);
+            return state;
+        }).set(listening ? 1 : 0);
+    }
+
+    private Tags streamTags ( Observation<?> observation ) {
+        if ( !(observation instanceof Observation.OnStream<?> onStream) ) {
+            return Tags.of("storage", observation.storage());
+        }
+        EventStreamId id = onStream.stream().stream();
+        String purpose = id.purpose() == null ? "" : id.purpose();
+        // bound the purpose: the first MAX_PURPOSES seen keep their own value, the rest are pooled
+        if ( !admittedPurposes.contains(purpose)
+                && ( admittedPurposes.size() >= MAX_PURPOSES || !admittedPurposes.add(purpose) ) ) {
+            purpose = "_other";
+        }
+        return Tags.of("storage", observation.storage(),
+                       "context", id.context() == null ? "" : id.context(),
+                       "purpose", purpose);
+    }
+}
 ```
 
-`MeterOptions.withUnlimitedPurposeTagValues()` removes the bound, which is only safe where purpose is low-cardinality by construction. Existing two-argument factory calls keep working unchanged and get the default cap.
+(`Tags` here is Micrometer's `io.micrometer.core.instrument.Tags`, not the eventstore's.) Because the scope is synchronous, the same shape works for a tracer: open a span in `start`, make it current, set its status in `completed`/`failed`, and end it in `close`.
 
-> **A Micrometer `MeterFilter` is not a substitute.** A filter runs at registration, while the store keys its `append.position` gauge state on the tags it *asked* for — so with the meters denied outright, a registry holding zero meters still leaves the store growing by roughly 730 bytes per distinct purpose. The cap is applied where the tag value is chosen, which bounds the meters, the `eventtype` cross product and that internal map in one place.
-{: .prompt-info }
+To count events rather than operations, read the outcome: `Outcome.Appended.storedPerType()` and `Outcome.Read.readPerStoredType()` break an operation down by event type, and `Observation.Append.submittedPerType()` against a `Duplicated` answer says how many submitted events a retry swallowed.
 
-**`context` is deliberately not capped.** It names a bounded context and comes from the code, not from the traffic. A store whose *context* is per-entity has the same problem with none of the protection — don't do that.
+### Connection Pool Metrics
+
+HikariCP has its own metrics seam, and the PostgreSQL builder hands it to the pools the storage uses, whether the builder created them or you supplied them:
+
+```java
+PostgresEventStorage.newBuilder()
+    .observer(new MicrometerObserver(registry))
+    .poolMetrics(new MicrometerMetricsTrackerFactory(registry))   // HikariCP's own Micrometer tracker
+    .buildStore();
+```
 
 ## Example Configuration: Prometheus
 
@@ -182,12 +214,12 @@ To expose metrics to Prometheus, add the Prometheus Micrometer registry dependen
 <dependency>
     <groupId>io.micrometer</groupId>
     <artifactId>micrometer-registry-prometheus</artifactId>
-    <version>1.17.0</version>
+    <version>1.17.1</version>
 </dependency>
 <dependency>
     <groupId>io.javalin</groupId>
     <artifactId>javalin</artifactId>
-    <version>7.2.2</version>
+    <version>7.2.3</version>
 </dependency>
 ```
 
@@ -197,6 +229,7 @@ To expose metrics to Prometheus, add the Prometheus Micrometer registry dependen
 import io.javalin.Javalin;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
+import com.zaxxer.hikari.metrics.micrometer.MicrometerMetricsTrackerFactory;
 
 public class EventStoreApp {
     public static void main(String[] args) {
@@ -210,12 +243,9 @@ public class EventStoreApp {
             "app.version", "1.2.3"
         );
 
-        // Create EventStore with Prometheus metrics.
-        // The builder passes the registry on to the storage as well, so HikariCP
-        // pool metrics land in the same registry.
         try ( EventStore eventStore = PostgresEventStorage.newBuilder()
-                  .meterRegistry(prometheusRegistry)
-                  .meterOptions(MeterOptions.withoutPurposeBreakdown())
+                  .observer(new MicrometerObserver(prometheusRegistry))
+                  .poolMetrics(new MicrometerMetricsTrackerFactory(prometheusRegistry))
                   .buildStore() ) {
 
             // Expose metrics endpoint via Javalin
@@ -232,9 +262,6 @@ public class EventStoreApp {
 }
 ```
 
-> The registry passed to `.meterRegistry(...)` is also handed to any HikariCP `DataSource` the builder created, so connection pool metrics appear alongside the event store's own.
-{: .prompt-tip }
-
 ### Prometheus Scrape Configuration
 
 Add this job to your `prometheus.yml`:
@@ -250,64 +277,46 @@ scrape_configs:
 
 ## Example Reporting: Grafana
 
-Grafana provides powerful visualization and alerting capabilities for EventStore metrics using Prometheus as a datasource.
-
-### Setting Up Grafana with Prometheus
-
-1. **Add Prometheus datasource** in Grafana:
-   - Navigate to Configuration → Data Sources
-   - Select "Prometheus"
-   - Set URL to your Prometheus instance (e.g., `http://localhost:9090`)
-   - Click "Save & Test"
-
-2. **Create EventStore dashboard** with useful panels:
+With the observer above, Grafana panels over Prometheus look like this.
 
 **Panel: Append Rate by Stream Context**
 ```promql
-rate(sliceworkz_eventstore_append_total[5m])
+sum by (context) (rate(eventstore_operation_seconds_count{operation="Append"}[5m]))
 ```
 
-**Panel: Query Duration (95th Percentile)**
+**Panel: Query Duration (95th Percentile)** — enable histograms on the timer (`.publishPercentileHistogram()`) for this one
 ```promql
 histogram_quantile(0.95,
-  rate(sliceworkz_eventstore_query_duration_seconds_bucket[5m])
-)
+  sum by (le) (rate(eventstore_operation_seconds_bucket{operation="Query"}[5m])))
 ```
 
 **Panel: Optimistic Locking Conflict Rate**
 ```promql
-rate(sliceworkz_eventstore_append_optimisticlock_total[5m])
+sum(rate(eventstore_operation_seconds_count{operation="Append",outcome="conflicted"}[5m]))
+  / sum(rate(eventstore_operation_seconds_count{operation="Append"}[5m]))
 ```
 
-**Panel: Events Appended per Second**
+**Panel: Retries Swallowed by Idempotency**
 ```promql
-rate(sliceworkz_eventstore_append_event_total[5m])
-```
-
-**Panel: Events Appended per Second by Event Type**
-```promql
-rate(sliceworkz_eventstore_append_event_total[5m])
-```
-Group by `eventtype` label to see the per-event-type breakdown.
-
-**Panel: Highest Event Position by Stream**
-```promql
-sliceworkz_eventstore_append_position
+sum(rate(eventstore_operation_seconds_count{operation="Append",outcome="duplicated"}[5m]))
 ```
 
 **Panel: Notification Health**
 ```promql
-sliceworkz_eventstore_notifications_up
+min by (channel) (eventstore_notifications_up)
 ```
-Group by `channel` to see the append and bookmark channels separately.
 
-### Key Metrics to Monitor
+### Key Signals to Monitor
 
-- **Notifications down**: `notifications_up == 0` means read models have stopped advancing on their own, while everything else keeps working. This is the one failure that is otherwise silent, and the first thing to alert on
-- **High optimistic locking conflicts**: May indicate contention on specific aggregates requiring architectural review
-- **Slow query durations**: Could signal missing indexes, inefficient queries, or database resource constraints
-- **Append rate spikes**: Unusual activity patterns that might indicate bugs or attacks
-- **Event position growth**: Helps predict storage requirements and identify most active streams
-- **A `purpose="_other"` series appearing**: the cardinality cap has been reached, so per-purpose breakdowns are no longer complete
+- **Notifications down**: `eventstore_notifications_up == 0` means read models have stopped advancing on their own, while everything else keeps working. This is the one failure that is otherwise silent, and the first thing to alert on:
+  ```promql
+  min_over_time(eventstore_notifications_up[1m]) == 0
+  ```
+- **High optimistic locking conflicts**: a boundary shared by many writers — widen it; see [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/)
+- **Slow queries**: compare the operation's duration with its `storageTime` first — a read returning thousands of events spends most of its time deserializing, not in the database
+- **Subscriptions only rising**: `subscriptionOpened` minus `subscriptionClosed` climbing without bound is a subscribed stream nobody closes
+- **A `purpose="_other"` series appearing**: the cardinality cap in your observer has been reached, so per-purpose breakdowns are no longer complete
 
-With Grafana, you can set up alerts on these metrics to proactively detect issues before they impact users.
+## Testing With an Observer
+
+The testing module publishes `RecordingObserver`, which keeps everything it is told and checks the contract a store owes an observer along the way — see [Testing Your Application](/posts/eventstore-testing/#asserting-what-the-store-reports-recordingobserver).

@@ -26,17 +26,14 @@ To use PostgreSQL as your event storage backend, add the following dependencies 
     <dependency>
         <groupId>org.postgresql</groupId>
         <artifactId>postgresql</artifactId>
-    </dependency>
-
-    <!-- HikariCP connection pooling (recommended) -->
-    <dependency>
-        <groupId>com.zaxxer</groupId>
-        <artifactId>HikariCP</artifactId>
+        <version>42.7.13</version>
     </dependency>
 </dependencies>
 ```
 
-The PostgreSQL driver is marked as `provided` scope in the library, allowing you to choose your preferred version. HikariCP is used for high-performance connection pooling.
+The PostgreSQL driver is marked as `provided` scope in the library, allowing you to choose your preferred version — the BOM manages the eventstore modules, not third-party libraries, so give it a version. HikariCP, used for connection pooling, comes with the backend transitively.
+
+`build()` returns a `PostgresEventStorage` — an `EventStorage` that also answers `isNotificationsAvailable()`, the one thing the PostgreSQL backend has to say that the storage contract does not cover. Keep that handle rather than widening it to `EventStorage` where a health check needs it. The implementation classes themselves are package-private: the builder is the only way to obtain a storage, which is what guarantees its version detection, its bounded startup and its pool ownership rules always apply. A builder can be reused: every `build()` resolves its own pools.
 
 ## PostgreSQL Version Support
 
@@ -138,7 +135,7 @@ What the application role needs depends on the `DatabaseInitMode` it starts with
 |---|---|
 | `NONE`, `VALIDATE` | `CONNECT`, `USAGE` on the schema, and no DDL at all |
 | `ENSURE` (default) | the above, plus `CREATE` on the **schema** — and, *only if `btree_gin` is not installed yet*, `CREATE` on the **database** |
-| `INITIALIZE` | the above, plus ownership of the store's tables and functions, since it drops them |
+| `RECREATE` | the above, plus ownership of the store's tables and functions, since it drops them |
 
 Every mode needs these grants at runtime. They come for free when the role created the tables itself; when a DBA created them, they have to be granted:
 
@@ -153,7 +150,20 @@ GRANT USAGE                          ON SEQUENCE <prefix>events_event_position_s
 
 Events are never updated or deleted — the store only ever appends to that table. Lease rows are never deleted either — a release backdates the heartbeat so the fencing token survives — so the leases table needs no `DELETE`; contender rows *are* pruned, so that table does. See [Leader Election with Leases](/posts/eventstore-leader-election/).
 
-**The shredding key table needs no `DELETE` either, and deliberately so.** Erasing a data subject *updates* the row: it nulls `key_material` and stamps `shredded_at` and `shredded_reason`. Keeping the row is what leaves the erasure an audit trail — the events themselves record nothing about it — and what lets a key id keep resolving to "erased" rather than to "unknown". Granting `DELETE` here would let an erasure be made untraceable. See [Erasing Personal Data](/posts/eventstore-erasing-personal-data/).
+**The shredding key table needs no `DELETE` either, and deliberately so.** Erasing a data subject *updates* the row: it nulls `key_material` and stamps `shredded_at` and `shredded_reason`. Keeping the row is what leaves the erasure an audit trail — the events themselves record nothing about it — and what lets a key id keep resolving to "erased" rather than to "unknown". An unknown key id fails the read, since it means the events were sealed against another store. Granting `DELETE` here would let an erasure be made untraceable, and turn the deleted subject's events unreadable. See [Erasing Personal Data](/posts/eventstore-erasing-personal-data/).
+
+### A Role That Must Not Read Personal Data
+
+A role that reads the events but never the personal data in them — a reporting service — is granted every column of the key table *except* `key_material`:
+
+```sql
+GRANT SELECT (key_id, subject_type, subject_id, subject_category, created_at, shredded_at, shredded_reason)
+    ON <prefix>shredding_keys TO <reporting_role>;
+```
+
+Resolving a key under that role fails with `insufficient_privilege` (SQLSTATE `42501`), which the key store reports as a *denial* rather than an outage: every protected value reads as `Shreddable.Withheld`, projections advance, and the [audit](/posts/eventstore-erasing-personal-data/#auditing-what-is-protected-and-what-was-erased) still works — it never references `key_material`, since PostgreSQL checks `SELECT` privilege on every column a statement mentions, `WHERE` clauses included. Because `information_schema` shows a role only the columns it may read, schema validation would report `key_material` as missing: such a role starts its store with `DatabaseInitMode.NONE`.
+
+Row-level security on the key table does **not** produce a denial: a hidden row is indistinguishable from an absent one, which is a key the store never held, and that fails the read. See [Readers That May Not See Personal Data](/posts/eventstore-erasing-personal-data/#readers-that-may-not-see-personal-data).
 
 ## Using Your Own DataSource
 
@@ -162,14 +172,14 @@ If your application already manages database connections, pass your existing `Da
 ```java
 DataSource existingDataSource = // ... from your application context
 
-EventStorage storage = PostgresEventStorage.newBuilder()
+PostgresEventStorage storage = PostgresEventStorage.newBuilder()
     .dataSource(existingDataSource)
     .build();
 
-EventStore eventStore = EventStoreFactory.get().eventStore(storage);
+EventStore eventStore = EventStore.on(storage).build();
 ```
 
-> `build()` returns an `EventStorage`; `buildStore()` returns a ready-to-use `EventStore` and, because it created the storage itself, is the only handle on it — so closing that store closes the storage too. See [Lifecycle and Shutdown](/posts/eventstore-lifecycle/).
+> `build()` returns a `PostgresEventStorage`; `buildStore()` returns a ready-to-use `EventStore` and, because it created the storage itself, is the only handle on it — so closing that store closes the storage too. See [Lifecycle and Shutdown](/posts/eventstore-lifecycle/).
 {: .prompt-info }
 
 A `DataSource` you pass in this way is **never closed** by the storage. One the builder creates itself from `db.properties` is. If you supply the pool, close the storage before closing the pool.
@@ -216,6 +226,10 @@ If you don't provide a separate monitoring DataSource, the regular DataSource is
 
 The monitoring connections include built-in resilience: if a LISTEN connection drops, it automatically reconnects with exponential backoff (1 second up to 30 seconds) to avoid flooding logs or exhausting the connection pool during database outages.
 
+A connection can also die **silently**: a NAT or firewall that dropped its state, a partition, a crashed host. The monitors wait for notifications with a bare socket read and send nothing meanwhile, so such a connection would otherwise look exactly like a quiet channel, reported up forever. Every monitoring connection therefore runs under a 5-second network timeout, and a monitor that has heard nothing for `notificationProbeInterval` (30 seconds by default) sends one round trip and replaces a connection that does not answer. A busy channel is never probed. See [Timeouts](#timeouts-a-stalled-lock-holder-and-a-socket-that-dies-silently).
+
+Nothing that arrives on a channel can take a monitor down, either. A `NOTIFY` channel is a database-wide name that any session can publish on; a payload that does not parse is logged at ERROR and dropped, and a listener that throws is contained. The monitor reads on.
+
 When connecting to a database through pbBouncer for the monitoring, you will find the realtime notification mechanism not to react to appends immediately, but only after 30 seconds or so.  While this functionally works, your expectations towards eventual consistency keeping up are without a doubt higher than that.
 
 ### Startup Waits for the Notification Channels
@@ -234,24 +248,35 @@ EventStore eventStore = PostgresEventStorage.newBuilder()
 
 Within the deadline, the monitors' own retry loop does the waiting, so a store racing its database up succeeds. Note that a *running* store repairs itself the same way after an outage — the fail-fast is about not starting blind, not about tearing a live store down when its connection drops.
 
-The configurations that can actually reach this are `DatabaseInitMode.NONE`, where nothing touches the database before the monitors do, and the realistic one: a **reachable main DataSource with an unreachable monitoring one**. The two are configured separately precisely because LISTEN/NOTIFY does not survive a transaction pooler, so "pooled works, direct is firewalled" is an ordinary misconfiguration.
+With `ENSURE` or `VALIDATE` the schema work runs first, and under `NONE` the [restored-history check](#backup-and-restore) does — so a dead *main* DataSource fails there, with a clear error, and never reaches the wait. The configuration that realistically does is a **reachable main DataSource with an unreachable monitoring one**. The two are configured separately precisely because LISTEN/NOTIFY does not survive a transaction pooler, so "pooled works, direct is firewalled" is an ordinary misconfiguration.
 
-For monitoring this in production, see the `sliceworkz.eventstore.notifications.up` gauge in [Eventstore Observability](/posts/eventstore-observability-micrometer-prometheus-grafana/).
+For monitoring this in production, an [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/#notification-channel-health) is told whenever a channel goes up or down, and `PostgresEventStorage.isNotificationsAvailable()` answers the same state for a health endpoint.
 
 ## Configuring an EventStore-managed DataSource (db.properties)
 
-The EventStore can automatically create and configure DataSources from a `db.properties` file. The library searches for this file in the following locations (in order):
+Without a `DataSource`, the builder describes its pools from a `db.properties` file (template: [`src/main/quickstart/db.properties`](https://github.com/sliceworkz/eventstore/tree/develop/sliceworkz-eventstore-infra-postgres/src/main/quickstart)). It takes the first of these that is present:
 
-1. System property: `-Deventstore.db.config=/path/to/db.properties`
-2. Environment variable: `EVENTSTORE_DB_CONFIG=/path/to/db.properties`
-3. Current working directory and up to 2 parent directories: `./db.properties`, `../db.properties`, `../../db.properties`
+1. a `DataSource` passed to `.dataSource(...)` (and `.monitoringDataSource(...)`)
+2. `Properties` or a file passed to `.configuration(...)`
+3. the file named by the system property `eventstore.db.config` (`-Deventstore.db.config=/path/to/db.properties`)
+4. the file named by the environment variable `EVENTSTORE_DB_CONFIG`
+5. `./db.properties` in the working directory of the process
+6. `db.properties` at the root of the classpath (`src/main/resources` in a Maven project)
+
+The lookup **never walks into parent directories**. When nothing is found, `build()` throws an `EventStorageException` naming every location it tried. Several stores in one process are configured by giving each builder its own `.configuration(...)`, or by sharing one pool between them through `.dataSource(...)` when they live in one database under different prefixes.
+
+```java
+EventStore store = PostgresEventStorage.newBuilder()
+    .configuration(Path.of("/etc/myapp/eventstore.properties"))
+    .buildStore();
+```
 
 ### Configuring the pooled and non-pooled connections
 
-Define separate datasources:
+Define separate datasources. Keys inside a section are HikariCP properties; keys under `datasource.` are handed to the PostgreSQL JDBC driver as they are:
 
 ```properties
-# db.properties - Advanced configuration
+# db.properties
 
 # Pooled connections for regular operations
 db.pooled.url=jdbc:postgresql://<host>/<db>
@@ -261,9 +286,6 @@ db.pooled.leakDetectionThreshold=2000
 db.pooled.maximumPoolSize=25
 db.pooled.datasource.sslmode=require
 db.pooled.datasource.channelBinding=require
-db.pooled.datasource.cachePrepStmts=true
-db.pooled.datasource.prepStmtCacheSize=250
-db.pooled.datasource.prepStmtCacheSqlLimit=2048
 
 # Non-pooled connections for LISTEN/NOTIFY
 db.nonpooled.url=jdbc:postgresql://<host>/<db>
@@ -273,15 +295,51 @@ db.nonpooled.leakDetectionThreshold=70000
 db.nonpooled.maximumPoolSize=2
 db.nonpooled.datasource.sslmode=require
 db.nonpooled.datasource.channelBinding=require
-db.nonpooled.datasource.cachePrepStmts=true
-db.nonpooled.datasource.prepStmtCacheSize=250
-db.nonpooled.datasource.prepStmtCacheSqlLimit=2048
 ```
 
-Be sure the size your pooled datasource connections according to your application needs.
+Be sure to size your pooled datasource connections according to your application needs.
 The non-pooled datasource used for monitoring appends with the NOTIFY/LISTEN mechanism only needs 2 connections.
 
 leakDetectionThreshold on the pooled (application) connections should be set quite low, for the monitoring connections this should be at least 30 seconds, as the monitoring connection only refreshes after a longer LISTEN for updates.
+
+The driver's prepared statements need no configuration: they are cached client-side by default and server-prepared from the fifth execution on. The knobs, should you want them, are `preparedStatementCacheQueries`, `preparedStatementCacheSizeMiB` and `prepareThreshold` — not the `cachePrepStmts` family, which the PostgreSQL driver silently ignores.
+
+## Timeouts: a Stalled Lock Holder, and a Socket That Dies Silently
+
+Two waits in this backend have no natural end, and the builder bounds both:
+
+```java
+PostgresEventStorage storage = PostgresEventStorage.newBuilder()
+    .lockTimeout(Duration.ofSeconds(10))                // default; Duration.ZERO waits without bound
+    .notificationProbeInterval(Duration.ofSeconds(30))  // default
+    .build();
+```
+
+**`lockTimeout`** bounds how long a conditional append waits for its stream's [advisory lock](#how-concurrent-appends-stay-safe) (and a lease request for its lease's lock). A healthy holder releases it within one INSERT, so ordinary contention never hits the bound; a *stalled* holder does — a paused process, a session the server still believes in after its client has gone. Without the bound, every conditional append to that stream parks behind the holder inside a checked-out pool connection until the pool is empty, and from then on every operation of the store fails on the pool's connection timeout, reads included. With it, the parked appends fail one at a time with an `EventStorageException` naming the stream and the bound (the cause carries SQLSTATE `55P03`), nothing is written, and the store stays up for everything else. The bound is sent as `SET LOCAL lock_timeout`, so it lives and dies with the append's transaction. Find the holder with:
+
+```sql
+SELECT l.objid, a.pid, a.state, a.xact_start, a.application_name, a.client_addr, a.query
+FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE l.locktype = 'advisory' AND l.granted;
+```
+
+**`notificationProbeInterval`** bounds how long a LISTEN/NOTIFY monitoring connection may stay silent before its monitor checks it is still there — see [Regular and Monitoring Connections](#regular-and-monitoring-connections).
+
+Both are library-level bounds, independent of the driver's. Two driver settings complement them and are yours to set under `datasource.`: `tcpKeepAlive=true` detects the same dead socket, but only after the operating system's keepalive time (two hours by default on Linux); `socketTimeout=<seconds>` bounds *every* read on that pool, so set it only above the longest statement the store legitimately runs — a large import batch, a `CREATE INDEX` under `ENSURE` — or it becomes the failure it was meant to catch.
+
+The defaults are public constants on the builder: `DEFAULT_LOCK_TIMEOUT`, `DEFAULT_NOTIFICATION_PROBE_INTERVAL` and `DEFAULT_NOTIFICATION_STARTUP_TIMEOUT`.
+
+## Connection Pool Metrics
+
+`poolMetrics(MetricsTrackerFactory)` hands HikariCP's own metrics seam to the pools this storage uses — the main and the monitoring pool, whether the builder created them or you supplied them (a pool that already has a tracker keeps it). HikariCP ships a tracker factory for Micrometer and one for the Prometheus client, so pool metrics land wherever you measure, while this library names no metrics library at all:
+
+```java
+PostgresEventStorage.newBuilder()
+    .poolMetrics(new MicrometerMetricsTrackerFactory(meterRegistry))
+    .build();
+```
+
+Not set by default: the pools then report nothing. What the *store* reports goes through its observer — see [Eventstore Observability](/posts/eventstore-observability-micrometer-prometheus-grafana/).
 
 ## Preparing the Database Schema Manually via DDL
 
@@ -293,7 +351,10 @@ The recommended approach is to create the database schema manually using DDL scr
 
 ### Using the Initialization Script
 
-The library includes a `quickstart.ddl.sql` script (unprefixed, ready to run) alongside the prefixed `ensure-schema.sql`. Both create the same objects — the events table, the bookmarks table, the two lease tables, the shredding key table, their indexes, and the notification functions and triggers:
+The library includes a `quickstart.ddl.sql` script (unprefixed, ready to run) alongside the prefixed `ensure-schema.sql`. Both create the same objects — the events table, the bookmarks table, the two lease tables, the shredding key table, their indexes, and the notification functions and triggers.
+
+> **Upgrading a database created by 0.10?** The bookmarks table needs a hand-applied migration under every init mode, and a `VALIDATE`/`NONE` deployment has two new indexes and a function body to apply. See [Upgrading to 0.11](/posts/eventstore-upgrading-to-0-11/#4-postgresql-schema).
+{: .prompt-warning }
 
 ```sql
 CREATE TABLE IF NOT EXISTS events (
@@ -322,7 +383,6 @@ CREATE TABLE IF NOT EXISTS events (
 
     -- Event payload
     event_data JSONB NOT NULL,
-    event_erasable_data JSONB,
 
     -- Tags as string array
     event_tags TEXT[] DEFAULT '{}'
@@ -332,19 +392,24 @@ CREATE TABLE IF NOT EXISTS events (
 
 The `stream_purpose` default matches `EventStreamId.DEFAULT_PURPOSE`, a public constant — so an interop layer doing raw SQL inserts can bind the same value the library does rather than copy the literal out of a script.
 
-`event_erasable_data` is a reserved, unused column. Schema validation requires it to be present, so leave it in place when applying this DDL by hand.
+A database created by an earlier release may still carry an `event_erasable_data` column. Nothing reads or writes it and validation no longer checks it: it may stay, or go with `ALTER TABLE <prefix>events DROP COLUMN event_erasable_data;`.
 
-Five indexes are created on the events table:
+These indexes are created on the events table:
 
 | Index | Purpose |
 |---|---|
-| `idx_events_position_brin` | compact BRIN index over `event_position` |
+| `idx_events_global_order` | B-tree on `(event_tx, event_position)` — the global order, for reads that bind **no** stream column: a wildcard stream, `head()` of the whole store, an unscoped import, the startup check. Partial on `event_position > 0` |
+| `idx_events_context_order` | B-tree on `(stream_context, event_tx, event_position)` — for reads that bind the context and leave the purpose open: a whole-context replay over a stream-per-entity layout. Partial on `event_tx > '0'::xid8` |
 | `idx_events_stream_type_position` | B-tree: stream + event type, ordered by `(event_tx, event_position)` |
-| `idx_events_stream_position` | B-tree: ordered stream replay |
+| `idx_events_stream_position` | B-tree: ordered stream replay, and `head()` of a stream |
 | `idx_events_tags` | GIN over the tag array, for tag-only lookups |
 | `idx_events_stream_tags` | GIN over stream columns **and** tags — the DCB read path. Requires `btree_gin` |
 
 The B-tree indexes are retained alongside the GIN ones because GIN cannot serve `ORDER BY`, and ordered stream replay needs it.
+
+**The two order indexes are partial on a tautology, and that is the point.** Both predicates hold for every row — `event_position` is a `bigserial` starting at 1, and `event_tx` never holds transaction id 0 — so each index covers the whole table. What the predicate decides is who may *enter* it: PostgreSQL admits a partial index only to a statement whose own predicates imply the index's, and it cannot prove a tautology on a column with no `CHECK` constraint by itself. The store spells the predicate out for exactly the reads whose scope binds no more than that index leads with, and for no others.
+
+Without that, a read of one stream could be served by a wider order index — walking the global order and filtering on the stream columns — whenever the stream is a large share of the table. For a stream that has been quiet while others wrote, that walk covers everything written since: measured on a 500.000-event table with a quiet stream 300.000 events back, `head()` of that stream took 24 ms against 0.08 ms off its own index, and its consistency check 56 ms against 0.02 ms. Correct, unlogged, and growing with the table. A partial index is closed to a statement that does not imply its predicate whatever the estimate, so this holds for a cached generic plan too.
 
 Idempotency uniqueness is a **partial** unique index, so events without a key are not indexed at all:
 
@@ -368,16 +433,20 @@ Beyond the tables, the script creates two `plpgsql` functions and their triggers
 ```sql
 CREATE TABLE IF NOT EXISTS bookmarks (
     reader TEXT PRIMARY KEY,
-    event_position BIGINT NOT NULL,
     event_id UUID NOT NULL,
-    event_tx xid8 NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_tags TEXT[] DEFAULT '{}',
     CONSTRAINT fk_bookmarks_event_id
         FOREIGN KEY (event_id)
         REFERENCES events(event_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_bookmarks_event_id ON bookmarks(event_id);
 ```
+
+**A bookmark stores the event id and nothing else about the event.** `getBookmark` and `getBookmarks` join the events row on its unique `event_id` index — one probe — to answer the bookmark's transaction and position, and the bookmark trigger does the same for its notification payload. So a bookmark always reads back with the store's own coordinates for the event it names, and a bookmarks table copied between stores by id is valid as it stands. A database created while this table still had `event_position` and `event_tx` columns must drop them — see [Upgrading to 0.11](/posts/eventstore-upgrading-to-0-11/#the-bookmarks-table).
+
+The foreign key deliberately does **not** cascade: an event deletion would otherwise silently remove the bookmarks of the readers still pointing into the deleted range — the lagging ones — and an absent bookmark means "replay from the beginning". With the default `NO ACTION`, deleting events out from under an outstanding bookmark fails loudly.
 
 The foreign key is what makes `placeBookmark` reject a reference this store never stored — the realistic mistake being a reference carried over from a *different* store or prefix. The store recognises the violation by the **constraint name** the server reports, exactly as it does for the idempotency index, so renaming it turns a clear `EventStorageException` back into an opaque SQL failure. The in-memory backends enforce the same rule against their own log, so the contract is identical on every backend — see [Bookmarking](/posts/eventstore-bookmarking/#the-reference-must-name-a-stored-event).
 
@@ -410,7 +479,9 @@ Election traffic never touches the events table, takes no lock that any query or
 
 ### The Shredding Keys Table
 
-Personal data in event payloads is protected by [crypto-shredding](/posts/eventstore-erasing-personal-data/): values are encrypted under a key held per data subject, and an erasure destroys the key instead of touching an event. `PostgresEventStorage.newBuilder().shredding()` keeps those keys in this store's own database, on the same `DataSource` as the events — so a minted key and the append that seals under it commit together.
+Personal data in event payloads is protected by [crypto-shredding](/posts/eventstore-erasing-personal-data/): values are encrypted under a key held per data subject, and an erasure destroys the key instead of touching an event. `PostgresEventStorage.newBuilder().shredding()` keeps those keys in this store's own database, on the same `DataSource` as the events.
+
+Sharing the `DataSource` buys the schema machinery, one set of credentials, and a backup carrying both. It does **not** put a key and the event sealed under it in one transaction: a key is minted on a connection of its own and committed *before* the append it seals for. A rolled-back append therefore leaves a key row with no event under it, which the subject's next append seals under — and an event whose key was never persisted cannot happen.
 
 ```sql
 CREATE TABLE IF NOT EXISTS shredding_keys (
@@ -479,7 +550,6 @@ CREATE TABLE IF NOT EXISTS PREFIX_events (
     event_type TEXT NOT NULL,
     event_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     event_data JSONB NOT NULL,
-    event_erasable_data JSONB,
     event_tags TEXT[] DEFAULT '{}'
 ) WITH (FILLFACTOR = 100);
 
@@ -516,7 +586,9 @@ EventStore tenant2Store = PostgresEventStorage.newBuilder()
     .buildStore();
 ```
 
-**Note**: Prefixes must be alphanumeric with underscores, end with an underscore, and be 32 characters or less. The 32-character cap is load-bearing: it keeps the longest generated index name inside PostgreSQL's 63-byte identifier limit, and a truncated index name would silently break both schema validation and idempotency detection.
+**Note**: Prefixes must be ASCII letters, digits and underscores, must not start with a digit, must end with an underscore, and be 32 characters or less. The 32-character cap is load-bearing: it keeps the longest generated index name inside PostgreSQL's 63-byte identifier limit, and a truncated index name would silently break both schema validation and idempotency detection.
+
+**A prefix is folded to lowercase**, because that is the name PostgreSQL gives every object it is used on unquoted: a store configured with `Tenant1_` *is* the store whose tables are `tenant1_*`, and the store compares names, channels and lock keys in that folded form too. A leading digit is rejected, since `1tenant_events` is not an identifier PostgreSQL parses unquoted at all.
 
 **Security Best Practice**: Create the schema with a privileged database user (e.g., `eventstore_admin` with DDL rights), then run your application with a limited user (e.g., `eventstore_app` with only DML rights). This prevents applications from accidentally modifying the schema.
 
@@ -526,7 +598,7 @@ The `DatabaseInitMode` enum controls how the database schema is handled at start
 
 ### ENSURE (default)
 
-Brings the schema up to what this release expects, then validates it. Safe to run repeatedly, and safe to run from several instances at once:
+Brings the schema up to what this release expects, then validates it. Safe to run repeatedly, and safe to run from several instances at once. `ENSURE` is also the mode that *initializes* a new database — there is no separate "initialize" mode:
 
 ```java
 // default behaviour — no need to specify
@@ -544,7 +616,7 @@ What "brings up to date" means differs per kind of object, and the difference ma
 | Object | What ENSURE does |
 |---|---|
 | Tables, columns | **Created if absent**, never altered |
-| Indexes | **Created if absent**, never rebuilt |
+| Indexes | **Created if absent**, never rebuilt — with one exception: the two superseded order indexes `idx_events_tx_position` and `idx_events_context_tx_position` are **dropped** (see [Upgrading to 0.11](/posts/eventstore-upgrading-to-0-11/#4-postgresql-schema)) |
 | The `btree_gin` extension | Created if absent, skipped entirely when already present |
 | Functions | **`CREATE OR REPLACE`d every time** — the body always matches this release |
 | Triggers | Compared against the expected shape (timing, orientation, transition table, target function) and **recreated only when it differs** |
@@ -556,7 +628,7 @@ Recreating a trigger whose shape has drifted *does* take a brief `ACCESS EXCLUSI
 > ENSURE needs `CREATE` on the schema, and — only when `btree_gin` is not installed yet — `CREATE` on the database. See [Database Privileges](#database-privileges) above.
 {: .prompt-info }
 
-**All the schema scripts run as a single transaction under a per-prefix advisory lock.** `CREATE TABLE / INDEX / EXTENSION IF NOT EXISTS` is not atomic against a concurrent creator, so without that lock several instances starting together against an empty database race on the system catalogs and most of them fail to start. One transaction across all scripts also makes `INITIALIZE`'s drop-then-create indivisible, so a second instance cannot drop what the first has just recreated. The lock is keyed on a hash of the table prefix, so two prefixed stores never block each other.
+**All the schema scripts run as a single transaction under a per-prefix advisory lock.** `CREATE TABLE / INDEX / EXTENSION IF NOT EXISTS` is not atomic against a concurrent creator, so without that lock several instances starting together against an empty database race on the system catalogs and most of them fail to start. One transaction across all scripts also makes `RECREATE`'s drop-then-create indivisible, so a second instance cannot drop what the first has just recreated. The lock is keyed on a hash of the table prefix, so two prefixed stores never block each other.
 
 ### VALIDATE
 
@@ -572,14 +644,15 @@ Validation checks that:
 
 - the required tables exist (`PREFIX_events`, `PREFIX_bookmarks`, `PREFIX_leases`, `PREFIX_lease_contenders`, `PREFIX_shredding_keys`)
 - every expected column is present, with the right type and nullability
-- the expected indexes exist by name — including `idx_events_stream_tags` and `idx_events_stream_idempotency`
+- the expected indexes exist by name — including `idx_events_stream_tags` and `idx_events_stream_idempotency` — and the two order indexes carry their admission predicates, while the two indexes they replaced are gone
+- the bookmarks table no longer carries the `event_position` and `event_tx` columns (the message names the migration)
 - the bookmarks foreign key exists by name (`fk_bookmarks_event_id`)
 - the notification functions exist
 - each trigger exists **with the expected orientation** (row-level vs statement-level), not merely by name
 
 If validation fails, an `EventStorageException` names what is missing or misconfigured.
 
-> **What validation does not check.** It verifies that named objects *exist*; it does not check an index's method, columns or uniqueness, a column's default, a foreign key's delete rule, or a function's body. So an index rebuilt as the wrong kind, or the idempotency index recreated without `UNIQUE`, passes validation. Where a DBA applies the DDL, apply the shipped script rather than hand-written equivalents.
+> **What validation does not check.** It verifies that named objects *exist*; apart from the order indexes' predicates, it does not check an index's method, columns or uniqueness, a column's default, a foreign key's delete rule, or a function's body. So an index rebuilt as the wrong kind, or the idempotency index recreated without `UNIQUE`, passes validation. Where a DBA applies the DDL, apply the shipped script rather than hand-written equivalents.
 {: .prompt-warning }
 
 Checking the trigger's orientation is worth the extra query, because the failure it prevents is not loud: a statement-level trigger bound to a row-level function body does not raise in PostgreSQL. It emits a notification with every field null, which becomes a wildcard stream with a zero reference that every concrete subscriber rejects — live updates stop with nothing thrown and nothing logged.
@@ -595,17 +668,19 @@ EventStore eventStore = PostgresEventStorage.newBuilder()
 ```
 
 Use this when:
-- The database user lacks permissions to query `information_schema`
+- The database user lacks permissions to query `information_schema` — or is a [reporting role](#a-role-that-must-not-read-personal-data) that may not see every column
 - Minimizing startup time is critical
 - You have full confidence in the schema being correct
 
-### INITIALIZE
+`NONE` is the recommended mode for production with a DBA-managed schema. Even under `NONE`, `build()` runs the one-probe [restored-history check](#backup-and-restore).
 
-Drops all event store objects — tables **and** functions — recreates them from scratch, then validates:
+### RECREATE
+
+Drops all event store objects — tables **and** functions — recreates them from scratch, then validates. It is the one destructive mode, and named for it:
 
 ```java
 EventStore eventStore = PostgresEventStorage.newBuilder()
-    .initializeDatabase()
+    .recreateDatabase()
     .buildStore();
 ```
 
@@ -640,7 +715,7 @@ EventStore eventStore = PostgresEventStorage.newBuilder()
 
 ```java
 EventStore eventStore = PostgresEventStorage.newBuilder()
-    .initializeDatabase()       // Fresh schema every test run
+    .recreateDatabase()         // Fresh schema every test run
     .buildStore();
 ```
 
@@ -659,35 +734,28 @@ When a query would exceed this limit, an `EventStorageException` is thrown:
 ```java
 try {
     // Query that exceeds the limit
-    stream.query(EventQuery.matchAll()).toList();
+    stream.query(EventQuery.matchAll());
 } catch (EventStorageException e) {
     // Handle: "Query result exceeded absolute limit of 10000"
 }
 ```
 
 **Important**: This is an emergency brake, not a substitute for proper query design. Applications should:
-- Use batched queries with `Limit` for large result sets
+- Page through large result sets with `EventQuery.limit(n)`
 - Design queries to stay well below the hard limit
 - Process results incrementally rather than loading everything into memory
 
 Example of proper batched querying:
 
 ```java
-EventReference lastRef = null;
-while (true) {
-    List<Event<CustomerEvent>> batch = stream.query(
-        EventQuery.matchAll(),
-        lastRef,
-        Limit.to(500)  // Well below hard limit
-    ).toList();
-
-    if (batch.isEmpty()) break;
-
-    // Process batch
-    batch.forEach(this::processEvent);
-
-    lastRef = batch.getLast().reference();
-}
+EventQuery query = EventQuery.matchAll().limit(500);   // well below the hard limit
+EventReference cursor = null;
+EventPage<CustomerEvent> page;
+do {
+    page = stream.page(query, cursor);
+    page.events().forEach(this::processEvent);
+    cursor = page.lastStoredEventReference().orElse(null);
+} while (page.storedEventCount() == 500);
 ```
 
 The hard limit applies globally to all queries on that EventStore instance. Individual queries can use lower limits, but cannot exceed the configured maximum.
@@ -763,19 +831,28 @@ PostgreSQL's MVCC (Multi-Version Concurrency Control) ensures safe concurrent ac
 
 ## How Concurrent Appends Stay Safe
 
-The DCB consistency check is an `INSERT ... WHERE NOT EXISTS (...)`. Under PostgreSQL's default READ COMMITTED isolation, each statement fixes its snapshot when it starts — so two concurrent appends at the same consistency boundary would both find it empty, both insert and both commit. That is a silent DCB violation: the store reports success to both callers and the invariant is gone. The conflicting row is a *phantom* at the moment of the check, so no row lock can cover it.
+The DCB consistency check asks whether an event matching the criteria exists after the expected reference. Under PostgreSQL's default READ COMMITTED isolation, each statement fixes its snapshot when it starts — so two concurrent appends at the same consistency boundary would both find it empty, both insert and both commit. That is a silent DCB violation: the store reports success to both callers and the invariant is gone. The conflicting row is a *phantom* at the moment of the check, so no row lock can cover it.
 
-**Conditional appends therefore take a transaction-scoped advisory lock**, keyed on a hash of the table prefix plus `(stream_context, stream_purpose)`, as its own statement before the INSERT runs.
+**Conditional appends therefore take a transaction-scoped advisory lock**, keyed on a hash of the table prefix plus `(stream_context, stream_purpose)`, as its own statement before the check and the insert run.
 
 Things worth knowing about it:
 
-- **Only conditional appends take it.** `AppendCriteria.none()` reads nothing and so cannot observe a stale boundary, which keeps bulk ingestion fully parallel.
-- **The key is the stream, not the filter.** Hashing the filter would be finer grained and unsound: two overlapping-but-unequal filters hash differently and would not exclude each other. An append not confined to one fully specified stream falls back to a storage-wide key.
-- **Cost** is around 5% against 8 concurrent writers spread over 1000 streams. Conditional appends to *one* stream serialize for the duration of a single INSERT — so a hot stream is the ceiling to watch, remembering that a stream is usually a bounded context rather than one aggregate.
+- **Only conditional appends take it.** An append without criteria reads nothing and so cannot observe a stale boundary, which keeps bulk ingestion fully parallel.
+- **The key is the stream, not the filter.** Hashing the filter would be finer grained and unsound: two overlapping-but-unequal filters hash differently and would not exclude each other.
+- **Cost.** Conditional appends to *one* stream serialize for the duration of a single INSERT, so a hot stream is a throughput ceiling: measured, writers sharing one stream's lock stay flat at ~1.4 appends/ms from one writer to sixteen, where writers spread over entities scale from 5.5 to 24. Stream layout is what buys the lock off — see [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/).
+- **The wait is bounded** by `lockTimeout` (10 seconds by default), so a stalled holder fails the appends queued behind it instead of draining the pool — see [Timeouts](#timeouts-a-stalled-lock-holder-and-a-socket-that-dies-silently).
 - **Key collisions are harmless.** They only make two unrelated streams take turns; they can never let a real conflict through.
-- **No DDL is involved**, so nothing has to be migrated to get this.
 
 `SERIALIZABLE` would also be correct, but it is a poor fit here: a DCB boundary check always scans the tail of the log, which is exactly where every writer writes, so predicate locks collide constantly. Measured on the same workload it produced 86% serialization failures and a third of the throughput.
+
+### The Check's Shape Follows the Criteria
+
+The SQL the check runs is derived from the criteria, not configured:
+
+- **With an expected reference** — the ordinary case — the check is an ordered probe (`ORDER BY event_tx, event_position LIMIT 1`) that walks the stream's position index forward *from the reference* and stops at the first match. Its cached plan is that walk, so it is stable, and OR-ing several facts together costs little (2.6× at ten OR-ed facts). Its one cost is a **stale cursor**: the walk is linear in the stream events appended since the reference, about 0.2 µs each. Taking the reference from `head()` before the decision's read keeps that walk to the few events appended during the decision — see [Optimistic Locking](/posts/eventstore-appending-events/#why-the-head-and-not-the-last-relevant-event).
+- **Without a reference** — "I decided on an empty boundary", the uniqueness pattern — the check is a `NOT EXISTS`, planned from its bound values rather than from a cached generic plan, so the tag index answers it (~2.3 ms at ten million events).
+
+One uniform `NOT EXISTS` for every criteria, left to the plan cache, was measured and rejected: a `NOT EXISTS` is priced by how soon a row turns up, while a DCB check expects none, so the cache settled on plans built for the wrong question — with a cliff at two OR-ed facts and a whole-table scan on the empty boundary.
 
 ## What Can Stall Reads: the Visibility Barrier
 
@@ -792,6 +869,8 @@ The read path withholds events whose transaction is still in flight, using `even
 - **Not harmless**: a batch job, an ETL run, a migration, or an `idle in transaction` connection that wrote before going idle. `SELECT ... FOR UPDATE` and an explicit `pg_current_xact_id()` also assign an id without writing a row.
 
 The blocker does not have to touch the events table, or even this database — transaction ids are cluster-wide, so a writer in a *different database of the same cluster* stalls this store just as effectively. The operational rule is "do not share a cluster with long-running write transactions", not "do not share a table".
+
+**Append notifications wait for the barrier.** A notification announcing events a query cannot yet see would wake a subscriber that reads nothing and then goes back to sleep — until the next append to its stream, which may be a long time coming. So the append monitor holds a notification back until the event it names is below the barrier: a subscribed projection catches up by itself the moment the blocker ends. A notification withheld for more than 10 seconds is logged at WARN — the one log line the library writes about a stall.
 
 **Read-your-own-writes does not hold while a blocker is open.** A caller can append successfully and not read the event back, because the append-side check deliberately carries no `xmin` filter and sees committed events the reader cannot. Under DCB that surfaces as an optimistic-locking conflict a retry loop **cannot clear**: the decider re-reads its boundary, gets the same stale reference, appends, and conflicts again for as long as the stall lasts.
 
@@ -816,7 +895,7 @@ Deliberately unfiltered by `datname`: the culprit may be in another database of 
 
 ### Alerting on It
 
-The library does not meter this, and nothing in the `sliceworkz.eventstore.*` meters reveals it — they count and time the calls the store makes, all of which keep succeeding throughout a stall. Detection is external, on the database.
+Nothing the store [reports to an observer](/posts/eventstore-observability-micrometer-prometheus-grafana/) reveals this — every call the store makes keeps succeeding throughout a stall — and the WARN about a withheld notification only appears once one has been held for 10 seconds. Detection is external, on the database.
 
 **Watch `pg_snapshot_xmin` standing still *while* something holds a transaction id**, never either alone. xmin also stops moving on a completely idle database, so "xmin has not advanced" fires on every quiet store; "a transaction holds an xid" fires on every append in flight. It is the combination that means events are being withheld.
 
@@ -825,6 +904,21 @@ Do **not** measure the effect by counting withheld events. `count(*) ... WHERE e
 ### The Store Is a Mild Instance of Its Own Hazard
 
 An append in flight holds a transaction id, so a second append that starts later and commits first cannot read its own event back until the first one finishes. That window is one INSERT long and self-clearing — the same mechanism, with a blocker lasting minutes rather than milliseconds, is the hazard above.
+
+## Backup and Restore
+
+**Back the cluster up physically, never with `pg_dump`.** `pg_basebackup` with WAL archiving, pgBackRest, Barman, a filesystem or managed-service snapshot, or a promoted replica all restore the transaction counter intact, so the next transaction id the restored cluster assigns is above every stored `event_tx`. A restore of that kind needs nothing from this library.
+
+**What a logical dump restored into a fresh cluster does.** `pg_dump` copies `event_tx` as plain data, so the restored history keeps the *source* cluster's transaction ids, while a fresh cluster hands out ids from a few hundred. Two things then fail, silently:
+
+- **The history reads as absent.** Every read sits behind the visibility barrier, and restored events carry ids above the new cluster's counter. `SELECT count(*)` in psql shows every row; the store sees none.
+- **New events sort before all of history.** An append gets a low id and orders before every restored event, so a projector bookmarked at the old head never advances, and a lock check whose reference is in history sees nothing after it and admits every conflict.
+
+**The store refuses to start in that state.** `build()` checks, under every `DatabaseInitMode`, that the newest stored event does not carry a transaction id at or above the next id the cluster will assign — one probe off `idx_events_global_order`, well under a millisecond whatever the store holds. No append can produce such a row, so a hit is unambiguous and fatal: the storage is closed and `build()` throws an `EventStorageException` naming the highest stored id, the cluster's next id, how many events and streams are affected, and the remedies:
+
+1. **Restore physically instead**, if a physical backup exists.
+2. **Move the counter, if nothing has been appended yet**, with `pg_resetwal -e <epoch> -x <xid>` on the stopped cluster — the postgres module README works the arithmetic through from the id the error reports. Managed services do not expose `pg_resetwal`.
+3. **Copy the events into a fresh store with [`EventStoreImporter`](/posts/eventstore-importing-events/#moving-a-store-to-another-cluster)**, which lets the target assign both ordering columns. This is the supported way to move a store between clusters: a major-version upgrade by dump, a cloud migration, a change of hosting.
 
 ## A Note on `db.properties` and Secrets
 

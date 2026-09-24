@@ -32,7 +32,7 @@ Add the EventStore BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventstore.version>0.10.2</sliceworkz.eventstore.version>
+    <sliceworkz.eventstore.version>0.11.1</sliceworkz.eventstore.version>
 </properties>
 ...
 <dependencyManagement>
@@ -64,14 +64,11 @@ For development and testing with in-memory storage:
         <groupId>org.sliceworkz</groupId>
         <artifactId>sliceworkz-eventstore-infra-inmem</artifactId>
     </dependency>
-    <dependency>
-        <groupId>org.sliceworkz</groupId>
-        <artifactId>sliceworkz-eventstore-impl</artifactId>
-        <scope>runtime</scope>
-    </dependency>
 </dependencies>
 ...
 ```
+
+Every storage backend brings `sliceworkz-eventstore-impl` in at runtime, so `EventStore.on(storage).build()` finds an implementation without you naming one.
 
 For local development with file persistence (events survive restarts without requiring PostgreSQL):
 
@@ -84,7 +81,7 @@ For local development with file persistence (events survive restarts without req
 ...
 ```
 
-For production use with PostgreSQL, you can replace the inmemory-storage with this one:
+For production use with PostgreSQL, you can replace the inmemory-storage with this one. The JDBC driver is declared `provided` by the backend, so add it yourself, at the version your platform ships:
 
 ```xml
 ...
@@ -92,8 +89,16 @@ For production use with PostgreSQL, you can replace the inmemory-storage with th
     <groupId>org.sliceworkz</groupId>
     <artifactId>sliceworkz-eventstore-infra-postgres</artifactId>
 </dependency>
+<dependency>
+    <groupId>org.postgresql</groupId>
+    <artifactId>postgresql</artifactId>
+    <version>42.7.13</version>
+</dependency>
 ...
 ```
+
+> **What lands on your classpath.** `sliceworkz-eventstore-api` brings SLF4J and nothing else of note — no metrics library, and no Jackson beyond the optional `jackson-annotations` artifact Jackson 2 and 3 share. Jackson 3 (`tools.jackson.*`) arrives with the implementation and the backends; it is a different groupId and package from Jackson 2, so an application on Jackson 2 runs both side by side without conflict. Every jar declares an `Automatic-Module-Name` (`org.sliceworkz.eventstore`, `org.sliceworkz.eventstore.infra.postgres`, …), so `requires` clauses keep working on the module path whatever the jar file is called.
+{: .prompt-info }
 
 > **PostgreSQL version support.** The oldest supported PostgreSQL is **16**; **18+** is what the library is built around, using the native server-side `uuidv7()` function for event ids. On 16 and 17 those ids are generated in Java instead, which requires the optional `com.github.f4b6a3:uuid-creator` dependency to be added explicitly to your application. The right implementation is selected automatically at startup from the connected server's major version. See the [PostgreSQL EventStorage guide](/posts/eventstore-configuring-postgresql-storage/#postgresql-version-support) for the dependency snippet and details.
 {: .prompt-info }
@@ -164,20 +169,19 @@ import org.sliceworkz.eventstore.infra.postgres.PostgresEventStorage;
 EventStore eventstore = PostgresEventStorage.newBuilder()
     .name("mystore")
     .prefix("myapp_")
-    .initializeDatabase()
     .buildStore();
 ```
 
-> **Note:** PostgreSQL requires a `db.properties` file with connection settings.  Have a look at the example <a href="https://github.com/sliceworkz/eventstore/tree/develop/sliceworkz-eventstore-infra-postgres/src/main/quickstart">quickstart configuration</a> for a template.
+> **Note:** PostgreSQL needs connection settings — a `db.properties` file, or a `DataSource` you pass in (see [PostgreSQL Configuration](#postgresql-configuration) below). Have a look at the example <a href="https://github.com/sliceworkz/eventstore/tree/develop/sliceworkz-eventstore-infra-postgres/src/main/quickstart">quickstart configuration</a> for a template.
 
-> The `.initializeDatabase()`{:.filepath} call uses `DatabaseInitMode.INITIALIZE`, which drops and recreates the necessary tables and indexes. Without it, the default mode is `ENSURE`, which creates missing objects idempotently. For production, the recommended way of working is to connect the DB with a user that only has DML rights, use `.validateDatabase()`{:.filepath} to verify the schema, and create the database schema upfront with the DDL found in the <a href="https://github.com/sliceworkz/eventstore/tree/develop/sliceworkz-eventstore-infra-postgres/src/main/quickstart">quickstart configuration</a>
+> The default `DatabaseInitMode` is `ENSURE`, which creates missing tables, indexes, functions and triggers idempotently and leaves your data alone. `.recreateDatabase()`{:.filepath} (`DatabaseInitMode.RECREATE`) drops and recreates everything, **deleting every event** — handy for a test run, never for anything else. For production, the recommended way of working is to connect the DB with a user that only has DML rights, use `.validateDatabase()`{:.filepath} to verify the schema, and create the database schema upfront with the DDL found in the <a href="https://github.com/sliceworkz/eventstore/tree/develop/sliceworkz-eventstore-infra-postgres/src/main/quickstart">quickstart configuration</a>
 {: .prompt-warning }
 
 
 ### 3. Get an EventStream
 
 An Eventstore gives access to EventStreams, which are identified by a 2-part (context and purpose).
-It also takes the sealed interfaces class as a parameter to allow typed access to the events in the stream.
+It also takes the sealed interface class as a parameter to allow typed access to the events in the stream. That class fixes the stream's type parameter: `getEventStream(id, CustomerEvent.class)` is an `EventStream<CustomerEvent>`, and assigning it to an `EventStream<OrderEvent>` does not compile.
 
 All events in the EventStore are of course organised sequentially, an EventStream is actually a subset of the Events in the overall Event history managed by the Eventstore.
 
@@ -192,34 +196,28 @@ EventStreamId streamId = EventStreamId.forContext("customer").withPurpose("123")
 EventStream<CustomerEvent> stream = eventstore.getEventStream(streamId, CustomerEvent.class);
 ```
 
-> **A stream is not an aggregate.** It is tempting to read this as "the stream for customer 123" and to rebuild one object per entity from it — the classic aggregate. Resist that. A stream is normally a whole bounded context; consistency comes from the **tags on the events**, not from the boundary of the stream, which is what lets a single decision span facts about several entities at once. The [Dynamic Consistency Boundary](#dynamic-consistency-boundary---optimistic-locking-with-tags) section below shows the shape to aim for, and it is the one this library is built around.
+> **A stream is not an aggregate.** It is tempting to read this as "the stream for customer 123" and to rebuild one object per entity from it — the classic aggregate. Resist that. Consistency comes from the **tags on the events**, not from the boundary of the stream, which is what lets a single decision span facts about several entities at once. The [Dynamic Consistency Boundary](#dynamic-consistency-boundary---optimistic-locking-with-tags) section below shows the shape to aim for, and it is the one this library is built around.
 {: .prompt-warning }
 
-> A `purpose` per entity is also expensive in practice: it is a metric tag, so a purpose per customer means a set of meters per customer. See [bounding meter cardinality](/posts/eventstore-observability-micrometer-prometheus-grafana/#bounding-meter-cardinality-the-purpose-tag). Use a purpose to separate *kinds* of stream within a context, not instances of an entity.
+> Whether the purpose should be an entity id — a stream per customer rather than one stream for all customers — is a layout decision with measured consequences for both reads and write contention. On PostgreSQL a stream per entity wins or ties almost everything, provided you read an entity through its own stream — but a conditional append only checks the stream it appends to, so facts that one decision spans have to share a stream. See [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/) before settling on one.
 {: .prompt-info }
 
 ### 4. Append Events
 
 You're now ready to append Events to your EventStream.
-For now, we'll just add them after whatever Events already exists, without any conditions (AppendCriteria).
+For now, we'll just add them after whatever Events already exist, without any conditions: no decision was read, so there is no consistency boundary to check.
 
 These are simple appends without optimistic locking:
 
 ```java
 import org.sliceworkz.eventstore.events.Event;
 import org.sliceworkz.eventstore.events.Tags;
-import org.sliceworkz.eventstore.stream.AppendCriteria;
 
-stream.append(
-    AppendCriteria.none(),
-    Event.of(new CustomerRegistered("John"), Tags.none())
-);
-
-stream.append(
-    AppendCriteria.none(),
-    Event.of(new CustomerNameChanged("Jane"), Tags.none())
-);
+stream.append(Event.of(new CustomerRegistered("John"), Tags.none()));
+stream.append(Event.of(new CustomerNameChanged("Jane"), Tags.none()));
 ```
+
+An append without criteria is exactly `stream.append(AppendCriteria.none(), ...)`, which stays valid — use whichever reads better.
 
 ### 5. Query Events
 
@@ -229,22 +227,19 @@ Querying all events in the stream:
 
 ```java
 import org.sliceworkz.eventstore.query.EventQuery;
-import java.util.stream.Stream;
+import java.util.List;
 
-Stream<Event<CustomerEvent>> allEvents = stream.query(EventQuery.matchAll());
+List<Event<CustomerEvent>> allEvents = stream.query(EventQuery.matchAll());
 allEvents.forEach(System.out::println);
 ```
+
+`query()` returns a `List`, read in full: storage has finished reading by the time it comes back. Bound a read over a large stream with `.limit(n)` — see [Querying Events](/posts/eventstore-querying-events/).
 
 Query with filters, in this example only returning Events of a certain type:
 
 ```java
-import org.sliceworkz.eventstore.query.EventTypesFilter;
-
-Stream<Event<CustomerEvent>> registrations = stream.query(
-    EventQuery.forEvents(
-        EventTypesFilter.of(CustomerRegistered.class),
-        Tags.none()
-    )
+List<Event<CustomerEvent>> registrations = stream.query(
+    EventQuery.forTypes(CustomerRegistered.class)
 );
 ```
 
@@ -257,6 +252,8 @@ Before diving into some more advanced scenarios, let's explain some of the requi
 
 The Eventstore is the main entry point for interacting with the event storage system (inmemory or postgres-database). 
 It Provides access to EventStreams.
+
+A storage builder's `buildStore()` gives you one directly. When you hold the `EventStorage` yourself, `EventStore.on(storage).build()` turns it into a store.
 
 You would typically create a single EventStore object per application.
 
@@ -274,7 +271,7 @@ Key-value pairs attached to events that enable dynamic querying across different
 
 ### EventQuery
 
-Defines which events to retrieve from storage and how to traverse them. An `EventQuery` wraps an `EventFilter` (matching criteria: event types, tags, and an optional "until" reference) together with a direction (forward or backward) and an optional limit.
+Defines which events to retrieve from storage and how to traverse them. An `EventQuery` wraps an `EventFilter` (matching criteria: event types, tags, and an optional "until" reference) together with a direction (forward or backward) and an optional limit. Build one fluently — `EventQuery.forTypes(CustomerEvent.class).tagged("customer", "123")`, where a sealed root stands for its whole hierarchy — or from its two halves with `EventQuery.forEvents(types, tags)`.
 
 ### AppendCriteria
 
@@ -301,21 +298,8 @@ EventStreamId streamId = EventStreamId.forContext("customers");
 EventStream<CustomerEvent> stream = eventstore.getEventStream(streamId, CustomerEvent.class);
 
 // Append events with customer tags
-stream.append(
-    AppendCriteria.none(),
-    Event.of(
-        new CustomerRegistered("123", "John"),
-        Tags.of("customer", "123")
-    )
-);
-
-stream.append(
-    AppendCriteria.none(),
-    Event.of(
-        new CustomerRegistered("456", "Alice"),
-        Tags.of("customer", "456")
-    )
-);
+stream.append(Event.of(new CustomerRegistered("123", "John"), Tags.of("customer", "123")));
+stream.append(Event.of(new CustomerRegistered("456", "Alice"), Tags.of("customer", "456")));
 ```
 
 ### Query by Tag
@@ -326,11 +310,8 @@ Retrieve events for a specific customer:
 import java.util.List;
 
 List<Event<CustomerEvent>> customer123Events = stream.query(
-    EventQuery.forEvents(
-        EventTypesFilter.any(),
-        Tags.of("customer", "123")
-    )
-).toList();
+    EventQuery.forTags(Tags.of("customer", "123"))
+);
 ```
 
 ### Conditional Append with Optimistic Locking
@@ -339,52 +320,47 @@ Ensure no new relevant events exist before appending:
 
 ```java
 import org.sliceworkz.eventstore.events.EventReference;
+import org.sliceworkz.eventstore.stream.AppendCriteria;
 import org.sliceworkz.eventstore.stream.OptimisticLockingException;
 import java.util.List;
 
-// 1. Query current state
-List<Event<CustomerEvent>> events = stream.query(
-    EventQuery.forEvents(
-        EventTypesFilter.any(),
-        Tags.of("customer", "123")
-    )
-).toList();
+EventQuery customer123 = EventQuery.forTags(Tags.of("customer", "123"));
 
-// 2. Make business decision based on events
+// 1. Pin the boundary at the stream head, BEFORE reading.
+//    An absent head is an empty stream -- a valid boundary, so no special case is needed
+EventReference head = stream.head().orElse(null);
+
+// 2. Query the relevant facts, bounded at that head
+List<Event<CustomerEvent>> events = stream.query(customer123.until(head));
+
+// 3. Make business decision based on events
 // ... process events and decide to change name ...
 
-// 3. Get reference to last known event
-EventReference lastKnownEvent = events.getLast().reference();
-
-// 4. Append with optimistic lock
+// 4. Append with optimistic lock: the query UNBOUNDED, the head as the expected last event
 try {
     stream.append(
-        AppendCriteria.of(
-            EventQuery.forEvents(
-                EventTypesFilter.any(),
-                Tags.of("customer", "123")
-            ),
-            lastKnownEvent
-        ),
-        Event.of(
-            new CustomerNameChanged("123", "Jane"),
-            Tags.of("customer", "123")
-        )
+        AppendCriteria.of(customer123, head),
+        Event.of(new CustomerNameChanged("123", "Jane"), Tags.of("customer", "123"))
     );
 } catch (OptimisticLockingException e) {
-    // New events were appended since we queried
-    // Retry: query again, make decision, append
+    // A new fact about customer 123 was appended since the head was taken
+    // Retry: take the head again, query again, decide again, append
 }
 ```
+
+`head()` is the reference of the newest stored event in the stream, answered without reading it. Taking it *before* the read gives every read of the decision the same boundary, and gives the lock check a cursor at the stream head — which on PostgreSQL is markedly cheaper to check than the reference of the last relevant event.
+
+> **Hand `AppendCriteria` the query without its `until`.** `AppendCriteria.of(customer123.until(head), head)` — reusing the query the read used — deems nothing after the head relevant, so the check never finds a new fact and every append is admitted. Nothing fails to tell you: optimistic locking is simply off.
+{: .prompt-danger }
 
 ### The DCB Pattern
 
 This pattern implements the <a href="https://dcb.events/specification">Dynamic Consistency Boundary specification</a>:
 
-1. **Query** relevant events with an `EventQuery`
-2. **Note** the reference of the last relevant event
+1. **Pin** the boundary: take the stream's `head()` (or, for a single read, note the reference of the last relevant event)
+2. **Query** relevant events with an `EventQuery`, bounded with `until(head)`
 3. **Decide** based on the events retrieved
-4. **Append** new events with `AppendCriteria` containing the same query and last reference
+4. **Append** new events with `AppendCriteria` containing the same query — without the `until` — and that reference
 5. If new events matching the query exist after the reference, the append **fails**
 
 This ensures your business decisions are based on complete information and prevents conflicts.
@@ -402,43 +378,43 @@ An example of subscribing to newly appended events:
 import org.sliceworkz.eventstore.events.Event;
 import org.sliceworkz.eventstore.events.EventReference;
 import org.sliceworkz.eventstore.query.EventQuery;
+import org.sliceworkz.eventstore.stream.EventSource;
+import org.sliceworkz.eventstore.stream.Subscription;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
-// Open read-only stream for all events
-EventStream<Object> stream = eventstore.getEventStream(EventStreamId.anyContext());
+// A raw, read-only source over every stream: each event's data is the stored JSON document
+EventSource<String> everything = eventstore.getRawEventStream(EventStreamId.anyContext());
 
-// Get reference to last event as starting point
-AtomicReference<EventReference> lastSeen = new AtomicReference<>(
-    stream.query(EventQuery.matchAll().backwards().limit(1))
-          .findFirst()
-          .map(Event::reference)
-          .orElse(null)
-);
+// Start after the current head
+AtomicReference<EventReference> lastSeen = new AtomicReference<>(everything.head().orElse(null));
 
 // Subscribe to new appends. The listener is a functional interface:
 // it receives the reference appended to at least, and returns the one it reached.
-stream.subscribe(atLeastUntil -> {
-    List<Event<Object>> newEvents = stream.query(EventQuery.matchAll(), lastSeen.get()).toList();
+Subscription subscription = everything.subscribe(atLeastUntil -> {
+    List<Event<String>> newEvents = everything.query(EventQuery.matchAll(), lastSeen.get());
 
-    newEvents.forEach(System.out::println);
+    newEvents.forEach(e -> System.out.println(e.type() + " " + e.data()));
 
     if (!newEvents.isEmpty()) {
         lastSeen.set(newEvents.getLast().reference());
     }
     return lastSeen.get();
 });
+
+// ... later: end this one subscription
+subscription.close();
 ```
 
 > **Note:** Notifications only tell you that Events were appended to **at least** a certain reference.  By the time you reach out to query new Events, it is perfectly possible that more have been appended.  Additionally, not all Event adds are notified individually per se.
 
-> Subscribing registers the stream with the storage, which then holds it until the stream is closed. Close a subscribed stream when you are done with it — or close the store, which closes them all. See [Lifecycle and Shutdown](/posts/eventstore-lifecycle/).
+> Subscribing registers the stream with the storage, which then holds it while it has a live subscription. Close the `Subscription` handle `subscribe(...)` returns, or the stream, when you are done with it — or close the store, which closes them all. See [Lifecycle and Shutdown](/posts/eventstore-lifecycle/).
 {: .prompt-info }
 
 
 ## PostgreSQL Configuration
 
-Create a `db.properties` file in your working directory:
+Create a `db.properties` file in your working directory (or at the root of the classpath, e.g. `src/main/resources`):
 
 ```properties
 db.pooled.url=jdbc:postgresql://<host>/<db>
@@ -448,9 +424,6 @@ db.pooled.leakDetectionThreshold=2000
 db.pooled.maximumPoolSize=25
 db.pooled.datasource.sslmode=require
 db.pooled.datasource.channelBinding=require
-db.pooled.datasource.cachePrepStmts=true
-db.pooled.datasource.prepStmtCacheSize=250
-db.pooled.datasource.prepStmtCacheSqlLimit=2048
 
 db.nonpooled.url=jdbc:postgresql://<host>/<db>
 db.nonpooled.username=<user>
@@ -459,10 +432,9 @@ db.nonpooled.leakDetectionThreshold=70000
 db.nonpooled.maximumPoolSize=2
 db.nonpooled.datasource.sslmode=require
 db.nonpooled.datasource.channelBinding=require
-db.nonpooled.datasource.cachePrepStmts=true
-db.nonpooled.datasource.prepStmtCacheSize=250
-db.nonpooled.datasource.prepStmtCacheSqlLimit=2048
 ```
+
+Keys in a section are HikariCP properties; keys under `datasource.` go to the JDBC driver. The builder looks for the file at a fixed set of locations and never walks into parent directories — see [where `db.properties` is found](/posts/eventstore-configuring-postgresql-storage/#configuring-an-eventstore-managed-datasource-dbproperties). You can also hand it over directly with `.configuration(Path.of(...))` or `.configuration(properties)`.
 
 
 > **Note:** Eventstore uses up to two different types of connections to your database (pooled and nonpooled).
@@ -481,13 +453,13 @@ dataSource.setJdbcUrl("jdbc:postgresql://localhost:5432/eventstore");
 dataSource.setUsername("postgres");
 dataSource.setPassword("postgres");
 
-EventStorage storage = PostgresEventStorage.newBuilder()
+PostgresEventStorage storage = PostgresEventStorage.newBuilder()
     .dataSource(dataSource)
     .prefix("myapp_")		// if you want your tables prefixed
-    .initializeDatabase()	// drop/create the database - only in DEV/test
+    .recreateDatabase()		// drop/create the tables, deleting every event - only in DEV/test
     .build();
 
-EventStore eventstore = EventStoreFactory.get().eventStore(storage);
+EventStore eventstore = EventStore.on(storage).build();
 ```
 
 ## Shutting Down
@@ -529,10 +501,10 @@ void testCustomerNameChange() {
     EventStreamId streamId = EventStreamId.forContext("customer").withPurpose("123");
     EventStream<CustomerEvent> stream = eventstore.getEventStream(streamId, CustomerEvent.class);
 
-    stream.append(AppendCriteria.none(), Event.of(new CustomerRegistered("John"), Tags.none()));
-    stream.append(AppendCriteria.none(), Event.of(new CustomerNameChanged("Jane"), Tags.none()));
+    stream.append(Event.of(new CustomerRegistered("John"), Tags.none()));
+    stream.append(Event.of(new CustomerNameChanged("Jane"), Tags.none()));
 
-    List<Event<CustomerEvent>> events = stream.query(EventQuery.matchAll()).toList();
+    List<Event<CustomerEvent>> events = stream.query(EventQuery.matchAll());
 
     assertEquals(2, events.size());
     assertEquals("Jane", ((CustomerNameChanged) events.get(1).data()).name());
@@ -547,6 +519,9 @@ See [Testing Your Application](/posts/eventstore-testing/) for the full fixture 
 - Explore the `sliceworkz-eventstore-examples` module for more complex scenarios
 - Learn about [projections](/posts/eventstore-projecting-events/) and [point-in-time queries](/posts/eventstore-querying-events/#querying-until-a-certain-moment-in-time)
 - Consider implementing [event upcasting](/posts/eventstore-defining-events/#approach-2-upcasting) for schema evolution
+- Choose your [stream layout](/posts/eventstore-stream-design-and-performance/) with the measured trade-offs in hand
+- Report what the store does to your metrics or tracing library through an [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/)
+- Upgrading from 0.10? Read [Upgrading to 0.11](/posts/eventstore-upgrading-to-0-11/) first
 - Understand [which exceptions to retry](/posts/eventstore-error-handling/) before writing your first retry loop
 - Plan [store lifecycle and shutdown](/posts/eventstore-lifecycle/) before going to production
 - Holding personal data in your events? See [Erasing Personal Data](/posts/eventstore-erasing-personal-data/) before your first append, since it decides how the events are declared

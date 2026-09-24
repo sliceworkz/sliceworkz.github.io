@@ -18,7 +18,7 @@ Projections build read models by processing events sequentially. When a projecti
 
 ```java
 StockLevelProjection projection = new StockLevelProjection("WIDGET-42");
-Projector.from(stream).towards(projection).build().run();
+Projector.from(stream).into(projection).build().run();
 // Processes ALL events from the beginning of time
 ```
 
@@ -116,6 +116,8 @@ When the Projector runs a projection that has an `initQuery()`, the execution pr
 
 On subsequent runs of the same Projector instance, the initQuery is skipped — the projector already has a cursor position and continues from there.
 
+If the handler throws on the savepoint — a savepoint written by a buggy version, say — the run fails as a `ProjectorException` naming the savepoint event, and the cursor goes back to where the run started. The next run therefore re-runs `initQuery()` rather than starting the delta query from a projection that was never initialised. `initQuery()` returning `null` is tolerated and means the same as the default, `EventQuery.matchNone()`: no savepoint phase.
+
 ## A Full Example
 
 Here is a complete walkthrough showing the savepoint pattern in action:
@@ -130,18 +132,18 @@ String product = "WIDGET-42";
 Tags tags = Tags.of("product", product);
 
 // Simulate stock movements
-stream.append(AppendCriteria.none(), Event.of(new StockAdded(product, 100), tags));
-stream.append(AppendCriteria.none(), Event.of(new StockPicked(product, 10), tags));
-stream.append(AppendCriteria.none(), Event.of(new StockPicked(product, 5), tags));
-stream.append(AppendCriteria.none(), Event.of(new StockAdded(product, 50), tags));
-stream.append(AppendCriteria.none(), Event.of(new StockPicked(product, 20), tags));
+stream.append(Event.of(new StockAdded(product, 100), tags));
+stream.append(Event.of(new StockPicked(product, 10), tags));
+stream.append(Event.of(new StockPicked(product, 5), tags));
+stream.append(Event.of(new StockAdded(product, 50), tags));
+stream.append(Event.of(new StockPicked(product, 20), tags));
 ```
 
 ### First run — no savepoint exists
 
 ```java
 StockLevelProjection projection = new StockLevelProjection(product);
-ProjectorMetrics metrics = Projector.from(stream).towards(projection).build().run();
+ProjectorMetrics metrics = Projector.from(stream).into(projection).build().run();
 
 System.out.println("Stock level: " + projection.level());           // 115
 System.out.println("Events handled: " + metrics.eventsHandled());   // 5
@@ -152,7 +154,7 @@ No savepoint exists yet, so the `initQuery()` returns nothing and the `eventQuer
 ### Append a savepoint
 
 ```java
-stream.append(AppendCriteria.none(), Event.of(new StockCounted(product, 115), tags));
+stream.append(Event.of(new StockCounted(product, 115), tags));
 ```
 
 This records the current stock level as a domain event. It is the application's choice when to do this — after a batch of operations, on a schedule, or triggered by a manual stock count.
@@ -161,11 +163,11 @@ This records the current stock level as a domain event. It is the application's 
 
 ```java
 // More movements after the savepoint
-stream.append(AppendCriteria.none(), Event.of(new StockAdded(product, 30), tags));
-stream.append(AppendCriteria.none(), Event.of(new StockPicked(product, 12), tags));
+stream.append(Event.of(new StockAdded(product, 30), tags));
+stream.append(Event.of(new StockPicked(product, 12), tags));
 
 StockLevelProjection projection2 = new StockLevelProjection(product);
-ProjectorMetrics metrics2 = Projector.from(stream).towards(projection2).build().run();
+ProjectorMetrics metrics2 = Projector.from(stream).into(projection2).build().run();
 
 System.out.println("Stock level: " + projection2.level());              // 133
 System.out.println("Events handled: " + metrics2.eventsHandled());      // 3
@@ -177,11 +179,11 @@ This time the `initQuery()` finds the `StockCounted(115)` savepoint. The project
 ### Fixing a bad savepoint
 
 ```java
-stream.append(AppendCriteria.none(), Event.of(new StockCounted(product, 133), tags));
-stream.append(AppendCriteria.none(), Event.of(new StockPicked(product, 3), tags));
+stream.append(Event.of(new StockCounted(product, 133), tags));
+stream.append(Event.of(new StockPicked(product, 3), tags));
 
 StockLevelProjection projection3 = new StockLevelProjection(product);
-ProjectorMetrics metrics3 = Projector.from(stream).towards(projection3).build().run();
+ProjectorMetrics metrics3 = Projector.from(stream).into(projection3).build().run();
 
 System.out.println("Stock level: " + projection3.level());              // 130
 System.out.println("Events handled: " + metrics3.eventsHandled());      // 2
