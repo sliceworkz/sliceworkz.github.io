@@ -111,7 +111,7 @@ A bookmarked [`Projector`](/posts/eventstore-projecting-events/#the-read-positio
 
 **The read position is never a resume point.** Resuming from it would buy nothing — the typed query already skips the events the reader does not handle, through the index — and it would lose events silently: a reader whose query later gains an event type would never be handed the events of that type sitting between the two positions.
 
-**It is optional.** A bookmark placed without one — through the three-argument overload, by a writer that does not record it, or by a storage that does not store it — reads back with an empty `readUpTo`, and `Bookmark.readUpToOrReference()` falls back to the reference, which is exactly what such a bookmark says. The next placement that carries a read position fills it in.
+**It is optional.** A bookmark placed without one reads back with an empty `readUpTo`, and `Bookmark.readUpToOrReference()` falls back to the reference, which is exactly what such a bookmark says.
 
 **It is held to the same rules as the reference**, independently: it must name an event this store holds (or the placement is rejected and the previous bookmark stays), only its event id is stored, and it reads back as the store's own coordinates for that event — as the two sections above describe. A storage does not judge whether `readUpTo` is at or after `reference`; that is the writer's to keep.
 
