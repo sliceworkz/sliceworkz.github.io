@@ -32,7 +32,7 @@ Projector.from(stream).into(projection).build().run();
 // Now caught up with history
 ```
 
-Bookmarks enable this independence by marking the last successfully processed event.
+Bookmarks enable this independence by marking the last successfully processed event — and, beside it, how far the reader has *read* the stream (see [Two Positions: Handled and Read](#two-positions-handled-and-read)).
 
 ## Placing a Bookmark
 
@@ -78,16 +78,42 @@ stream.placeBookmark("my-reader", referenceFromSomewhereElse, Tags.none());
 // -> EventStorageException; "my-reader" still points where it did before
 ```
 
-This is the contract on **every** backend — PostgreSQL enforces it with the `fk_bookmarks_event_id` foreign key, the in-memory backends check their own log — and the TCK pins it per backend. Without it, a miswired multi-store setup poisons a reader's cursor silently, and the reader then resumes from a position that means nothing in the store it is reading.
+The same holds for a bookmark's read position ([below](#two-positions-handled-and-read)). This is the contract on **every** backend — PostgreSQL enforces it with the `fk_bookmarks_event_id` and `fk_bookmarks_read_up_to_event_id` foreign keys, the in-memory backends check their own log — and the TCK pins it per backend. Without it, a miswired multi-store setup poisons a reader's cursor silently, and the reader then resumes from a position that means nothing in the store it is reading.
 
 ### A Bookmark Stores the Event Id, and Nothing Else About the Event
 
-A bookmark records *which* event the reader reached, by id. Its position and transaction — the coordinates cursor comparisons order by — are answered from the stored event itself whenever the bookmark is read: on PostgreSQL by joining the events row on its unique id, in memory by resolving the reference from the log.
+A bookmark records *which* event the reader reached, by id — and, when it has one, its [read position](#two-positions-handled-and-read), by id too. Its position and transaction — the coordinates cursor comparisons order by — are answered from the stored event itself whenever the bookmark is read: on PostgreSQL by joining the events row on its unique id, in memory by resolving the reference from the log.
 
-So the reference you read back — and the one a bookmark notification carries — is always the store's own for that event, whatever the caller passed in. Two things follow:
+So the reference you read back — and the one a bookmark notification carries, read position included — is always the store's own for that event, whatever the caller passed in. Two things follow:
 
 - **A bookmark cannot carry a cursor that disagrees with the event it names.** Storing the caller's `(tx, position)` beside the id would let a bookmark pass validation with a stored id and a wrong cursor, since the check is on the id.
 - **A bookmarks table is valid in another store holding the same events.** An [import](/posts/eventstore-importing-events/) preserves event ids and reassigns both ordering columns, so bookmarks copied across by id resolve to the target's own coordinates as they stand.
+
+## Two Positions: Handled and Read
+
+A bookmark holds two positions, because they answer two different questions:
+
+- **`reference`** — the last event the reader *handled*. This is where the reader resumes.
+- **`readUpTo`** — the event up to which the reader has *read* the stream, relevant to it or not. This is what its backlog is counted from.
+
+They differ for any reader whose query names only some event types. A projection over `OrderPlaced` and `OrderShipped` never handles a `PaymentReceived`, so its `reference` never moves past one. Counting "events after the reference" as its backlog therefore counts every payment appended since its last order event — events it will never handle, for good. A reader that is fully caught up would look further behind with every payment. `readUpTo` moves past those events, so the backlog counted from it is only what the reader has not read yet.
+
+```java
+stream.placeBookmark(
+    "order-dashboard",
+    lastHandled.reference(),            // where the reader resumes
+    headWhenTheRunStarted,              // how far it has read, handled or not
+    Tags.none()
+);
+```
+
+A bookmarked [`Projector`](/posts/eventstore-projecting-events/#the-read-position) places both positions itself, so code bookmarking by hand rarely needs this four-argument overload. The three-argument `placeBookmark(reader, reference, tags)` records no read position.
+
+**The read position is never a resume point.** Resuming from it would buy nothing — the typed query already skips the events the reader does not handle, through the index — and it would lose events silently: a reader whose query later gains an event type would never be handed the events of that type sitting between the two positions.
+
+**It is optional.** A bookmark placed without one reads back with an empty `readUpTo`, and `Bookmark.readUpToOrReference()` falls back to the reference, which is exactly what such a bookmark says.
+
+**It is held to the same rules as the reference**, independently: it must name an event this store holds (or the placement is rejected and the previous bookmark stays), only its event id is stored, and it reads back as the store's own coordinates for that event — as the two sections above describe. A storage does not judge whether `readUpTo` is at or after `reference`; that is the writer's to keep.
 
 ## Retrieving a Bookmark
 
@@ -104,25 +130,51 @@ bookmark.ifPresentOrElse(
 
 Returns `Optional.empty()` if no bookmark exists for that reader (first run scenario).
 
+`getBookmark()` answers the resume point only. `findBookmark()` answers the whole bookmark of one reader — both positions, its tags, and when it was last placed:
+
+```java
+Optional<Bookmark> bookmark = stream.findBookmark("order-dashboard");
+
+bookmark.ifPresent(b -> System.out.printf(
+    "handled up to %d, read up to %d%n",
+    b.reference().position(), b.readUpToOrReference().position()));
+```
+
+It is the read for a caller that wants to know how far a reader has *read* — for instance one waiting for a reader to have seen a given event:
+
+```java
+// has the reader read past the event I just appended?
+EventReference appended = stream.append(event).getLast().reference();
+
+boolean seen = stream.findBookmark("order-dashboard")
+    .map(b -> !appended.happenedAfter(b.readUpToOrReference()))
+    .orElse(false);
+```
+
+Comparing with the read position rather than the reference is what makes this work for an event the reader does not handle: its reference never reaches such an event, while its read position does.
+
 ## Retrieving All Bookmarks
 
 `getBookmarks()` returns every bookmark on the stream, with the metadata that `getBookmark()` does not carry:
 
 ```java
 public record Bookmark (
-    String reader,             // the reader identifier
-    EventReference reference,  // the position it reached
-    Tags tags,                 // the tags supplied when it was placed
-    Instant updatedAt          // when it was last placed
-) { }
+    String reader,                     // the reader identifier
+    EventReference reference,          // the last event it handled: where it resumes
+    Optional<EventReference> readUpTo, // how far it has read the stream; empty when none was recorded
+    Tags tags,                         // the tags supplied when it was placed
+    Instant updatedAt                  // when it was last placed
+) {
+    public EventReference readUpToOrReference() { ... } // readUpTo when recorded, reference otherwise
+}
 ```
 
 ```java
 List<Bookmark> bookmarks = stream.getBookmarks();
 
 bookmarks.forEach(b -> System.out.printf(
-    "%-30s position %-8d updated %s %s%n",
-    b.reader(), b.reference().position(), b.updatedAt(), b.tags()));
+    "%-30s handled %-8d read %-8d updated %s %s%n",
+    b.reader(), b.reference().position(), b.readUpToOrReference().position(), b.updatedAt(), b.tags()));
 ```
 
 This is the API behind an operational view of a system's readers. Where `getBookmark(reader)` answers "where is *this* processor", `getBookmarks()` answers "where is everything, and which of it has stopped moving":
@@ -132,7 +184,7 @@ This is the API behind an operational view of a system's readers. Where `getBook
 Optional<EventReference> head = stream.head();
 
 stream.getBookmarks().stream()
-    .filter(b -> head.isPresent() && b.reference().happenedBefore(head.get()))
+    .filter(b -> head.isPresent() && b.readUpToOrReference().happenedBefore(head.get()))
     .forEach(b -> LOGGER.warn("reader {} is behind, last moved at {}", b.reader(), b.updatedAt()));
 
 // which readers have not moved in an hour?
@@ -141,6 +193,8 @@ stream.getBookmarks().stream()
     .filter(b -> b.updatedAt().isBefore(cutoff))
     .forEach(b -> alertOnStalledReader(b.reader(), b.updatedAt()));
 ```
+
+Lag is measured from `readUpToOrReference()`, never from `reference()`: a reader whose query skips most event types would otherwise always look behind, however current it is. Note that a bookmarked `Projector` with nothing to handle moves its read position at most once per [idle bookmark interval](/posts/eventstore-projecting-events/#the-read-position) (two seconds by default), so allow that much slack before calling a reader behind.
 
 `updatedAt` is stamped at placement time, and `tags` are exactly the tags passed to `placeBookmark(...)` — which is what makes them worth populating with a hostname, an instance id or an application version. A reader that has stopped moving is much easier to chase down when its bookmark says which process last touched it.
 
@@ -357,7 +411,7 @@ Subscription subscription = stream.subscribe((String reader, EventReference proc
 });
 ```
 
-The listener — a `BookmarkListener` — is invoked asynchronously (eventually consistent) whenever any reader places or updates a bookmark. The reference it receives carries the store's own coordinates for the bookmarked event. Close the returned `Subscription` to stop listening.
+The listener — a `BookmarkListener` — is invoked asynchronously (eventually consistent) whenever any reader places or updates a bookmark. The reference it receives is the bookmark's `reference` — the last event the reader *handled* — with the store's own coordinates for that event. Where the read position matters, as it does for lag or for waiting on a reader, look it up with `stream.findBookmark(reader)` when notified. Close the returned `Subscription` to stop listening.
 
 Some use Cases for Bookmark Listeners:
 

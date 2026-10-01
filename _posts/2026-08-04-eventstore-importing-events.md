@@ -238,7 +238,7 @@ A `pg_dump` restored into a fresh PostgreSQL cluster keeps the source's transact
 What the importer does *not* carry, and the runbook therefore has to:
 
 - **The `btree_gin` extension** on the target database. Let `ENSURE` create the target schema, or install the extension first.
-- **Bookmarks.** Copy `<prefix>bookmarks` across *after* the events. A bookmark stores only the event id, the import preserves ids, and the target answers a bookmark's position from its own events — so the copied table is valid as it stands and the foreign key holds.
+- **Bookmarks.** Copy `<prefix>bookmarks` across *after* the events. A bookmark stores only event ids — the last event handled and the read position — the import preserves ids, and the target answers both positions from its own events — so the copied table is valid as it stands and both foreign keys hold.
 - **Shredding keys.** Copy `<prefix>shredding_keys` alongside, shredded rows included, so erased values still read as erased.
 - **Leases** are deliberately not migrated; they expire.
 - **Anything outside the store holding event references** — a read model's own cursor columns, say — holds the source's coordinates. Rebuild such read models on the target rather than resuming them.

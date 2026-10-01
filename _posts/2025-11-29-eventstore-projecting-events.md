@@ -429,7 +429,7 @@ Bookmarking allows projectors to automatically save and restore their position i
 - **Allow projection updates to run subsequently on different instances**: Share position with next application instance needing it
 - **Enable incremental updates**: Process only new events since the last run (without relying on a local in-process variable)
 
-A bookmark consists of a reader name (unique identifier) and an event reference (position in the stream).   
+A bookmark consists of a reader name (unique identifier), the reference of the last event the projector handled (where it resumes), and the event up to which it has read the stream (what its lag is counted from — see [The Read Position](#the-read-position)).   
 Optionally, you can add tags to add metadata (eg: application version, hostname, process id, ... that placed the bookmark)
 
 ### Basic Bookmarking
@@ -459,6 +459,7 @@ The projector automatically:
 1. Reads the bookmark before each run to determine the starting position
 2. Processes events from that position forward
 3. Saves the updated bookmark **after every batch**, not once at the end of the run — so a catch-up interrupted halfway resumes near where it stopped instead of replaying everything it had already processed
+4. Records how far it has read the stream beside the last event it handled, so its lag is not inflated by events its query skips
 
 ### Continuous Projection Updates
 
@@ -554,6 +555,43 @@ projector.run();
 Whichever is chosen, the bookmark is still *placed* after every batch. `readBookmarkOnRequest()` is the setting for a projection that holds its own position in its own store (see [Being Exactly-Once Against Your Own Store](#being-exactly-once-against-your-own-store)), and for a test that wants to decide when the bookmark is consulted. Choosing either without `bookmarkAs(...)` is refused at `build()` — there is no bookmark to read.
 
 **`readBookmark()` never overlaps a run.** Both take the projector's lock, so a manual read while a run is in progress — a subscribed projector runs on the storage's notification thread — waits for the run to finish and then resets the position, rather than moving a cursor the run is about to overwrite with its own progress.
+
+### The Read Position
+
+A projection's query names the event types it handles, so the last event it handled never moves past an event of another type. A bookmark therefore records a second position, `readUpTo`: the event up to which the projector has *read* the stream, handled or not (see [Two Positions: Handled and Read](/posts/eventstore-bookmarking/#two-positions-handled-and-read)). Its lag is counted from there — `Bookmark.readUpToOrReference()` to the stream's head — rather than from the last event handled, which for a projection over a few event types would count every event of every other type, for good.
+
+The projector keeps it by these rules:
+
+1. **At the start of every run it takes the stream's [`head()`](/posts/eventstore-querying-events/#the-head-of-a-stream)**, behind the same visibility rules as every read, so anything committed later sorts after it.
+2. **After each committed batch** the bookmark records the last event handled as both positions. A run that fails or dies part-way leaves the read position at the last batch that landed — never beyond.
+3. **When a run has read to the end** — its last page came back shorter than its limit, and nothing failed — the read position becomes the later of that head and the last event handled, compared in the total order. Only then has everything up to the head been read. A run bounded with `runUntil(reference)` extends it only when the head is at or before that boundary.
+4. **A run that handled nothing moves only the read position, and at most once per idle bookmark interval** (two seconds by default). A subscribed projector runs on every append to its stream, whether its projection reads the event or not, and each placement is a write — on PostgreSQL an upsert, its trigger and a notification — so without the interval an idle reader would cost a write per append.
+5. **It never resumes from the read position.** It would buy nothing — the typed query skips what the projection does not read through the index — and a query that later gains an event type would never be handed the events of that type between the two positions.
+
+A projector that has handled nothing yet has no bookmark, and records no read position either.
+
+The interval is a builder setting:
+
+```java
+Projector.from(stream)
+    .into(projection)
+    .bookmarkAs("order-dashboard")
+    .idleBookmarkInterval(Duration.ofSeconds(10))   // default Projector.Builder.DEFAULT_IDLE_BOOKMARK_INTERVAL, 2s
+    .subscribe()
+    .build();
+```
+
+`Duration.ZERO` writes on every idle run; a negative or null interval is refused. A run that handled something is never held to it — it places its bookmark, read position included, after every batch.
+
+A move held back by the interval is written by the first run after the interval has passed. A subscribed projector gets that run from the next append. A projector you drive yourself can ask when it is due, so its read position does not trail the stream until something else is appended:
+
+```java
+projector.run();
+projector.deferredReadUpToDueIn()                 // empty when nothing is held back
+    .ifPresent(due -> scheduler.schedule(projector::run, due.toMillis(), TimeUnit.MILLISECONDS));
+```
+
+`Duration.ZERO` means it is due now.
 
 ## Naming a Projector for Its Observations
 

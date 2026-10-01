@@ -59,7 +59,7 @@ Every operation the store performs on behalf of a caller is reported through `st
 | `Query` | a query or a page, a projector's pages among them | `Read`: stored events read per stored type, events returned |
 | `GetEvent` | `getEventById` | `Found` |
 | `Head` | `head()` | `HeadRead` |
-| `PlaceBookmark` / `GetBookmark` / `ListBookmarks` | the bookmark operations | `Done` / `Found` / `Counted` |
+| `PlaceBookmark` / `GetBookmark` / `ListBookmarks` | the bookmark operations — `PlaceBookmark` carries the last event handled and, when the placement records one, the read position; `GetBookmark` covers `getBookmark` and `findBookmark` alike | `Done` / `Found` / `Counted` |
 | `ProjectorBatch` | one projector batch; phase `INIT` for the savepoint read, `BATCH` for every page | `Projected`: stored events read, events handled, the last reference, whether it bookmarked |
 | `Erase` | an erasure, with its reason | `Erased`: keys shredded, categories erased |
 

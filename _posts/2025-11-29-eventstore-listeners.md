@@ -143,16 +143,21 @@ Subscription subscription = stream.subscribe((String reader, EventReference proc
 
     readerPositions.put(reader, processedUntil);
 
-    // Detect processing lag
-    long latestPosition = getLatestEventPosition(stream);
-    long readerPosition = processedUntil.position();
-    long lag = latestPosition - readerPosition;
+    // Detect processing lag: count from how far the reader has *read*, not from the last
+    // event it handled, which never moves past an event type its query skips
+    EventReference readUpTo = stream.findBookmark(reader)
+        .map(Bookmark::readUpToOrReference)
+        .orElse(processedUntil);
+    long latestPosition = stream.head().map(EventReference::position).orElse(0L);
+    long lag = latestPosition - readUpTo.position();
 
     if (lag > 1000) {
         alertOnProcessingLag(reader, lag);
     }
 });
 ```
+
+The reference a bookmark listener receives is the last event the reader *handled*. A reader whose query names a few event types never handles the others, so measuring lag from that reference would report it behind every event of another type, however current it is. The bookmark's read position — `Bookmark.readUpToOrReference()`, looked up with `findBookmark(reader)` — is what the backlog is counted from; see [Two Positions: Handled and Read](/posts/eventstore-bookmarking/#two-positions-handled-and-read).
 
 Bookmark listeners get the same failure containment as append listeners: an exception is logged and the next subscriber still runs.
 
