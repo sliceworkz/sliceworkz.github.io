@@ -428,7 +428,7 @@ Beyond the tables, the script creates two `plpgsql` functions and their triggers
 ```sql
 CREATE TABLE IF NOT EXISTS bookmarks (
     reader TEXT PRIMARY KEY,
-    event_id UUID NOT NULL,
+    event_id UUID,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_tags TEXT[] DEFAULT '{}',
     read_up_to_event_id UUID,
@@ -437,7 +437,9 @@ CREATE TABLE IF NOT EXISTS bookmarks (
         REFERENCES events(event_id),
     CONSTRAINT fk_bookmarks_read_up_to_event_id
         FOREIGN KEY (read_up_to_event_id)
-        REFERENCES events(event_id)
+        REFERENCES events(event_id),
+    CONSTRAINT ck_bookmarks_handled_or_read_position
+        CHECK (event_id IS NOT NULL OR read_up_to_event_id IS NOT NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_bookmarks_event_id ON bookmarks(event_id);
@@ -445,6 +447,8 @@ CREATE INDEX IF NOT EXISTS idx_bookmarks_read_up_to_event_id ON bookmarks(read_u
 ```
 
 A bookmark row holds two event ids: `event_id`, the last event the reader handled and where it resumes, and the nullable `read_up_to_event_id`, the event up to which it has read the stream — what its lag is counted from (see [Two Positions: Handled and Read](/posts/eventstore-bookmarking/#two-positions-handled-and-read)). A bookmark placed without a read position leaves it null, and readers fall back to `event_id`.
+
+`event_id` is nullable too: a reader whose query selects event types that have not occurred yet records its [read position alone](/posts/eventstore-bookmarking/#two-positions-handled-and-read) — "read up to here, handled nothing yet" — and still resumes from the beginning. The check `ck_bookmarks_handled_or_read_position` keeps a row from naming neither. The foreign key is `MATCH SIMPLE`, PostgreSQL's default, so a null `event_id` is not checked and a present one still has to name a stored event. Placing a read position alone never clears the `event_id` a row already holds — the upsert keeps it with `COALESCE` — and the notification payload's `event*` fields are null for a row that names no handled event.
 
 **A bookmark stores event ids and nothing else about the events.** `getBookmark`, `findBookmark` and `getBookmarks` join the events row on its unique `event_id` index — one probe, and a second (`LEFT JOIN`) for the read position — to answer each position's transaction and position, and the bookmark trigger does the same for its notification payload. So a bookmark always reads back with the store's own coordinates for the event it names, and a bookmarks table copied between stores by id is valid as it stands.
 
@@ -611,7 +615,7 @@ What "brings up to date" means differs per kind of object, and the difference ma
 
 | Object | What ENSURE does |
 |---|---|
-| Tables, columns | **Created if absent**, never altered |
+| Tables, columns | **Created if absent**, never altered — save that the bookmarks table is brought to a nullable `event_id` with its `ck_bookmarks_handled_or_read_position` check, a change needing no data, guarded so an ordinary start issues no `ALTER TABLE` |
 | Indexes | **Created if absent**, never rebuilt |
 | The `btree_gin` extension | Created if absent, skipped entirely when already present |
 | Functions | **`CREATE OR REPLACE`d every time** — the body always matches this release |
@@ -641,7 +645,7 @@ Validation checks that:
 - the required tables exist (`PREFIX_events`, `PREFIX_bookmarks`, `PREFIX_leases`, `PREFIX_lease_contenders`, `PREFIX_shredding_keys`)
 - every expected column is present, with the right type and nullability
 - the expected indexes exist by name — including `idx_events_stream_tags` and `idx_events_stream_idempotency` — and the two order indexes carry their admission predicates
-- the bookmarks foreign keys exist by name (`fk_bookmarks_event_id`, `fk_bookmarks_read_up_to_event_id`), and the bookmarks table has its `read_up_to_event_id` column
+- the bookmarks foreign keys exist by name (`fk_bookmarks_event_id`, `fk_bookmarks_read_up_to_event_id`), the bookmarks table has its `read_up_to_event_id` column, a nullable `event_id`, and its `ck_bookmarks_handled_or_read_position` check
 - the notification functions exist
 - each trigger exists **with the expected orientation** (row-level vs statement-level), not merely by name
 
@@ -684,7 +688,7 @@ EventStore eventStore = PostgresEventStorage.newBuilder()
 
 ### Schema Changes That No Mode Applies
 
-`ENSURE` only ever *creates* tables, columns and indexes. Anything needing `ALTER TABLE` — changing a column default, altering a constraint, rebuilding an index differently — is outside what any mode does, and has to be applied by hand. Combined with what [validation does not check](#validate), that is the argument for applying the shipped `quickstart.ddl.sql` / `ensure-schema.sql` rather than hand-written equivalents: a schema that differs from it in one of those ways starts cleanly and stays wrong.
+Apart from the bookmarks relaxation above, `ENSURE` only ever *creates* tables, columns and indexes. Anything needing `ALTER TABLE` — changing a column default, altering a constraint, rebuilding an index differently — is outside what any mode does, and has to be applied by hand. Combined with what [validation does not check](#validate), that is the argument for applying the shipped `quickstart.ddl.sql` / `ensure-schema.sql` rather than hand-written equivalents: a schema that differs from it in one of those ways starts cleanly and stays wrong.
 
 > **`VALIDATE` and `NONE` change nothing at all**, including the function bodies — and validation cannot detect a stale body, since it does not compare function source. Where a deployment is pinned to either mode, apply the shipped `quickstart.ddl.sql` / `ensure-schema.sql` as part of the release rather than expecting the application to bring the schema forward.
 {: .prompt-warning }
