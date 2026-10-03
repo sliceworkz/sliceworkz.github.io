@@ -568,7 +568,7 @@ The projector keeps it by these rules:
 4. **A run that handled nothing moves only the read position, and at most once per idle bookmark interval** (two seconds by default). A subscribed projector runs on every append to its stream, whether its projection reads the event or not, and each placement is a write — on PostgreSQL an upsert, its trigger and a notification — so without the interval an idle reader would cost a write per append.
 5. **It never resumes from the read position.** It would buy nothing — the typed query skips what the projection does not read through the index — and a query that later gains an event type would never be handed the events of that type between the two positions.
 
-A projector that has handled nothing yet has no bookmark, and records no read position either.
+**A projector that has handled nothing yet records its read position alone**, by the same rules: after a run that read to the end, the head (within its `runUntil` boundary), as an idle move held to the interval. Its query may select event types that have not occurred yet; its bookmark then names no handled event, and its backlog is not counted as the whole stream although nothing in it concerns the projection. It still resumes from the beginning, exactly as a projector without a bookmark does, and the first event it handles fills the handled reference in. See [Two Positions: Handled and Read](/posts/eventstore-bookmarking/#two-positions-handled-and-read).
 
 The interval is a builder setting:
 

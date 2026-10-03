@@ -111,7 +111,20 @@ A bookmarked [`Projector`](/posts/eventstore-projecting-events/#the-read-positio
 
 **The read position is never a resume point.** Resuming from it would buy nothing — the typed query already skips the events the reader does not handle, through the index — and it would lose events silently: a reader whose query later gains an event type would never be handed the events of that type sitting between the two positions.
 
-**It is optional.** A bookmark placed without one reads back with an empty `readUpTo`, and `Bookmark.readUpToOrReference()` falls back to the reference, which is exactly what such a bookmark says.
+**Either position may be absent, but not both.** A bookmark always says something:
+
+- **No read position** — a bookmark placed without one reads back with an empty `readUpTo`, and `Bookmark.readUpToOrReference()` falls back to the reference, which is exactly what such a bookmark says.
+- **No handled event** — "read up to here, handled nothing yet". A reader whose query selects event types that have not occurred yet reads the stream without handling anything. Without a bookmark its whole stream would count as backlog, although nothing in it concerns it. So it records its read position alone, and `reference()` reads back empty.
+
+```java
+stream.placeReadPosition(
+    "order-dashboard",
+    headWhenTheRunStarted,              // how far it has read; it has handled nothing yet
+    Tags.none()
+);
+```
+
+A reader with such a bookmark **still resumes from the beginning**, exactly as one without a bookmark does: `getBookmark(reader)` — the resume point — answers empty, since the read position is never a resume point. Placing a read position alone **never clears a handled reference** the bookmark already names; only the read position, tags and update time are replaced. The first `placeBookmark` that names a handled event fills the reference in. A bookmarked `Projector` places a read-position-only bookmark itself, after a run that read to the end without handling anything.
 
 **It is held to the same rules as the reference**, independently: it must name an event this store holds (or the placement is rejected and the previous bookmark stays), only its event id is stored, and it reads back as the store's own coordinates for that event — as the two sections above describe. A storage does not judge whether `readUpTo` is at or after `reference`; that is the writer's to keep.
 
@@ -128,16 +141,17 @@ bookmark.ifPresentOrElse(
 );
 ```
 
-Returns `Optional.empty()` if no bookmark exists for that reader (first run scenario).
+Returns `Optional.empty()` if no bookmark exists for that reader (first run scenario), or if its bookmark records a read position only — a reader that has handled nothing yet starts from the beginning either way.
 
-`getBookmark()` answers the resume point only. `findBookmark()` answers the whole bookmark of one reader — both positions, its tags, and when it was last placed:
+`getBookmark()` answers the resume point only. `findBookmark()` answers the whole bookmark of one reader — both positions, its tags, and when it was last placed — including the bookmark of a reader that has read the stream without handling anything yet:
 
 ```java
 Optional<Bookmark> bookmark = stream.findBookmark("order-dashboard");
 
 bookmark.ifPresent(b -> System.out.printf(
-    "handled up to %d, read up to %d%n",
-    b.reference().position(), b.readUpToOrReference().position()));
+    "handled up to %s, read up to %d%n",
+    b.reference().map(r -> String.valueOf(r.position())).orElse("nothing yet"),
+    b.readUpToOrReference().position()));
 ```
 
 It is the read for a caller that wants to know how far a reader has *read* — for instance one waiting for a reader to have seen a given event:
@@ -160,21 +174,28 @@ Comparing with the read position rather than the reference is what makes this wo
 ```java
 public record Bookmark (
     String reader,                     // the reader identifier
-    EventReference reference,          // the last event it handled: where it resumes
-    Optional<EventReference> readUpTo, // how far it has read the stream; empty when none was recorded
-    Tags tags,                         // the tags supplied when it was placed
-    Instant updatedAt                  // when it was last placed
+    Optional<EventReference> reference, // the last event it handled: where it resumes; empty when it has handled nothing yet
+    Optional<EventReference> readUpTo,  // how far it has read the stream; empty when none was recorded
+    Tags tags,                          // the tags supplied when it was placed
+    Instant updatedAt                   // when it was last placed
 ) {
-    public EventReference readUpToOrReference() { ... } // readUpTo when recorded, reference otherwise
+    public EventReference readUpToOrReference() { ... } // readUpTo when recorded, reference otherwise; never null
 }
+```
+
+At least one of the two positions is always present — the record refuses a bookmark naming neither — so `readUpToOrReference()` always answers.
+
+```java
 ```
 
 ```java
 List<Bookmark> bookmarks = stream.getBookmarks();
 
 bookmarks.forEach(b -> System.out.printf(
-    "%-30s handled %-8d read %-8d updated %s %s%n",
-    b.reader(), b.reference().position(), b.readUpToOrReference().position(), b.updatedAt(), b.tags()));
+    "%-30s handled %-8s read %-8d updated %s %s%n",
+    b.reader(),
+    b.reference().map(r -> String.valueOf(r.position())).orElse("-"),
+    b.readUpToOrReference().position(), b.updatedAt(), b.tags()));
 ```
 
 This is the API behind an operational view of a system's readers. Where `getBookmark(reader)` answers "where is *this* processor", `getBookmarks()` answers "where is everything, and which of it has stopped moving":
@@ -200,7 +221,7 @@ Lag is measured from `readUpToOrReference()`, never from `reference()`: a reader
 
 ## Removing a Bookmark
 
-`removeBookmark(reader)` deletes a reader's bookmark and returns the reference it held, or `Optional.empty()` if there was none:
+`removeBookmark(reader)` deletes a reader's bookmark and returns the handled reference it held, or `Optional.empty()` if there was none — or if it recorded a read position only, which it removes too:
 
 ```java
 Optional<EventReference> removed = stream.removeBookmark("customer-analytics");
@@ -412,6 +433,22 @@ Subscription subscription = stream.subscribe((String reader, EventReference proc
 ```
 
 The listener — a `BookmarkListener` — is invoked asynchronously (eventually consistent) whenever any reader places or updates a bookmark. The reference it receives is the bookmark's `reference` — the last event the reader *handled* — with the store's own coordinates for that event. Where the read position matters, as it does for lag or for waiting on a reader, look it up with `stream.findBookmark(reader)` when notified. Close the returned `Subscription` to stop listening.
+
+A placement that records a read position alone — a reader that has read the stream without handling anything yet — has no processed-until to report, so it is not passed to `bookmarkUpdated`. It goes to `BookmarkListener.readPositionUpdated(reader, readUpTo)`, a default method that does nothing. A listener waiting for a reader to have read further — an automation waiting for its todo list, say — overrides it too:
+
+```java
+stream.subscribe(new BookmarkListener() {
+    @Override
+    public void bookmarkUpdated(String reader, EventReference processedUntil) {
+        progress.put(reader, processedUntil);
+    }
+
+    @Override
+    public void readPositionUpdated(String reader, EventReference readUpTo) {
+        progress.put(reader, readUpTo);   // read this far, handled nothing yet
+    }
+});
+```
 
 Some use Cases for Bookmark Listeners:
 

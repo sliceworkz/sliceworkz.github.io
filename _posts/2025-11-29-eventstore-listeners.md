@@ -159,6 +159,8 @@ Subscription subscription = stream.subscribe((String reader, EventReference proc
 
 The reference a bookmark listener receives is the last event the reader *handled*. A reader whose query names a few event types never handles the others, so measuring lag from that reference would report it behind every event of another type, however current it is. The bookmark's read position — `Bookmark.readUpToOrReference()`, looked up with `findBookmark(reader)` — is what the backlog is counted from; see [Two Positions: Handled and Read](/posts/eventstore-bookmarking/#two-positions-handled-and-read).
 
+A reader that has read the stream without handling anything yet records its read position alone, and that placement has no processed-until to hand to `bookmarkUpdated`. It is passed to `BookmarkListener.readPositionUpdated(reader, readUpTo)` instead, a default method that does nothing; override it where a read position alone matters — a monitor like the one above, or a caller waiting for a reader to have read further.
+
 Bookmark listeners get the same failure containment as append listeners: an exception is logged and the next subscriber still runs.
 
 **Why bookmark notifications are asynchronous too.** Bookmarks are placed after processing each event or batch, potentially hundreds or thousands of times per second. Blocking those operations with synchronous notifications would severely degrade throughput and couple readers tightly to whoever is watching them.
