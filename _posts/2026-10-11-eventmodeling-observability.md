@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Observability and Tracing
 description: What a bounded context reports about itself — lifecycle and outcome events for a monitoring stream, scoped observations for metrics and tracing, and correlation ids that follow one flow across every step.
-date: 2026-10-12 14:00:00
+date: 2026-10-11 14:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Deployment]
 tags: [eventmodeling, observability, monitoring, tracing, correlation id, metrics, micrometer, dashboard]
 ---

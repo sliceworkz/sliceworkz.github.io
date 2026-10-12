@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Personal Data and Erasure
 description: Declaring personal data as Shreddable values in domain events, configuring where the keys live, erasing a person or one category of their data, and what erasure does not reach.
-date: 2026-10-12 15:00:00
+date: 2026-10-11 15:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Deployment]
 tags: [eventmodeling, gdpr, personal data, erasure, crypto-shredding, shreddable, privacy]
 ---

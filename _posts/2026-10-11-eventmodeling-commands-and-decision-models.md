@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Commands and Decision Models
 description: How a command decides on history, raises domain events and gets its append checked against everything it read
-date: 2026-10-12 03:00:00
+date: 2026-10-11 03:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, commands, decision models, dcb, optimistic locking, idempotency, aggregates]
 ---

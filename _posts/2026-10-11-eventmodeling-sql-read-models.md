@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Durable SQL Read Models
 description: Writing eventually consistent read models into SQL tables with SqlReadModelProjector and SqlReadModelQuery, with the projector's position committed in the same transaction as its rows.
-date: 2026-10-12 07:00:00
+date: 2026-10-11 07:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, read models, sql, projections, leader election, idempotency]
 ---

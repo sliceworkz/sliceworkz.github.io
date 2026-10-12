@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Where a Validation Goes
 description: One place for each kind of check, and why a validation runs before events exist or never
-date: 2026-10-12 04:00:00
+date: 2026-10-11 04:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, validation, commands, decision models, dcb, uniqueness, poison events]
 ---

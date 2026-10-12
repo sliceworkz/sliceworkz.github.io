@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Choosing a Read Model
 description: The ladder of read models in Sliceworkz EventModeling, from a live model projected per read to background projections, seeded reads and snapshots, and when to climb each step.
-date: 2026-10-12 06:00:00
+date: 2026-10-11 06:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, read models, projections, live model, eventual consistency, snapshots]
 ---

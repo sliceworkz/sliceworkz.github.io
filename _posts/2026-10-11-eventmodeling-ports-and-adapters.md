@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Ports, Adapters and Monitored Calls
 description: How a feature slice reaches outside its bounded context through a port the application binds, and how every call through it is timed, sorted into an answer or a failure, and attributed to the slice that made it.
-date: 2026-10-12 10:00:00
+date: 2026-10-11 10:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, ports, adapters, monitoring, tracing, hexagonal architecture]
 ---

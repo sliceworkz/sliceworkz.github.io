@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Running in Production
 description: PostgreSQL storage, several instances of one deployment, leader election, splitting front and batch instances, failure handling and the operator's controls.
-date: 2026-10-12 13:00:00
+date: 2026-10-11 13:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Deployment]
 tags: [eventmodeling, production, postgresql, leader election, high availability, operations, management]
 ---

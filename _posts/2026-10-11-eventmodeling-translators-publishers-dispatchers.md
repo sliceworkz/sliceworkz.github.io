@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Translators, Publishers and Dispatchers
 description: How events cross the edge of a bounded context — translators bring external events in, publishers map recorded facts into the published language, dispatchers send them out.
-date: 2026-10-12 09:00:00
+date: 2026-10-11 09:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, translator, publisher, dispatcher, outbox, integration events, idempotency]
 ---

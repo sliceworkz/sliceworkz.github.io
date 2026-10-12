@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Entities, Typed Ids and Tags
 description: Declaring the kinds of thing your events are about, with an id type per entity and type-safe tags
-date: 2026-10-12 02:00:00
+date: 2026-10-11 02:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, entity, entityid, tags, dcb, typed ids]
 ---

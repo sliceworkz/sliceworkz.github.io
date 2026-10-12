@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Bounded Contexts and Feature Slices
 description: How a bounded context is declared, built from feature slices, deployed in parts, started and shut down
-date: 2026-10-12 01:00:00
+date: 2026-10-11 01:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, bounded context, feature slice, builder, deployment, lifecycle]
 ---

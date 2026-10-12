@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Who May Do What
 description: Handing each caller the narrow capability type its job needs instead of the whole bounded context
-date: 2026-10-12 11:00:00
+date: 2026-10-11 11:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, capabilities, bounded context, api design, architecture]
 ---

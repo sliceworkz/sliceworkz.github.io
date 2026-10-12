@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Automations and Policies
 description: Reacting to what happened — a to-do list worked off by an automation, or a policy that turns one event into one command — and what each costs when the work fails.
-date: 2026-10-12 08:00:00
+date: 2026-10-11 08:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, automation, policy, todo list, idempotency, retries, dead letter]
 ---

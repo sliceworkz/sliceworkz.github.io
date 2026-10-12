@@ -3,7 +3,7 @@ layout: post
 toc: true
 title: Business Rules and Enforcement Levels
 description: Rules people may break under conditions — declared once, checked by the command, judged by the kernel, previewed before anything is submitted
-date: 2026-10-12 05:00:00
+date: 2026-10-11 05:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Guides]
 tags: [eventmodeling, business rules, sbvr, overrides, commands, evaluation, http]
 ---
