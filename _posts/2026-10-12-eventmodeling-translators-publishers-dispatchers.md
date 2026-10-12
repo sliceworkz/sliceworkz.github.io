@@ -95,7 +95,7 @@ Catching `BusinessException` from the command is the clean way to do the second:
 
 ### `incoming(...)` or `translate(...)`
 
-Application code (an HTTP endpoint receiving a webhook, a message-bus consumer) feeds inbound events in through the context's `TranslationCapability`. There are two ways, reusing the same registered translators:
+Application code (an HTTP endpoint receiving a webhook, a message-bus consumer) feeds inbound events in through the context's `TranslationCapability<BankingInboundEvent>` — the narrow type to hand such an adapter, since feeding the domain external events is a different job from executing commands on a user's behalf (see [Who May Do What](/posts/eventmodeling-who-may-do-what/)). There are two ways, reusing the same registered translators:
 
 | | `incoming(event)` | `translate(event)` |
 |---|---|---|
@@ -115,7 +115,7 @@ List<EventReference> raised = banking.translate(new SalaryPaid(accountId.value()
 
 `incoming` is the default: the inbound event is durable before you acknowledge it, and the translator retries without the caller. Give it an **idempotency key from the sender's own message id** (`incoming(event, key)`), so a sender retrying its delivery stores the message once.
 
-`translate` suits an integration that wants the domain events immediately. Two things differ. Because there is a caller to reject, a translator may fail loudly on this path. And the `Event` the translator is handed is built for the call: its reference carries a freshly minted id under a position that names no stored event — fit to key what the translation raises, so the events of *one* translation are consistent, and for nothing else. Calling `translate` twice with the same message is two translations; protect that with a key of your own on the commands the translator executes, derived from something in the payload such as `payrollReference`. `translate` runs the translators registered on the instance it is called on.
+`translate` suits an integration that wants the domain events immediately. Two things differ. Because there is a caller to reject, a translator may fail loudly on this path. And the `Event` the translator is handed is built for the call: its reference carries a freshly minted id under a position that names no stored event — fit to key what the translation raises, so the events of *one* translation are consistent, and for nothing else. Calling `translate` twice with the same message is two translations; protect that with a key of your own on the commands the translator executes, derived from something in the payload such as `payrollReference`. `translate` runs the translators registered on the instance it is called on — so in a deployment split by aspect, call it on an instance that runs the aspect its translators are registered from, or it answers `NoTranslatorRegisteredException`.
 
 ### Registering a translator
 

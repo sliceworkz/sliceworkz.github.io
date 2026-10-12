@@ -328,11 +328,11 @@ An automation reports its lifecycle as bounded-context events:
 | event | means |
 |---|---|
 | `AutomationStarted` | running — with reason `BOUNDED_CONTEXT_START` or `RESTART`; emitted even for an empty to-do list, so a deployed automation is visible from startup |
-| `AutomationProcessed` | a batch handled something |
+| `AutomationProcessed` | a batch ran, with its metrics (events streamed and handled, duration) |
 | `AutomationFailed` | a batch failed and handled nothing; carries `consecutiveFailedBatches` so you pick your own alerting threshold |
 | `AutomationStopped` | down while its context is up: a `STOP_AUTOMATION`, or an operator stop |
 
-Fold `AutomationStarted`/`AutomationStopped` (the later wins) to answer "is it running". There is no "recovered" event: recovery is the next `AutomationProcessed`.
+Fold `AutomationStarted`/`AutomationStopped` (the later wins) to answer "is it running". There is no "recovered" event: recovery is the next `AutomationProcessed` with a non-zero `eventsHandled`.
 
 An operator holds `OperationsCapabilities` (see [Who May Do What](/posts/eventmodeling-who-may-do-what/)): `automations()` returns an `AutomationStatus` per automation — `running`, `leader`, `itemsFailed`, `consecutiveFailedBatches`, `lastFailure`, `stoppedBy`. A climbing `consecutiveFailedBatches` with nothing handled is a stall. `stopAutomation(name)` parks one (and hands its lease to another instance); `restartAutomation(name)` puts it back. Restarting without fixing the cause hands the same item over and stops again.
 

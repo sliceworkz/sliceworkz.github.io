@@ -27,7 +27,7 @@ consistency boundary. If one of them is superseded before the command appends, t
 
 `CommandContext.read(...)` is also available inside a command, but it sits **outside** that boundary and
 is meant for auxiliary lookups. A command that decides on what `read(...)` returned can append against a
-history the store no longer agrees with, and nothing will report it. No amount of read-model tuning
+history the store does not agree with any more, and nothing will report it. No amount of read-model tuning
 fixes that, so settle this question first. [Commands and Decision Models](/posts/eventmodeling-commands-and-decision-models/)
 covers decision models in full.
 
@@ -190,7 +190,7 @@ The projector runs `initQuery()` first and feeds its result through `when(...)`.
 model replays from the beginning.
 
 - **Give the two queries disjoint event types.** The savepoint types belong to `initQuery()` only.
-  Otherwise savepoints are processed twice, and you can no longer recover from a buggy savepoint by
+  Otherwise savepoints are processed twice, and you cannot recover from a buggy savepoint by
   ignoring it.
 - **The savepoint is written by the domain.** A `CloseMonthCommand` decides the books are closed. That is
   a business fact with its own meaning, and the faster read model follows from it.

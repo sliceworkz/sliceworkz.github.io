@@ -180,15 +180,23 @@ read models sharing a prefix therefore do not share a position.
 
 An absent bookmark row means "replay from the beginning". There is deliberately no fallback to the event
 store's bookmark, because that would hand a fresh database a position describing rows it does not have.
-This makes rebuilding a read model simple:
+Emptying the tables, the bookmark table included, is therefore all a rebuild takes. For a `SHARED` read
+model, without restarting anything:
 
 1. Stop its projector on every instance. `ProcessorAdminCapability.stopProcessor(ProcessorKind.READ_MODEL, name)`
    does this locally, and the management stream does it remotely. See
-   [Running in Production](/posts/eventmodeling-running-in-production/).
-2. Drop the read model's tables, **including its `_projection_bookmark` table**.
-3. Start the projector again. It recreates the tables and replays the stream.
+   [Running in Production](/posts/eventmodeling-running-in-production/). A stopped leader hands its lease
+   back.
+2. Empty the read model: drop and recreate its tables (`ensureTables()` recreates them), or delete their
+   rows. **Include its `_projection_bookmark` table.**
+3. Start the projector again with `restartProcessor(...)`. The instance that wins the lease asks the
+   projector where to resume, finds no bookmark row, and replays the stream.
 
-Nothing else needs to be reset.
+Nothing else needs to be reset. A projector only creates the bookmark table on its own; your domain tables
+are created by `ensureTables()`, which a slice calls while it is configured. Dropping the tables without
+recreating them leaves `project()` failing, and retrying, until they exist again. For an `EPHEMERAL` or
+`LOCAL` read model, which is not elected, the projector is asked where to resume when its context is
+built, so empty its tables while the process is down.
 
 > `tracksItsOwnBookmark()` returns `true`. Override it to return `false` only for a `DataSource` that may
 > not be issued DDL. The read model then falls back to the event store's bookmark, which is written
@@ -274,7 +282,7 @@ closes half of that window:
 - Each acquisition of the lease carries a token that only ever grows. On promotion, the framework hands it
   to the projector (`fencedBy(long)`), and the projector stores it in its bookmark row.
 - `resumeFrom()` raises the stored token **before** reading the position it resumes from. From the moment
-  the new leader knows where to resume, the old leader can no longer move that position.
+  the new leader knows where to resume, the old leader cannot move that position any more.
 - Every batch's bookmark write compares tokens inside the batch transaction. A superseded leader finds a
   newer token stored, and its whole batch fails with a **`StaleLeadershipException`**. Its rows roll back
   together with the refused bookmark, its projector retires, and its instance hands the lease back.
@@ -484,7 +492,8 @@ class AccountRegisterTest extends SqlReadModelTest<BankingDomainEvent> {
 - `h2DataSource()` is a fresh in-memory H2 in PostgreSQL mode. `postgresDataSource()` (or
   `postgresDataSource(image)`) is a shared PostgreSQL Testcontainer, kept for the life of the JVM. List
   the bookmark table in `tablesToDrop()` too, or the next test resumes from the previous test's position.
-- Add H2 (`com.h2database:h2`) to your test dependencies. Running the PostgreSQL variant needs Docker.
+- The testing module brings H2, the PostgreSQL driver and Testcontainers with it. Running the PostgreSQL
+  variant needs a Docker daemon.
 
 Run the read model's SQL against PostgreSQL as well as H2. H2 in PostgreSQL mode is close, but it is not
 the database you deploy on.
