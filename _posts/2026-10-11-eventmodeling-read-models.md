@@ -290,13 +290,15 @@ command execution returns the reference of the event it appended:
 EventReference write = banking.execute(new DepositCommand(accountId, amount, "salary")).orElseThrow();
 
 ReadModelResult<Map<AccountId,BigDecimal>> published = balances.published();
-boolean includesMyWrite = published.upTo() != null && !write.happenedAfter(published.upTo());
+boolean includesMyWrite = published.includes(write);
 ```
 
-Compare references with `happenedAfter` / `happenedBefore`, never with `position()` alone. A reference is
-ordered by `(tx, position, index)`. A position and a transaction id are assigned independently, so the two
-orders can disagree. Both methods are strict: when your write is exactly the last event folded,
-`write.happenedBefore(upTo)` is `false`. That is why the check above asks "not after".
+`includes(write)` is `upTo != null && !write.storedEventHappenedAfter(upTo)`: the write is in the answer
+once the stored event it was appended as is at or before `upTo`. Use it rather than comparing references
+yourself, and never compare with `position()` alone: a reference is ordered by `(tx, position, index)`, and
+a position and a transaction id are assigned independently, so the two orders can disagree. Note that
+`write.happenedBefore(upTo)` is strict, and so is `false` exactly when your write is the newest event
+folded — which is why `includes` asks "not after".
 
 > `upTo()` is `null` until the first batch is published. Treat that as "includes nothing yet".
 {: .prompt-info }

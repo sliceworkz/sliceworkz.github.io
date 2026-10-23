@@ -2,10 +2,10 @@
 layout: post
 toc: true
 title: Running in Production
-description: PostgreSQL storage, several instances of one deployment, leader election, splitting front and batch instances, failure handling and the operator's controls.
+description: PostgreSQL storage, several instances of one deployment, leader election, splitting front and batch instances, failure handling, health probes and the operator's controls.
 date: 2026-10-11 13:00:00
 categories: [Eventmodeling Documentation,Eventmodeling Deployment]
-tags: [eventmodeling, production, postgresql, leader election, high availability, operations, management]
+tags: [eventmodeling, production, postgresql, leader election, high availability, operations, management, health]
 ---
 
 The [quickstart](/posts/eventmodeling-quickstart/) runs a bounded context in one process on in-memory storage. This guide is about the other end: a bounded context on PostgreSQL, deployed as several instances, split into instances that serve requests and instances that do the background work, and kept running by an operator who can see what each processor is doing and stop or restart it without restarting anything else.
@@ -304,6 +304,71 @@ Stopping a **leader-only** processor or automation hands its lease back, so anot
 > Every method addresses **the instance it is called on**. Each instance runs its own processors, and a standby's automation is parked whatever you call on it. Reaching the other instances is the management stream's job.
 {: .prompt-info }
 
+### Health: what a probe asks of an instance
+
+`OperationsCapabilities` also answers how the context is doing on the instance it is called on, through
+`HealthCapability`. A health endpoint needs nothing more, so hand it that:
+
+```java
+HealthCapability health = banking;
+
+health.state();                                   // BUILT, STARTING, RUNNING, STOPPED or TERMINATED
+
+BoundedContextHealth report = health.health();    // waits at most EventStorage.DEFAULT_HEALTH_TIMEOUT, 2s
+report.status();                                  // UP, UNKNOWN, DEGRADED or DOWN
+report.storage();                                 // the event storage's own StorageHealth
+report.checks();                                  // what the framework checked
+report.check(BoundedContextHealth.PROCESSOR_LAG); // Optional<HealthCheck>, by name
+```
+
+`state()` is read locally and at once. `STARTING` is a state of its own because `start()` does not return
+until the in-memory read models have been projected, which on a long history takes minutes: the context is
+wired and its processors run, and it is not yet fit to serve a read. A readiness probe waits for
+`RUNNING`.
+
+`health()` puts the event storage's own report — its database, notification channels, visibility barrier
+and pools, see [Asking a Storage for Its Health](/posts/eventstore-observability-micrometer-prometheus-grafana/#asking-a-storage-for-its-health)
+— beside the checks only the framework can make, in the same `HealthCheck`/`HealthStatus` vocabulary, so an
+endpoint renders one shape. `status()` is the worst of both halves. Each check is present only where it
+applies:
+
+| check | reports |
+|---|---|
+| `lifecycle` | `UP` while `RUNNING`, `DOWN` otherwise |
+| `inMemoryReadModels` | `DEGRADED` while a context that stopped waiting at the startup timeout still has in-memory read models catching up |
+| `readModels`, `automations`, `translators`, `dispatchers`, `publishers`, `policies` | one per kind deployed here, judged while `RUNNING`: retired on a failure or retrying is `DEGRADED`, named in the message; stopped by an operator is counted and `UP` — it was asked for |
+| `processorLag` | the age of the oldest unread event per projector-driven processor running (and leading) here; `DEGRADED` beyond `processorLagTolerance` |
+| `leadership` | the leases contended and held; `DEGRADED` once the storage has left lease requests unanswered for longer than the ttl |
+| `monitoringListener` | with a listener only: `DEGRADED` while its deliveries fail |
+
+The lag tolerance is a builder setting, one minute by default:
+
+```java
+BoundedContext.newBuilder(Banking.class)
+        ...
+        .processorLagTolerance(Duration.ofMinutes(5))
+        .build();
+```
+
+It is held to the storage's rules: **it never throws** (a terminated context answers `TERMINATED` with the
+storage's report), **it returns within its timeout** whatever the database does — `health(Duration)` sets
+another — and **it is neither observed nor cached**, so pace it in the endpoint. A measurement still in
+flight when the next probe arrives is waited on again rather than started twice, so a database that stopped
+answering is asked once.
+
+What a status means for the application is yours to decide. `DEGRADED` is a context that serves while
+something it relies on does not work — a processor retired on a failure, a read model falling behind — and
+restarting the process fixes none of it, so a liveness probe has rarely a reason to look here. `DOWN` is
+what a readiness probe is for:
+
+```java
+app.get("/health/ready", ctx -> {
+    BoundedContextHealth report = health.health();
+    ctx.status(report.state() == BoundedContextState.RUNNING && report.status() != HealthStatus.DOWN ? 200 : 503)
+       .json(report);
+});
+```
+
 ### Reaching every instance: the management stream
 
 An operator outside the process reaches the instances through the event store, which every instance can already reach. Each context subscribes to a stream of `ManagementInstruction`s with `.management(stream)`; an operator appends an instruction; every instance reads it; the ones it targets apply it through their own `OperationsCapabilities` and answer.
@@ -391,6 +456,7 @@ Two consequences for sizing: count processors freely, and look for the load in w
 - Derive idempotency keys from the item or the triggering event; make external receivers idempotent where they can be.
 - Register a listener writing to a durable monitoring store, and alert on `...Failed` and `...Stopped` events (see [Observability and Tracing](/posts/eventmodeling-observability/)).
 - Give operators `OperationsCapabilities`, and the management stream for reaching other instances — on a store only they can append to.
+- Point readiness probes at `HealthCapability`: `RUNNING`, and not `DOWN`; keep `DEGRADED` out of liveness.
 
 ## Related
 
