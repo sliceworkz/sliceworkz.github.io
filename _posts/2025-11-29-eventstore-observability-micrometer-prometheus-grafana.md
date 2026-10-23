@@ -2,10 +2,10 @@
 layout: post
 toc: true
 title: Eventstore Observability
-description: Observing the Eventstore with the metrics or tracing library of your choice, through the EventStoreObserver SPI — with Micrometer, Prometheus and Grafana as the worked example
+description: Observing the Eventstore with the metrics or tracing library of your choice, through the EventStoreObserver SPI, and asking a storage for its health — with Micrometer, Prometheus and Grafana as the worked example
 date: 2025-11-29 08:00:00
 categories: [Eventstore Documentation,Eventstore deployment]
-tags: [observability,monitoring,observer,tracing,micrometer,prometheus,grafana]
+tags: [observability,monitoring,observer,health,tracing,micrometer,prometheus,grafana]
 ---
 
 ## EventStore Observability
@@ -86,6 +86,7 @@ The observer's other methods report what is *held*, so an observer can count it 
 | `storageStarted(storage)` / `storageClosed(storage)` | a backend finished `build()` / was closed — channels are reported down first |
 | `subscriptionOpened(stream)` / `subscriptionClosed(stream)` | once per subscription, so opened minus closed is the live count — and a count that only rises is a subscribed stream nobody closes |
 | `notificationChannelChanged(storage, channel, listening)` | a LISTEN/NOTIFY channel went up or down (PostgreSQL) |
+| `visibilityStallChanged(storage, stalled)` | reads went behind the [visibility barrier](/posts/eventstore-configuring-postgresql-storage/#what-can-stall-reads-the-visibility-barrier), or came out from behind it (PostgreSQL) |
 | `streamOpened(stream)` | a stream handle was opened |
 
 There is deliberately no `streamClosed`: a handle used only to query and append holds nothing and is never closed, so a counterpart would climb forever. What a stream holds is a subscription.
@@ -96,10 +97,63 @@ This is the signal to alert on. When append notifications stop, the store is **d
 
 The PostgreSQL backend reports each channel — `NotificationChannel.EVENT_APPENDED` and `BOOKMARK_PLACED` — as **down from its constructor**, so an observer knows the channel from the moment the storage exists; up once its listener is registered; down whenever it loses it (a dropped connection, or one found silently dead by the liveness probe) and up again when it recovers; and down on close. Every transition is reported exactly once. The in-memory backends notify in-process, have no channels, and never call it.
 
-For a health endpoint rather than a metric, `PostgresEventStorage.isNotificationsAvailable()` answers the same state.
+For a health endpoint rather than a metric, [`health()`](#asking-a-storage-for-its-health) reports each channel as a check of its own.
 
-> A channel reported up does **not** rule out a read stall caused by a long-running write transaction elsewhere in the PostgreSQL cluster. During such a stall every call the store makes keeps succeeding. Detecting that is done on the database — see [What Can Stall Reads](/posts/eventstore-configuring-postgresql-storage/#what-can-stall-reads-the-visibility-barrier).
+### Visibility Stalls
+
+A channel reported up does not rule out a read stall caused by a long-running write transaction elsewhere in the PostgreSQL cluster: every call the store makes keeps succeeding, and reads simply stop advancing. The PostgreSQL backend holds an append notification back until the events it announces are readable, and once one has been held for 10 seconds it calls `visibilityStallChanged(storage, true)`; once it is delivered, `false`. A stall still in progress when the storage closes is reported cleared, so a gauge built on it does not keep showing a stall for a storage that is gone. The in-memory backends have no barrier and never call it.
+
+> Only a store something is appended to can notice a stall: a stall during which nothing is appended withholds nothing. Monitoring on the database stays the complete answer — see [What Can Stall Reads](/posts/eventstore-configuring-postgresql-storage/#what-can-stall-reads-the-visibility-barrier).
 {: .prompt-warning }
+
+## Asking a Storage for Its Health
+
+The observer is told what happens; a health endpoint asks what the state is *now*. `EventStorage.health()` answers a `StorageHealth`: one `HealthCheck` per aspect the backend can judge, each with a name, a `HealthStatus`, a message and details, and a `status()` that is the worst of them.
+
+```java
+StorageHealth health = storage.health();                 // waits at most DEFAULT_HEALTH_TIMEOUT, 2s
+StorageHealth quick  = storage.health(Duration.ofMillis(500));
+
+health.status();                                          // UP, UNKNOWN, DEGRADED or DOWN
+for ( HealthCheck check : health.checks() ) {
+    log.info("{}: {} {} {}", check.name(), check.status(), check.message(), check.details());
+}
+health.check(HealthCheck.OPEN);                           // Optional<HealthCheck>, by name
+```
+
+`HealthStatus` is ordered `UP < UNKNOWN < DEGRADED < DOWN`, and the overall status is computed from the checks rather than stated beside them, so a storage can never report itself `UP` beside a check that is `DOWN`. A check's details are JSON scalars — strings, numbers and booleans — in the order the backend gave them, so a `StorageHealth` renders into a health endpoint's response as it is.
+
+It is built for health endpoints, and held to rules an ordinary operation is not:
+
+- **It never throws on account of the storage.** A closed storage answers `DOWN` under the `open` check and asks nothing else; a check that fails is reported as a failed check. Only a timeout that is not positive is refused — that is the caller's mistake.
+- **It returns within its timeout**, whatever the database does. A check that has not answered in time is reported as such and left to finish; the next call waits on that same check rather than starting a second one beside it, so a database that stopped answering is asked once, not once per probe.
+- **It is not observed and not cached.** A probe is not an operation a caller performed, and every call checks again — pace it in the endpoint that calls it.
+
+### What Each Backend Reports
+
+Every backend reports `HealthCheck.OPEN` (`"open"`), `DOWN` once the storage is closed. The other checks are named by constants on the backend that reports them:
+
+| Check | Backend | Reports |
+|---|---|---|
+| `InMemoryFsEventStorage.HEALTH_DIRECTORIES` (`directories`) | file-backed in-memory | `DOWN` when the events or bookmarks directory is gone or not writable — every append and bookmark is written to a file as it happens |
+| `PostgresEventStorage.HEALTH_DATABASE` (`database`) | PostgreSQL | a pooled connection and `SELECT 1`, with `roundTripMicros`. `DOWN` when it fails (`error`, `sqlState`) or does not answer in time (`timeoutMillis`, `inFlightMillis`). It says the database answers, not that this store's tables are intact — those are checked when the storage is built |
+| `HEALTH_EVENT_APPENDED_NOTIFICATIONS` (`eventAppendedNotifications`), `HEALTH_BOOKMARK_PLACED_NOTIFICATIONS` (`bookmarkPlacedNotifications`) | PostgreSQL | `DEGRADED` while the channel's monitor holds no `LISTEN` |
+| `HEALTH_VISIBILITY` (`visibility`) | PostgreSQL | `DEGRADED` once an append notification has been withheld behind the visibility barrier for 10 seconds, with `withheldStreams` and `withheldForMillis` |
+| `HEALTH_CONNECTION_POOL` (`connectionPool`), `HEALTH_MONITORING_CONNECTION_POOL` (`monitoringConnectionPool`) | PostgreSQL | for a HikariCP pool, whoever created it: `active`, `idle`, `total`, `max` and `waiting`, `DEGRADED` while anyone waits for a connection. The monitoring pool is reported only when the monitors have a pool of their own |
+
+The plain in-memory backend reports `open` alone. A third-party `EventStorage` that does not implement the method answers `UNKNOWN`: it has checked nothing, and does not claim to be up.
+
+### Mapping It onto Your Endpoint
+
+**`DEGRADED` means reads and writes work, and something the application relies on does not**: subscribers are not woken, reads are held behind the barrier, callers queue for a connection. None of those is fixed by restarting the process or taking it out of a load balancer — the channel reconnects by itself, the stall is a transaction elsewhere in the cluster, the queue is load. So a liveness probe that restarts on `DEGRADED` turns a database-side condition into an outage of every instance at once. **`DOWN`** — the storage is closed, or the database does not answer — is the status a readiness probe is for. Which of the degraded checks should still fail readiness is your call; the store states what it sees:
+
+```java
+app.get("/health/ready", ctx -> {
+    StorageHealth health = storage.health();
+    ctx.status(health.status() == HealthStatus.DOWN ? 503 : 200)
+       .json(health);
+});
+```
 
 ## What an Observer Must Honour
 
@@ -113,7 +167,7 @@ Every observation carries the stream id as it is, and `purpose` can be an entity
 
 ## Example: a Micrometer Observer
 
-As an example of what you could build on the SPI, here is an observer that reports to Micrometer. It fits on a page: it times every operation by kind and answer, and exposes channel health as a gauge. Adapt it to the meters, tags and naming conventions your application already uses:
+As an example of what you could build on the SPI, here is an observer that reports to Micrometer. It fits on a page: it times every operation by kind and answer, and exposes channel health and visibility stalls as gauges. Adapt it to the meters, tags and naming conventions your application already uses:
 
 ```java
 import io.micrometer.core.instrument.*;
@@ -126,6 +180,7 @@ public final class MicrometerObserver implements EventStoreObserver {
     private final MeterRegistry registry;
     private final Set<String> admittedPurposes = ConcurrentHashMap.newKeySet();
     private final Map<String, AtomicInteger> channels = new ConcurrentHashMap<>();
+    private final Map<String, AtomicInteger> stalls = new ConcurrentHashMap<>();
 
     public MicrometerObserver ( MeterRegistry registry ) {
         this.registry = registry;
@@ -169,6 +224,17 @@ public final class MicrometerObserver implements EventStoreObserver {
                  .register(registry);
             return state;
         }).set(listening ? 1 : 0);
+    }
+
+    @Override
+    public void visibilityStallChanged ( String storage, boolean stalled ) {
+        stalls.computeIfAbsent(storage, key -> {
+            AtomicInteger state = new AtomicInteger();
+            Gauge.builder("eventstore.visibility.stalled", state, AtomicInteger::get)
+                 .tag("storage", storage)
+                 .register(registry);
+            return state;
+        }).set(stalled ? 1 : 0);
     }
 
     private Tags streamTags ( Observation<?> observation ) {
