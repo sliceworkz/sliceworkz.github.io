@@ -195,7 +195,7 @@ automation registered without a projector for its todo list on this instance:
   registered: add builder.readmodel(todoList).eventuallyConsistent())
 ```
 
-A `SHARED` to-do list (a durable [SQL read model](/posts/eventmodeling-sql-read-models/)) is exempt: its projector holds a lease of its own and may legitimately run on another instance.
+A `SHARED` to-do list (a durable [SQL read model](/posts/eventmodeling-sql-read-models/)) is exempt: its projector holds a lease of its own and may legitimately run on another instance. That is how the projection and the automation run apart — the list projected where the projection aspect runs, worked where the automation aspect runs (see [A To-Do List in SQL](/posts/eventmodeling-sql-read-models/#a-to-do-list-in-sql-projected-here-worked-there)).
 
 ### When `handle` throws: `onFailure`
 

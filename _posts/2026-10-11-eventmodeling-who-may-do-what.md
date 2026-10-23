@@ -20,12 +20,12 @@ The framework files every capability of a bounded context under an **audience** 
 |---|---|---|
 | **Application** — a controller, a scheduled job, any adapter driving the domain | `ApplicationCapabilities<D,O>` | `execute`, `executeWithRetry`, `evaluate`, `read`, `aggregate` |
 | **Inbound edge** — a webhook, a message consumer feeding the domain | `TranslationCapability<I>` | `incoming`, `translate` |
-| **Operator** — an admin endpoint, a dashboard | `OperationsCapabilities` | `automations`, `restartAutomation`, `stopAutomation`, `processors`, `restartProcessor`, `stopProcessor`, `skipStalledEvent` |
+| **Operator** — an admin endpoint, a dashboard | `OperationsCapabilities` | `automations`, `restartAutomation`, `stopAutomation`, `processors`, `restartProcessor`, `stopProcessor`, `skipStalledEvent`, `state`, `health` |
 | **Erasure requests** | `PrivacyCapability` | `erase`, `eraseCategory` |
 | **The escape hatch** | `ProvidedEventCapability<D>` | `event` |
 | **Owner** — whatever built the context | your context interface (`Banking`) | all of the above, plus `start`/`stop`/`terminate`, `port`, `getDeployedFeatureSlices`/`getUndeployedFeatureSlices` |
 
-`OperationsCapabilities` is itself the composition of `AutomationAdminCapability` (the three automation methods) and `ProcessorAdminCapability` (the four processor methods), for code that needs only one of the two.
+`OperationsCapabilities` is itself the composition of `AutomationAdminCapability` (the three automation methods), `ProcessorAdminCapability` (the four processor methods) and `HealthCapability` (`state` and `health`), for code that needs only one of them — a health endpoint holds a `HealthCapability` and can stop nothing.
 
 The owner's own capabilities — `LifecycleCapability`, `PortsCapability`, `FeatureSliceCapabilities` — are not grouped into an audience, because only the code that called `build()` has a use for them.
 

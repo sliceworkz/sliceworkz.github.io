@@ -17,7 +17,7 @@ Every box on an event model has a home in the framework: a **command** raises **
 
 # Quickstart Guide
 
-We build a small banking context: open an account, deposit money into it, and read it back two ways — one read model projected on demand, one projected in the background. The guide uses version **0.7.1**.
+We build a small banking context: open an account, deposit money into it, and read it back two ways — one read model projected on demand, one projected in the background. The guide uses version **0.8.0**.
 
 
 ## Prerequisites
@@ -31,7 +31,7 @@ Sliceworkz EventModeling is available in <a href="https://mvnrepository.com/arti
 
 ```xml
 <properties>
-    <sliceworkz.eventmodeling.version>0.7.1</sliceworkz.eventmodeling.version>
+    <sliceworkz.eventmodeling.version>0.8.0</sliceworkz.eventmodeling.version>
 </properties>
 
 <dependencyManagement>

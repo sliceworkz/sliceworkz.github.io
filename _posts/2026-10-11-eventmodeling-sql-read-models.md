@@ -155,8 +155,9 @@ Banking bc = BoundedContext.newBuilder(Banking.class)
 ```
 
 `ensureTables()` runs your `createTables()` statements and creates the projector's bookmark table. Do not
-declare that table in `createTables()`. The projector also creates it on first use, because the framework
-may ask a projector where to resume before the slice has called `ensureTables()`.
+declare that table in `createTables()`. The projector also runs `ensureTables()` itself every time it is
+asked where to resume, because the framework may ask before the slice has called it — so the tables are
+there whenever the projector starts, restarts or is promoted.
 
 ## Progress Lives Next to the State
 
@@ -180,28 +181,45 @@ read models sharing a prefix therefore do not share a position.
 
 An absent bookmark row means "replay from the beginning". There is deliberately no fallback to the event
 store's bookmark, because that would hand a fresh database a position describing rows it does not have.
-Emptying the tables, the bookmark table included, is therefore all a rebuild takes. For a `SHARED` read
-model, without restarting anything:
+Emptying the tables, the bookmark table included, is therefore all a rebuild takes, and it needs no
+restart, whatever the read model's storage class:
 
-1. Stop its projector on every instance. `ProcessorAdminCapability.stopProcessor(ProcessorKind.READ_MODEL, name)`
-   does this locally, and the management stream does it remotely. See
-   [Running in Production](/posts/eventmodeling-running-in-production/). A stopped leader hands its lease
-   back.
-2. Empty the read model: drop and recreate its tables (`ensureTables()` recreates them), or delete their
-   rows. **Include its `_projection_bookmark` table.**
-3. Start the projector again with `restartProcessor(...)`. The instance that wins the lease asks the
-   projector where to resume, finds no bookmark row, and replays the stream.
+1. Stop its projector — on every instance that runs it.
+   `ProcessorAdminCapability.stopProcessor(ProcessorKind.READ_MODEL, name)` does this locally, and the
+   `StopProcessor` management instruction does it remotely. See
+   [Running in Production](/posts/eventmodeling-running-in-production/). A stopped `SHARED` leader hands
+   its lease back.
+2. Drop its tables, **its `_projection_bookmark` table included** — or delete their rows.
+3. Start the projector again with `restartProcessor(...)` (or `StartProcessor`). The restarted projector
+   asks where to resume, which recreates the tables with `ensureTables()`, finds no bookmark row, and
+   replays the stream. For a `SHARED` read model the instance that wins the lease does this.
 
-Nothing else needs to be reset. A projector only creates the bookmark table on its own; your domain tables
-are created by `ensureTables()`, which a slice calls while it is configured. Dropping the tables without
-recreating them leaves `project()` failing, and retrying, until they exist again. For an `EPHEMERAL` or
-`LOCAL` read model, which is not elected, the projector is asked where to resume when its context is
-built, so empty its tables while the process is down.
+Nothing else needs to be reset.
 
-> `tracksItsOwnBookmark()` returns `true`. Override it to return `false` only for a `DataSource` that may
-> not be issued DDL. The read model then falls back to the event store's bookmark, which is written
-> *after* the commit, so a crash in between re-projects a batch.
-{: .prompt-warning }
+### A To-Do List in SQL: Projected Here, Worked There
+
+A to-do list can be an SQL read model too: one class extends `SqlReadModelProjector` and implements
+`TodoListReadModel`, with `streamItems` reading the table. That lets the projection and the automation
+run on different instances. Register it `.eventuallyConsistent()` where the projection aspect runs, and
+hand it to the automation where the automation aspect runs; on the automation's instance only
+`streamItems` is called, and the automation wakes on the bookmark the projecting instance places, just as
+it does on its own.
+
+```java
+public class PaymentsToExecuteTodoList extends SqlReadModelProjector<BankingDomainEvent>
+        implements TodoListReadModel<BankingDomainEvent, PaymentToExecute> {
+    ...
+    @Override
+    public Stream<PaymentToExecute> streamItems ( Limit limit ) {
+        // a SELECT on the table project() maintains, in the order the items are to be handled
+    }
+}
+```
+
+Both instances need to reach the same database, so the to-do list is `SHARED`. That is also what lets
+`build()` accept an automation whose to-do list is not projected on its own instance: a `SHARED` list's
+projector holds a lease of its own and may run elsewhere. An in-memory H2 to-do list serves only a
+deployment that runs every aspect in one process.
 
 ## Write `project()` So a Repeat Changes Nothing
 
