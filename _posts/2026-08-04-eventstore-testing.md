@@ -384,7 +384,7 @@ Recording head = observer.last(Observation.Head.class);
 assertInstanceOf(Outcome.HeadRead.class, head.outcome().orElseThrow());
 ```
 
-Every operation is a `Recording`: what was started, what it answered or failed with, whether it was closed, and the recording it was started inside of — so a test can check that a projector's page query nests under its batch. Lifecycle and health signals are kept as `Signal`s. It also checks the contract a store owes an observer — a scope completed twice, or both completed and failed, or closed twice — and keeps what it finds in `violations()`, so a test asserting that list is empty has checked the store along the way.
+Every operation is a `Recording`: what was started, what it answered or failed with, whether it was closed, and the recording it was started inside of — so a test can check that a projector's page query nests under its batch. Lifecycle and health signals — channels going up or down, visibility stalls — are kept as `Signal`s. It also checks the contract a store owes an observer — a scope completed twice, or both completed and failed, or closed twice — and keeps what it finds in `violations()`, so a test asserting that list is empty has checked the store along the way.
 
 ## What Cannot Be Asserted
 

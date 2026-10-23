@@ -66,12 +66,16 @@ An interrupt during startup throws `EventStorageException` and closes the storag
 
 The storage reports the health of each channel (`EVENT_APPENDED` / `BOOKMARK_PLACED`) to its [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/#notification-channel-health) through `notificationChannelChanged`: **down from the constructor**, so an observer knows the channel from the moment the storage exists — a signal that only appears once notifications work is no use for alerting on notifications *not* working — up once the monitor listens, down again when a running store loses its monitoring connection (which is the same silence as never having had one), and down on close. Every transition is reported exactly once.
 
-For a health endpoint, `isNotificationsAvailable()` answers the same state, on the `PostgresEventStorage` type the builder's `build()` returns — no downcast needed:
+For a health endpoint, ask the storage for its [health](/posts/eventstore-observability-micrometer-prometheus-grafana/#asking-a-storage-for-its-health): each channel is a check of its own, beside the database round trip, the visibility barrier and the connection pools. `health()` is on `EventStorage`, so whatever holds the storage can ask:
 
 ```java
-PostgresEventStorage storage = PostgresEventStorage.newBuilder().build();
-healthChecks.register("eventstore-notifications", storage::isNotificationsAvailable);
+StorageHealth health = storage.health();               // waits at most 2 seconds for the database
+health.status();                                        // the worst of its checks
+health.check(PostgresEventStorage.HEALTH_EVENT_APPENDED_NOTIFICATIONS)
+      .map(HealthCheck::status);                        // DEGRADED while the channel does not listen
 ```
+
+`isNotificationsAvailable()`, on the `PostgresEventStorage` type the builder's `build()` returns, answers both channels together as one boolean.
 
 ## Closing a Store
 
@@ -97,7 +101,7 @@ try ( EventStore eventStore = PostgresEventStorage.newBuilder().buildStore() ) {
 
 **Terminal** — there is no reopening. `start()` on a closed storage throws.
 
-**Operations throw afterwards** — every read and write throws `EventStorageClosedException` (a subclass of `EventStorageException`); `name()` keeps working, so logging does not break. A closed storage does not keep serving reads while its notifications are dead, which would strand projections silently.
+**Operations throw afterwards** — every read and write throws `EventStorageClosedException` (a subclass of `EventStorageException`); `name()` keeps working, so logging does not break, and `health()` answers `DOWN` rather than throwing. A closed storage does not keep serving reads while its notifications are dead, which would strand projections silently.
 
 ### Storage Ownership: Who Closes What
 

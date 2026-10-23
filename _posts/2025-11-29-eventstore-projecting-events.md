@@ -566,9 +566,28 @@ The projector keeps it by these rules:
 2. **After each committed batch** the bookmark records the last event handled as both positions. A run that fails or dies part-way leaves the read position at the last batch that landed — never beyond.
 3. **When a run has read to the end** — its last page came back shorter than its limit, and nothing failed — the read position becomes the later of that head and the last event handled, compared in the total order. Only then has everything up to the head been read. A run bounded with `runUntil(reference)` extends it only when the head is at or before that boundary.
 4. **A run that handled nothing moves only the read position, and at most once per idle bookmark interval** (two seconds by default). A subscribed projector runs on every append to its stream, whether its projection reads the event or not, and each placement is a write — on PostgreSQL an upsert, its trigger and a notification — so without the interval an idle reader would cost a write per append.
-5. **It never resumes from the read position.** It would buy nothing — the typed query skips what the projection does not read through the index — and a query that later gains an event type would never be handed the events of that type between the two positions.
+5. **It never resumes from the read position.** It would buy nothing — the typed query skips what the projection does not read through the index — and a query that later gains an event type would never be handed the events of that type between the two positions. The one exception is a projector built to [resume after its read position](#starting-a-reader-from-now-on), for a bookmark that names no handled event.
 
 **A projector that has handled nothing yet records its read position alone**, by the same rules: after a run that read to the end, the head (within its `runUntil` boundary), as an idle move held to the interval. Its query may select event types that have not occurred yet; its bookmark then names no handled event, and its backlog is not counted as the whole stream although nothing in it concerns the projection. It still resumes from the beginning, exactly as a projector without a bookmark does, and the first event it handles fills the handled reference in. See [Two Positions: Handled and Read](/posts/eventstore-bookmarking/#two-positions-handled-and-read).
+
+#### Starting a Reader From Now On
+
+Some readers are deployed to react only to what is appended from then on — not to the history already in the store. Place a read position at the head as the reader's first bookmark, and build its projector with `resumeAfterReadPosition()`:
+
+```java
+stream.head().ifPresent(head -> stream.placeReadPosition("order-notifier", head, Tags.none()));
+
+Projector.from(stream)
+    .into(notifier)
+    .bookmarkAs("order-notifier")
+    .resumeAfterReadPosition()      // a bookmark naming no handled event resumes after its read position
+    .subscribe()
+    .build();
+```
+
+While its bookmark names no handled event, such a projector reads on after the read position instead of from the beginning, so a restart before it has handled anything does not hand it the history it was started to skip. Its bookmark keeps naming no handled event until it handles one: the handled reference is only ever an event the projection was handed. Once it has handled an event, that event is its resume point, as for every projector.
+
+Do not use `startingAfter(readPosition)` for this: the projector's cursor is also the reference it records as handled, so the bookmark would name an event the projection never processed. And accept the cost the default rule avoids: a query that later gains an event type is not handed the events of that type before the read position — which, for a reader started from now on, is what it was started to skip.
 
 The interval is a builder setting:
 

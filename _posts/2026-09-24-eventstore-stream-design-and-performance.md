@@ -106,7 +106,7 @@ The pattern is spelled out in [Optimistic Locking](/posts/eventstore-appending-e
 
 The in-memory backends are **correctness**-equivalent to PostgreSQL — the same compliance suite holds both to the same contract, down to what they refuse — and deliberately not performance-equivalent. They hold a list and match in Java: their cost is how far into the log the scan walks, not how many events come back.
 
-At 100.000 events that made the in-memory store **31× slower than PostgreSQL on a needle tag query** and **78× slower reading one long-tail entity's history**, while being 3–90× *faster* where a limit fills immediately — a page, a lookup by id. So an application prototyped against the in-memory store learns nothing about what its tag queries will cost in production, and learns it backwards: selective tag queries are the case PostgreSQL's GIN index exists for, and the case the in-memory store is worst at.
+At 100.000 events that made the in-memory store **24× slower than PostgreSQL on a needle tag query** and **59× slower reading one long-tail entity's history**, while being 3–45× *faster* where a limit fills immediately — a page, a lookup by id. So an application prototyped against the in-memory store learns nothing about what its tag queries will cost in production, and learns it backwards: selective tag queries are the case PostgreSQL's GIN index exists for, and the case the in-memory store is worst at.
 
 Keep using it for tests and for local development. Size the application against PostgreSQL.
 

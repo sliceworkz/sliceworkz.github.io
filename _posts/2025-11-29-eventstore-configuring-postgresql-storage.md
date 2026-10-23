@@ -33,7 +33,7 @@ To use PostgreSQL as your event storage backend, add the following dependencies 
 
 The PostgreSQL driver is marked as `provided` scope in the library, allowing you to choose your preferred version — the BOM manages the eventstore modules, not third-party libraries, so give it a version. HikariCP, used for connection pooling, comes with the backend transitively.
 
-`build()` returns a `PostgresEventStorage` — an `EventStorage` that also answers `isNotificationsAvailable()`, the one thing the PostgreSQL backend has to say that the storage contract does not cover. Keep that handle rather than widening it to `EventStorage` where a health check needs it. The implementation classes themselves are package-private: the builder is the only way to obtain a storage, which is what guarantees its version detection, its bounded startup and its pool ownership rules always apply. A builder can be reused: every `build()` resolves its own pools.
+`build()` returns a `PostgresEventStorage` — an `EventStorage` that also answers `isNotificationsAvailable()` and publishes the names of the [health checks](/posts/eventstore-observability-micrometer-prometheus-grafana/#asking-a-storage-for-its-health) it reports. A health endpoint needs neither the handle nor a downcast: `health()` is on `EventStorage` itself. The implementation classes themselves are package-private: the builder is the only way to obtain a storage, which is what guarantees its version detection, its bounded startup and its pool ownership rules always apply. A builder can be reused: every `build()` resolves its own pools.
 
 ## PostgreSQL Version Support
 
@@ -250,7 +250,7 @@ Within the deadline, the monitors' own retry loop does the waiting, so a store r
 
 With `ENSURE` or `VALIDATE` the schema work runs first, and under `NONE` the [restored-history check](#backup-and-restore) does — so a dead *main* DataSource fails there, with a clear error, and never reaches the wait. The configuration that realistically does is a **reachable main DataSource with an unreachable monitoring one**. The two are configured separately precisely because LISTEN/NOTIFY does not survive a transaction pooler, so "pooled works, direct is firewalled" is an ordinary misconfiguration.
 
-For monitoring this in production, an [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/#notification-channel-health) is told whenever a channel goes up or down, and `PostgresEventStorage.isNotificationsAvailable()` answers the same state for a health endpoint.
+For monitoring this in production, an [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/#notification-channel-health) is told whenever a channel goes up or down, and [`health()`](/posts/eventstore-observability-micrometer-prometheus-grafana/#asking-a-storage-for-its-health) reports each channel as a check of its own for a health endpoint.
 
 ## Configuring an EventStore-managed DataSource (db.properties)
 
@@ -859,7 +859,7 @@ The read path withholds events whose transaction is still in flight, using `even
 
 `pg_snapshot_xmin` is the oldest transaction id still running — **a property of the whole PostgreSQL cluster, not of this store**. So every event appended since the oldest open transaction took its id is invisible to this store until that transaction ends.
 
-> **Nothing fails and nothing is logged.** Reads just stop advancing: projections go quiet, bookmarks stop moving, `SELECT count(*)` in psql shows the events are there, and when the blocker finally ends everything appears at once.
+> **Nothing fails.** Reads just stop advancing: projections go quiet, bookmarks stop moving, `SELECT count(*)` in psql shows the events are there, and when the blocker finally ends everything appears at once.
 {: .prompt-warning }
 
 **Only transactions that have written count**, which is what makes this narrow rather than severe. PostgreSQL assigns a transaction id lazily, at the first write, and only assigned ids enter a snapshot's xmin:
@@ -869,7 +869,7 @@ The read path withholds events whose transaction is still in flight, using `even
 
 The blocker does not have to touch the events table, or even this database — transaction ids are cluster-wide, so a writer in a *different database of the same cluster* stalls this store just as effectively. The operational rule is "do not share a cluster with long-running write transactions", not "do not share a table".
 
-**Append notifications wait for the barrier.** A notification announcing events a query cannot yet see would wake a subscriber that reads nothing and then goes back to sleep — until the next append to its stream, which may be a long time coming. So the append monitor holds a notification back until the event it names is below the barrier: a subscribed projection catches up by itself the moment the blocker ends. A notification withheld for more than 10 seconds is logged at WARN — the one log line the library writes about a stall.
+**Append notifications wait for the barrier.** A notification announcing events a query cannot yet see would wake a subscriber that reads nothing and then goes back to sleep — until the next append to its stream, which may be a long time coming. So the append monitor holds a notification back until the event it names is below the barrier: a subscribed projection catches up by itself the moment the blocker ends. A notification withheld for more than 10 seconds is logged at WARN, reported to the observer through `visibilityStallChanged(storage, true)` and reported `DEGRADED` by the `visibility` [health check](/posts/eventstore-observability-micrometer-prometheus-grafana/#asking-a-storage-for-its-health); once it is delivered, the observer is told `false`.
 
 **Read-your-own-writes does not hold while a blocker is open.** A caller can append successfully and not read the event back, because the append-side check deliberately carries no `xmin` filter and sees committed events the reader cannot. Under DCB that surfaces as an optimistic-locking conflict a retry loop **cannot clear**: the decider re-reads its boundary, gets the same stale reference, appends, and conflicts again for as long as the stall lasts.
 
@@ -894,7 +894,7 @@ Deliberately unfiltered by `datname`: the culprit may be in another database of 
 
 ### Alerting on It
 
-Nothing the store [reports to an observer](/posts/eventstore-observability-micrometer-prometheus-grafana/) reveals this — every call the store makes keeps succeeding throughout a stall — and the WARN about a withheld notification only appears once one has been held for 10 seconds. Detection is external, on the database.
+The store sees a stall only through the notifications it withholds: once one has been held for 10 seconds, the observer's `visibilityStallChanged` and the `visibility` health check report it. That covers a store something is appended to. **A stall during which nothing is appended withholds nothing**, so the store has nothing to notice — and every call it makes keeps succeeding. The complete answer is external, on the database.
 
 **Watch `pg_snapshot_xmin` standing still *while* something holds a transaction id**, never either alone. xmin also stops moving on a completely idle database, so "xmin has not advanced" fires on every quiet store; "a transaction holds an xid" fires on every append in flight. It is the combination that means events are being withheld.
 
