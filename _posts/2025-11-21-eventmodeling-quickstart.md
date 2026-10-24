@@ -230,7 +230,7 @@ public class OpenAccountCommand implements CommandWithResult<BankingDomainEvent,
 ```
 
 **Key concepts:**
-- `@FeatureSlice` marks the class for discovery. It carries only what the code cannot say — the `chapter` of the event model the slice sits in. The slice's name comes from the class name, its bounded context from `Slice<Banking>`, and its type (state change, state read, automation, translation) is derived from what it registers.
+- `@FeatureSlice` marks the class for discovery. It carries only what the code cannot say — the `chapter` of the event model the slice sits in. The slice's name comes from the class name, its bounded context from `Slice<Banking>`, and its type (state change, state view, automation, translation) is derived from what it registers.
 - `configureCommand` is where a slice registers its command-side components. `builder.command(...)` is declarative: commands are instantiated by the caller, and registering one makes it part of the slice's inventory from startup.
 - A command implements `Command<E>` (the caller gets the reference of the appended event) or `CommandWithResult<E, R>` (the caller also gets what `execute` returns, once the events are stored).
 - `noDecisionModels()` is the explicit statement that this command decides on nothing; it hands back the result to raise events on.
@@ -348,7 +348,7 @@ public class DepositFeatureSlice implements Slice<Banking> {
 - A rule history rejects is a `BusinessException`, not an `IllegalStateException`: the framework reports it as a rejection (`CommandRejected`), not as a failure, and the caller can tell the two apart.
 - Commands never decide on a read model. A read model read from a command sits outside the consistency boundary — see [Commands and Decision Models](/posts/eventmodeling-commands-and-decision-models/).
 
-## Step 6: A State Read — Account Details
+## Step 6: A State View — Account Details
 
 A read model answers a question out of events. This one is **live**: projected when it is read, so it is always current.
 
@@ -433,7 +433,7 @@ public class AccountDetailsFeatureSlice implements Slice<Banking> {
 - Every registration says how the read model is projected — `.live()` or `.eventuallyConsistent()`. `build()` rejects one that does not.
 - A live read model is right whenever the events it replays are bounded by design, as here: one account's events. See [Choosing a Read Model](/posts/eventmodeling-read-models/) for what to do when they are not.
 
-## Step 7: A State Read in the Background — Account Overview
+## Step 7: A State View in the Background — Account Overview
 
 A list of every account spans all accounts, so replaying it per read would get slower forever. It is projected once, in the background, and reads become free. That makes it **eventually consistent**: it lags the latest events by a moment.
 

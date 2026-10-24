@@ -25,7 +25,7 @@ It builds upon the <a href="/eventstore/">Sliceworkz Eventstore</a>, and decides
 | pattern | flow | in the framework |
 |---|---|---|
 | **State change** | Trigger → Command → Event | `Command`, deciding on `DecisionModel`s |
-| **State read** | Events → Read model → UI/API | `ReadModel`, live or eventually consistent |
+| **State view** | Events → Read model → UI/API | `ReadModel`, live or eventually consistent |
 | **Automation** | Events → To-do list → Processor → Command → Event | `TodoListReadModel` + `Automation` |
 | | or: Event → Policy → Command → Event | `Policy` — whenever an event happens, issue a command |
 | **Translation** | External event → Processor → Command → Event | `Translator` |

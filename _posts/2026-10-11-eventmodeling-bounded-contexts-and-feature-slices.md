@@ -133,7 +133,7 @@ The builder's `features().rootPackage(...)` scans that package and its subpackag
 
 - **Its name** is the class's simple name without the `FeatureSlice` suffix (`AccountDetails`), from `Slice.name()`.
 - **Its bounded context** is the `C` of `Slice<C>`.
-- **Its type** — state change, state read, automation, translation — is derived from what it registers (below).
+- **Its type** — state change, state view, automation, translation — is derived from what it registers (below).
 
 A value repeated in an annotation is one nobody checks against the code, and it agrees with the code only until the first refactoring. So the annotation holds the chapter, and nothing that could drift.
 
@@ -223,7 +223,7 @@ The framework works out which Event Modeling pattern a slice is (`SliceType`) fr
 | Registered | Type |
 |---|---|
 | a command or an aggregate | `STATE_CHANGE` |
-| read models only | `STATE_READ` |
+| read models only | `STATE_VIEW` |
 | an automation and its todo list, a policy, a command beside a read model, or only a publisher | `AUTOMATION` |
 | a translator | `TRANSLATION` |
 | parts of more than one pattern | `UNCLEAR` |
