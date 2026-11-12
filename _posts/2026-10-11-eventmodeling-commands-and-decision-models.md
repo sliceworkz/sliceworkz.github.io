@@ -54,7 +54,7 @@ public record DepositCommand ( AccountId accountId, BigDecimal amount, String de
             "The balance would become " + balanceAfter + ", above the guaranteed " + GUARANTEED_BALANCE);
 
         result.raiseEvent(new MoneyDeposited(accountId, amount, description, context.ruleViolations()),   // 3. raise
-            ACCOUNT.tags(accountId));
+            ACCOUNT.tag(accountId));
     }
 }
 ```
@@ -113,7 +113,7 @@ public record OpenAccountCommand ( CustomerId customerId, LocalDate date ) imple
 
         AccountId accountId = ACCOUNT.newId();
         result.raiseEvent(new AccountOpened(accountId, customerId, date),
-                Tags.of(ACCOUNT.tag(accountId), CUSTOMER.tag(customerId)));
+                ACCOUNT.tag(accountId), CUSTOMER.tag(customerId));
 
         return accountId;
     }
@@ -134,16 +134,16 @@ returned reference is not: the context offers no stream access to application co
 |---|---|
 | `decisionModels(DecisionModel...)` | project the models the decision is made on, pin the consistency boundary, get the `CommandResult` |
 | `noDecisionModels()` | the declaration that this command's append needs no guard; also gets the `CommandResult` |
-| `actor()` | who the command is executed for — the actor of the `Tracing` it was executed with, empty without one |
+| `actor()` | who the command is executed for — the actor of the `Tracing` bound for the call, empty without one |
 | `read(ReadModelClass.class, params...)` | an auxiliary lookup of a live read model — **outside** the boundary |
 | `check(rule, violated, message)` | check a business rule with an enforcement level |
 | `ruleViolations()` | the violations the execution goes ahead with, to record in the payload |
 | `justifies(...)` / `enforces(...)` | settle a post-justified override or a deferred enforcement |
 
-And `CommandResult` is what events are raised on: `raiseEvent(event, tags)`, or
-`raiseEvent(event, tags, idempotencyKey)` for an event keyed by hand, plus the idempotency key settings
-described below. Tags come from the entities: `ACCOUNT.tags(accountId)`, or `Tags.of(ACCOUNT.tag(a),
-CUSTOMER.tag(c))` for an event about several (see [Entities, Typed Ids and Tags](/posts/eventmodeling-entities-and-tags/)).
+And `CommandResult` is what events are raised on: `raiseEvent(event, Tag...)` or `raiseEvent(event, tags)`,
+or `raiseEvent(event, tags, idempotencyKey)` for an event keyed by hand, plus the idempotency key setting
+described below. Tags come from the entities: `ACCOUNT.tag(accountId)`, or `ACCOUNT.tag(a), CUSTOMER.tag(c)`
+for an event about several (see [Entities, Typed Ids and Tags](/posts/eventmodeling-entities-and-tags/)).
 
 > **Decide on decision models, never on `context.read(...)`.** A read model read through the context is
 > not part of the consistency boundary: one of the events it was projected from can be superseded between
@@ -157,7 +157,7 @@ succeeds. That is the ordinary shape of a command that reads, finds nothing to d
 
 ## Decision Models
 
-A `DecisionModel<D>` is a projection a command instantiates inline: `eventQuery()` scoped by tags to the
+A `DecisionModel<D>` is a projection a command instantiates inline: `eventFilter()` scoped by tags to the
 entity, `when(Event<D>)` folding the state, and accessors for the checks.
 
 ```java
@@ -176,18 +176,15 @@ public class AccountBalanceDecisionModel implements DecisionModel<BankingDomainE
     @Override
     public EventQuery initQuery ( ) {
         // the savepoint: the newest of the opening and the month closings, nothing older
-        return EventQuery.forEvents(
-                EventTypesFilter.of(AccountOpened.class, MonthClosed.class),
-                ACCOUNT.tags(accountId)
-            ).backwards().limit(1);
+        return EventQuery.of(EventFilter.forTypes(AccountOpened.class, MonthClosed.class).tagged(ACCOUNT.tag(accountId)))
+                         .backwards().limit(1);
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
+    public EventFilter eventFilter ( ) {
         // the movements after it; the savepoint types stay out
-        return EventQuery.forEvents(
-                EventTypesFilter.of(MoneyDeposited.class, MoneyWithdrawn.class, AccountClosed.class),
-                ACCOUNT.tags(accountId));
+        return EventFilter.forTypes(MoneyDeposited.class, MoneyWithdrawn.class, AccountClosed.class)
+                          .tagged(ACCOUNT.tag(accountId));
     }
 
     @Override
@@ -210,15 +207,33 @@ public class AccountBalanceDecisionModel implements DecisionModel<BankingDomainE
 
 The `initQuery()` is optional and implements the [savepoint pattern](/posts/eventstore-savepoint-pattern/):
 it finds the newest `MonthClosed` (or the opening, for an account that has not closed a month yet), and
-`eventQuery()` then replays only the movements after it. Without it the model replays the account's whole
-history on every command. The two queries name **disjoint** event types, so a savepoint is never folded
-twice. The repository's
+`eventFilter()` then selects only the movements after it. Without it the model replays the account's whole
+history on every command. The two name **disjoint** event types, so a savepoint is never folded
+twice.
+
+`eventFilter()` is the one method a decision model must implement; `eventQuery()` defaults to reading that
+filter forward. Override `eventQuery()` only for a model that reads otherwise — the newest event,
+backwards with a limit of one — and build it on the filter: `EventQuery.of(eventFilter()).backwards().limit(1)`.
+
+> **Coming from 0.8?** A decision model used to implement `EventQuery eventQuery()`. It now implements
+> `EventFilter eventFilter()` and returns the filter — `EventQuery.forTypes(X.class).tagged(...)` becomes
+> `EventFilter.forTypes(X.class).tagged(...)`. `initQuery()` stays an `EventQuery`, built as
+> `EventQuery.of(filter).backwards().limit(1)`.
+{: .prompt-warning } The repository's
 [`ActivePeriodDecisionModel`](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-examples/src/main/java/org/sliceworkz/eventmodeling/examples/banking/features/currentperiod/ActivePeriodDecisionModel.java)
 is the full version of this model.
 
 A decision model is cheap to make and lives for one execution: construct it inside `execute`, from the
 command's inputs. A command can use several — `context.decisionModels(account, exceptionsToday)` — and
 they are read against one shared boundary.
+
+**Several models share their reads.** Each savepoint model's `initQuery()` is read on its own first. The
+savepoint models' forward reads are then merged into one: each model's filter is narrowed to the events
+*after* the savepoint it found (an `after` bound on its items), the filters are united — each item keeping
+its own bounds — and every event read is handed to each model whose filter matches it. Each model still
+sees exactly what its own read would have returned, with fewer round trips. Bounded filters merge only
+with bounded ones, so plain models share a read of their own, and a model whose `eventQuery()` reads
+backwards or with a limit keeps a read of its own.
 
 ## The Consistency Boundary
 
@@ -227,11 +242,11 @@ This is the [Dynamic Consistency Boundary](https://dcb.events/) of the
 [EventStore](/posts/eventstore-appending-events/), applied for you:
 
 1. **The head of the domain stream is taken first**, before any model is read.
-2. **Every model read is bounded at that head**, so all of them see the same moment, however many reads
-   the command makes.
+2. **Every model read is bounded at that head** — `notAfter(head)`, the eventstore's read bound — so all of
+   them see the same moment, however many reads the command makes.
 3. **The raised events are appended with that head as the expected reference**, and with a lock filter
-   that is the **union of every query a model was read with** — each `eventQuery()`, and the `initQuery()`
-   of a model using a savepoint.
+   that is the **union of every filter a model was read with** — each model's `eventFilter()`, and the
+   `initQuery()` filter of a model using a savepoint.
 4. **If an event matching that filter was appended after the head, the append fails** with an
    `OptimisticLockingException`, and nothing is stored.
 
@@ -242,13 +257,16 @@ Three details are worth knowing:
 
 - **The savepoint query is locked on too.** "The newest closing is March" is a fact the command decided
   on as much as the movements after it. A `MonthClosed` landing after the read conflicts, whether or not
-  the model found a savepoint. You do not widen `eventQuery()` with the savepoint types to get this — keep
-  the two queries disjoint and the framework locks on both.
+  the model found a savepoint. You do not widen `eventFilter()` with the savepoint types to get this — keep
+  the two disjoint and the framework locks on both.
 - **An empty boundary is still a boundary.** On an empty stream the head is absent, and the check reads
   "I decided on nothing matching" — any matching event appended meanwhile conflicts. This is what makes
   uniqueness checks work (see [Where a Validation Goes](/posts/eventmodeling-where-validations-go/)).
-- **An `until` on a model's own query bounds its read only.** The framework strips it from the lock
-  filter: a criteria filter carrying one would deem nothing after it relevant, and admit every append.
+- **The pin is a read bound, never a filter bound.** A model's own `after` and `until` say what is relevant,
+  so they go into the lock filter as they are, and the eventstore's `AppendCriteria` prunes them against
+  the head: an item `until` the head or earlier can match nothing appended later and drops out, and an
+  `after` at or before the head — a savepoint model's lower bound — is dropped, since every event after the
+  head is after it too. A model bounded on a closed period therefore adds nothing to the check.
 
 Pinning the head first also keeps the check cheap: on PostgreSQL the check only walks the events appended
 *during* the command, not everything the stream received since the entity last changed (see
@@ -285,20 +303,40 @@ recognised by the exception **the command itself** threw. A `BusinessException` 
 decision model's `when` arrives wrapped by the projector and is reported as `CommandFailed` — a rule judged
 while history is read is a rule in the wrong place. Decision models fold; commands judge.
 
-## Retrying a Conflict: `executeWithRetry`
+## How a Command Is Executed: `Execution`
+
+`execute(command)` runs a command once, with no idempotency key. Everything else about *how* it runs is one
+value, an `Execution`, passed beside the command — the way an `EventQuery` says how a filter is read:
+
+```java
+bank.execute(command);                                              // once, no key
+bank.execute(command, Execution.retrying());                        // re-executed on a conflict
+bank.execute(command, Execution.retrying(RetryPolicy.of(5)));       // ... up to five attempts
+bank.execute(command, Execution.idempotent(requestId));             // a repeat is swallowed
+bank.execute(command, Execution.idempotent(requestId).withRetry()); // both
+```
+
+It works the same for `Command` and `CommandWithResult`.
+
+> **Coming from 0.8?** `execute(command, key)` is `execute(command, Execution.idempotent(key))`, and
+> `executeWithRetry(command[, key][, policy])` is `execute(command, Execution.retrying(...))` — with
+> `.withIdempotencyKey(key)` when it had a key. The overloads taking a `Tracing` are gone too: bind it
+> instead (see [Tracing](#tracing-who-through-what-in-which-flow)).
+{: .prompt-warning }
+
+## Retrying a Conflict
 
 An `OptimisticLockingException` is the routine DCB outcome under contention, and the answer is always the
 same: execute again, which builds a fresh context, re-projects the models and re-decides on the new facts.
-`executeWithRetry` is that loop, written once:
+`Execution.retrying()` is that loop, written once:
 
 ```java
 Optional<EventReference> deposited =
-    bank.executeWithRetry(new DepositCommand(account, new BigDecimal("100"), "salary"), alice, RetryPolicy.of(5));
+    bank.execute(new DepositCommand(account, new BigDecimal("100"), "salary"), Execution.retrying(RetryPolicy.of(5)));
 ```
 
-It exists for every `execute` shape — with or without a tracing and an idempotency key, for `Command` and
-`CommandWithResult` — taking a trailing `RetryPolicy`. `executeWithRetry(command)` uses
-`RetryPolicy.DEFAULT`, three attempts.
+`Execution.retrying()` uses `RetryPolicy.DEFAULT`, three attempts; `withRetry()` adds the same to an
+idempotent execution.
 
 - **Only `OptimisticLockingException` is retried.** A `BusinessException`, an `IllegalArgumentException`
   or a storage failure propagates from the attempt that raised it. A retry that ends in a
@@ -320,15 +358,15 @@ A caller that may send the same request twice — a client retrying a timed-out 
 handed the same todo item again — gives the execution an idempotency key:
 
 ```java
-Optional<EventReference> first  = bank.execute(new DepositCommand(account, new BigDecimal("50"), "gift"), "request-4711");
-Optional<EventReference> repeat = bank.execute(new DepositCommand(account, new BigDecimal("50"), "gift"), "request-4711");
+Optional<EventReference> first  = bank.execute(new DepositCommand(account, new BigDecimal("50"), "gift"), Execution.idempotent("request-4711"));
+Optional<EventReference> repeat = bank.execute(new DepositCommand(account, new BigDecimal("50"), "gift"), Execution.idempotent("request-4711"));
 // first is present, repeat is empty: nothing was appended the second time
 ```
 
 The store holds the key per event, scoped to the stream, and swallows a repeat silently. Derive the key
 from **the request** — a client-generated request id, the id of the todo item being handled — and never
 from the attempt: a key minted per attempt is a fresh key every time and de-duplicates nothing. The same
-key is carried into every attempt of `executeWithRetry`, which is safe because a conflicted append stored
+key is carried into every attempt of a retrying execution, which is safe because a conflicted append stored
 nothing.
 
 A command raising **several** events turns one command-level key into one key per event: the events get
@@ -338,31 +376,51 @@ re-execution under the same key that raises a *different* set of events is refus
 position, so a command whose number of events varies keys each event itself with
 `raiseEvent(event, tags, key)`, from what that event is about.
 
-The command decides how it treats a caller's key, through the `CommandResult`:
+The command decides how it treats a caller's key with one choice on the `CommandResult`,
+`idempotencyKey([key, ]CallerKey)`:
 
-| Method | Effect |
-|---|---|
-| `idempotencyKey(key)` | use this key, whatever the caller passed |
-| `fallbackIdempotencyKey(key)` | use the caller's key if there is one, this one otherwise |
-| `exclusiveIdempotencyKey(key)` | use this key; a caller passing one is an error |
-| `requireIdempotencyKey()` | the caller must pass a key |
-| `forbidIdempotencyKey()` | the caller must not pass a key |
+| Call | No key from the caller | A key from the caller |
+|---|---|---|
+| *(none)* | no key | the caller's |
+| `idempotencyKey(CallerKey.REQUIRED)` | refused | the caller's |
+| `idempotencyKey(CallerKey.REFUSED)` | no key | refused |
+| `idempotencyKey(key, CallerKey.PREFERRED)` | the command's | the caller's |
+| `idempotencyKey(key, CallerKey.IGNORED)` | the command's | the command's |
+| `idempotencyKey(key, CallerKey.REFUSED)` | the command's | refused |
+
+A refusal is an `IllegalStateException`, before anything is appended: the command and its caller disagree
+about who keys the execution, which is a bug in one of them. (In 0.8 these were five separate methods —
+`idempotencyKey`, `fallbackIdempotencyKey`, `exclusiveIdempotencyKey`, `requireIdempotencyKey` and
+`forbidIdempotencyKey`.)
 
 ## Tracing: Who, Through What, in Which Flow
 
-Every `execute` takes an optional `Tracing`: the actor, the channel and the correlation id of the flow the
-command is part of. The kernel writes them as tags (`x-actor`, `x-channel`, `x-correlation-id`, …) on
-every event the command appends, and the command can read the actor through `context.actor()` — which is
-how a command decides who may override a rule.
+A `Tracing` says who a call is for: the actor, the channel and the correlation id of the flow the command
+is part of. The kernel writes them as tags (`x-actor`, `x-channel`, `x-correlation-id`, …) on every event
+the command appends, and the command can read the actor through `context.actor()` — which is how a command
+decides who may override a rule.
+
+A tracing is never a parameter: it is **bound** to the thread with `TracingScope`, and every call made
+inside the scope runs under it:
 
 ```java
 Tracing alice = Tracing.actorAndChannel("alice", "counter");
-bank.execute(new WithdrawCommand(account, new BigDecimal("250"), "kitchen", today, Overrides.of(NO_OVERDRAFT.id())), alice);
+try ( TracingScope asAlice = TracingScope.bind(alice) ) {
+    bank.execute(new WithdrawCommand(account, new BigDecimal("250"), "kitchen", today, Overrides.of(NO_OVERDRAFT.id())));
+}
+
+// or, in the middle of an expression
+Optional<EventReference> ref = TracingScope.call(alice, () -> bank.execute(command));
 ```
 
-Without a tracing, the command runs under the tracing the edge bound to the thread with `TracingScope`,
-if any, and otherwise starts a fresh flow with no actor. An HTTP layer typically builds the tracing from
-the authenticated user once per request. [Observability and Tracing](/posts/eventmodeling-observability/)
+`TracingScope.call(tracing, supplier)` and `run(tracing, runnable)` bind it for the work and restore what
+was bound before, also when the work throws. Without a bound tracing, the command starts a fresh flow with
+no actor. An HTTP layer typically binds the tracing built from the authenticated user once per request.
+
+> **Coming from 0.8?** `execute(command, tracing)`, `executeWithRetry(command, tracing, …)` and the other
+> overloads taking a `Tracing` are gone. Bind the tracing around the call instead. A `Tracing` handed to
+> `read(...)` among its parameters is refused, naming this remedy.
+{: .prompt-warning } [Observability and Tracing](/posts/eventmodeling-observability/)
 covers correlation across commands, automations and translators.
 
 ## Aggregates: the Second Checked Write Path
@@ -411,13 +469,17 @@ Register it from a slice with `builder.aggregate(AccountAggregate.class)`, and l
 through the `aggregate` capability, which `BankingApi` carries:
 
 ```java
-AccountAggregate account = bank.aggregate(AccountAggregate.class, ACCOUNT.tags(accountId));
+AccountAggregate account = bank.aggregate(AccountAggregate.class, Tags.of(ACCOUNT.tag(accountId)));
 account.withdraw(new BigDecimal("10"), "coffee");
 ```
 
 - **The identity is a set of tags.** Loading replays the events carrying those tags — by default of any
-  type; override `eventQuery(Tags identity)` to narrow it — and every event the aggregate raises is tagged
-  with the identity.
+  type — and every event the aggregate raises is tagged with the identity.
+- **`eventFilter(Tags identity)` decides both what the aggregate reads and what its append checks.** The
+  default is `EventFilter.forTags(identity)`. Override it to leave out events that can change none of the
+  aggregate's decisions: an event it leaves out is neither read nor checked. (Up to 0.8 this was
+  `eventQuery(Tags identity)`, and the check stayed on every event carrying the identity whatever the
+  aggregate read — so an aggregate narrowing its read could be blocked for good by an event it never saw.)
 - **`raiseEvent` appends immediately**, checked against the last event the instance has seen. An instance
   that has fallen behind — loaded before another instance appended — gets an `OptimisticLockingException`.
   `context.updateFromStream()` catches it up; loading it again does the same.
@@ -456,11 +518,11 @@ public class WithdrawCommandTest extends CommandTest<BankingDomainEvent, Banking
     @Test
     void withdrawsWhenTheBalanceAllows ( ) {
         given()
-            .event(new AccountOpened(ACCOUNT_1, CUSTOMER.id("cust-1"), TODAY), ACCOUNT.tags(ACCOUNT_1))
-            .event(new MoneyDeposited(ACCOUNT_1, new BigDecimal("100"), "salary"), ACCOUNT.tags(ACCOUNT_1))
+            .event(new AccountOpened(ACCOUNT_1, CUSTOMER.id("cust-1"), TODAY), Tags.of(ACCOUNT.tag(ACCOUNT_1)))
+            .event(new MoneyDeposited(ACCOUNT_1, new BigDecimal("100"), "salary"), Tags.of(ACCOUNT.tag(ACCOUNT_1)))
             .when(new WithdrawCommand(ACCOUNT_1, new BigDecimal("40"), "groceries", TODAY, Overrides.none()))
             .then()
-            .event(new MoneyWithdrawn(ACCOUNT_1, new BigDecimal("40"), "groceries"), ACCOUNT.tags(ACCOUNT_1));
+            .event(new MoneyWithdrawn(ACCOUNT_1, new BigDecimal("40"), "groceries"), Tags.of(ACCOUNT.tag(ACCOUNT_1)));
     }
 
     @Test
@@ -478,7 +540,7 @@ public class WithdrawCommandTest extends CommandTest<BankingDomainEvent, Banking
 Seed events with the tags production gives them — a decision model selects by tag, so an untagged seed is
 invisible to it. `businessError(message)` asserts the rejection is a `BusinessException`, so a rule thrown
 as the wrong type fails the test. `AggregateTest` does the same for aggregates:
-`given(ACCOUNT.tags(id)).events(...).when(account -> account.withdraw(...)).then()...`.
+`given(Tags.of(ACCOUNT.tag(id))).events(...).when(account -> account.withdraw(...)).then()...`.
 [Testing Feature Slices](/posts/eventmodeling-testing/) covers both, and running them against every
 storage backend.
 
@@ -491,7 +553,7 @@ storage backend.
 | History to decide on | `DecisionModel` built inside `execute`, savepoint `initQuery()` to bound the replay |
 | No history needed | `noDecisionModels()` |
 | A lookup the decision does not depend on | `context.read(...)` — outside the boundary |
-| A conflict | `executeWithRetry(command[, tracing], policy)` |
-| The same request twice | an idempotency key derived from the request |
-| Who and in which flow | a `Tracing`; `context.actor()` in the command |
-| An object per identity | `Aggregate`, loaded with `aggregate(X.class, tags)` |
+| A conflict | `execute(command, Execution.retrying([policy]))` |
+| The same request twice | `Execution.idempotent(key)`, a key derived from the request |
+| Who and in which flow | a `Tracing` bound with `TracingScope`; `context.actor()` in the command |
+| An object per identity | `Aggregate`, loaded with `aggregate(X.class, tags)`; `eventFilter(identity)` to narrow it |

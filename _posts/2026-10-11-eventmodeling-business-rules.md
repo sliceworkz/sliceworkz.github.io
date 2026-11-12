@@ -165,7 +165,7 @@ public record WithdrawCommand ( AccountId accountId, BigDecimal amount, String d
 
         // raise as if everything were allowed: the kernel stops what may not go ahead
         result.raiseEvent(new MoneyWithdrawn(accountId, amount, description, context.ruleViolations()),
-            ACCOUNT.tags(accountId));
+            ACCOUNT.tag(accountId));
     }
 }
 ```
@@ -204,11 +204,11 @@ public class OverdraftExceptionsTodayDecisionModel implements DecisionModel<Bank
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
+    public EventFilter eventFilter ( ) {
         // the kernel tags every overridden withdrawal with the rule and the actor: one tag query
         return teller
-            .map(t -> EventQuery.forEvents(EventTypesFilter.of(MoneyWithdrawn.class), RuleTags.overriddenBy(t, NO_OVERDRAFT)))
-            .orElse(EventQuery.matchNone());
+            .map(t -> EventFilter.forTypes(MoneyWithdrawn.class).tagged(RuleTags.overriddenBy(t, NO_OVERDRAFT)))
+            .orElse(EventFilter.matchNone());
     }
 
     @Override
@@ -233,11 +233,11 @@ public class OverdraftExceptionsTodayDecisionModel implements DecisionModel<Bank
 The command passes the answer to `overridableWhen(authorized, whyNot)` on the check:
 
 - **It sits inside the consistency boundary.** The quota model is one of the command's decision models,
-  so its query is part of the lock filter. Two overdrafts by the same teller racing past the quota cannot
-  both succeed: the second append conflicts, and `executeWithRetry` re-decides on a count that includes
+  so its filter is part of the lock filter. Two overdrafts by the same teller racing past the quota cannot
+  both succeed: the second append conflicts, and `Execution.retrying()` re-decides on a count that includes
   the first.
 - **`whyNot` is what the actor is shown** instead of a checkbox when the answer is no.
-- **The actor is `context.actor()`**, read from the tracing the command was executed with — the same value
+- **The actor is `context.actor()`**, read from the tracing bound for the execution — the same value
   the kernel stores in the `x-actor` tag of every event. It is empty for an execution without an actor,
   and a decision that needs one should then say no.
 - **Without `overridableWhen`**: nobody may make a pre-authorized override; anybody who asks may make a
@@ -300,11 +300,11 @@ an explicit event for an exception (`OverdraftApproved`) raises one in the same 
 ## Evaluating Before Executing
 
 ```java
-Evaluation anonymous = bank.evaluate(overdraft);           // nothing is appended
-Evaluation teller    = bank.evaluate(overdraft, alice);
+Evaluation anonymous = bank.evaluate(overdraft);                                  // nothing is appended
+Evaluation teller    = TracingScope.call(alice, () -> bank.evaluate(overdraft));    // evaluated for alice
 ```
 
-`evaluate` runs the command exactly as `execute` would — decision models projected, its
+`evaluate` runs the command for the caller bound with `TracingScope`, exactly as `execute` would — decision models projected, its
 `BusinessException`s thrown, its rules checked and judged against the overrides it carries — and stops
 short of the append. It answers an `Evaluation`:
 
@@ -355,10 +355,10 @@ static Javalin create ( BankingApi banking ) {
     return Javalin.create(config -> {
         config.routes.query("/api/withdrawals", ctx -> ctx
             .header("Cache-Control", "no-store")
-            .json(banking.evaluate(toCommand(ctx), tracingOf(ctx))));
+            .json(TracingScope.call(tracingOf(ctx), () -> banking.evaluate(toCommand(ctx)))));
 
         config.routes.post("/api/withdrawals", ctx -> {
-            banking.executeWithRetry(toCommand(ctx), tracingOf(ctx), RetryPolicy.DEFAULT);
+            TracingScope.call(tracingOf(ctx), () -> banking.execute(toCommand(ctx), Execution.retrying()));
             ctx.status(201);
         });
 
@@ -434,7 +434,7 @@ public void execute ( CommandContext<BankingDomainEvent, BankingDomainEvent> con
     result.raiseEvent(
         new WithdrawalJustified(accountId, withdrawal,
             context.justifies(LARGE_WITHDRAWAL_JUSTIFIED, EventId.of(withdrawal), justification.strip())),
-        ACCOUNT.tags(accountId));
+        ACCOUNT.tag(accountId));
 }
 ```
 
@@ -479,8 +479,8 @@ on `CommandRejected.ruleJudgements`. The dashboard's Business Rules screen is bu
 @Test
 void aTellerIsOfferedTheOverdraftAsAnOverride ( ) {
     given()
-        .event(new AccountOpened(ACCOUNT_1, CUSTOMER.id("cust-1"), TODAY), ACCOUNT.tags(ACCOUNT_1))
-        .event(new MoneyDeposited(ACCOUNT_1, new BigDecimal("100"), "salary"), ACCOUNT.tags(ACCOUNT_1))
+        .event(new AccountOpened(ACCOUNT_1, CUSTOMER.id("cust-1"), TODAY), Tags.of(ACCOUNT.tag(ACCOUNT_1)))
+        .event(new MoneyDeposited(ACCOUNT_1, new BigDecimal("100"), "salary"), Tags.of(ACCOUNT.tag(ACCOUNT_1)))
         .as("alice")
         .whenEvaluated(new WithdrawCommand(ACCOUNT_1, new BigDecimal("250"), "tv", TODAY, Overrides.none()))
         .thenEvaluation()
@@ -491,8 +491,8 @@ void aTellerIsOfferedTheOverdraftAsAnOverride ( ) {
 @Test
 void aTellerGrantsAnOverdraftAndItIsRecorded ( ) {
     given()
-        .event(new AccountOpened(ACCOUNT_1, CUSTOMER.id("cust-1"), TODAY), ACCOUNT.tags(ACCOUNT_1))
-        .event(new MoneyDeposited(ACCOUNT_1, new BigDecimal("100"), "salary"), ACCOUNT.tags(ACCOUNT_1))
+        .event(new AccountOpened(ACCOUNT_1, CUSTOMER.id("cust-1"), TODAY), Tags.of(ACCOUNT.tag(ACCOUNT_1)))
+        .event(new MoneyDeposited(ACCOUNT_1, new BigDecimal("100"), "salary"), Tags.of(ACCOUNT.tag(ACCOUNT_1)))
         .as("alice")
         .when(new WithdrawCommand(ACCOUNT_1, new BigDecimal("250"), "tv", TODAY, Overrides.of(NO_OVERDRAFT.id())))
         .then()
@@ -506,9 +506,9 @@ void aTellerGrantsAnOverdraftAndItIsRecorded ( ) {
 void theFourthOverdraftOfTheDayIsRefused ( ) {
     MoneyWithdrawn earlier = new MoneyWithdrawn(ACCOUNT_1, new BigDecimal("1"), "earlier", List.of(
         new RuleViolation(NO_OVERDRAFT.id(), EnforcementLevel.PRE_AUTHORIZED_OVERRIDE, Disposition.OVERRIDDEN, "earlier", null)));
-    Tags overdraftTags = ACCOUNT.tags(ACCOUNT_1).merge(Tags.of(RuleTags.overridden(NO_OVERDRAFT)));
+    Tags overdraftTags = Tags.of(ACCOUNT.tag(ACCOUNT_1), RuleTags.overridden(NO_OVERDRAFT));
     given()
-        .event(new AccountOpened(ACCOUNT_1, CUSTOMER.id("cust-1"), TODAY), ACCOUNT.tags(ACCOUNT_1))
+        .event(new AccountOpened(ACCOUNT_1, CUSTOMER.id("cust-1"), TODAY), Tags.of(ACCOUNT.tag(ACCOUNT_1)))
         .as("alice")
         .event(earlier, overdraftTags)
         .event(earlier, overdraftTags)
@@ -581,7 +581,7 @@ kernel's judgement, and the audit then says something that did not happen.
 | Who may override | `.overridableWhen(authorized, whyNot)`, on decision models | `BLOCKS` with a reason, or `OVERRIDE_REQUIRED` / `OVERRIDDEN` |
 | What the user asked for | an `Overrides` component, `implements Overriding` | override requests the kernel judges |
 | What to record | `context.ruleViolations()` in the payload; rule tags added by the kernel | audit, quota counts, follow-ups |
-| Preview | `evaluate(command, tracing)`; HTTP `QUERY` | `Evaluation`, nothing appended |
+| Preview | `evaluate(command)`, for the bound caller; HTTP `QUERY` | `Evaluation`, nothing appended |
 | Rejected execution | `RuleViolationException` (a `BusinessException`) | carries the same `Evaluation`; HTTP `422` |
 | Follow-up | a todo list or read model on `RuleTags` | justification, deferred enforcement |
 | Settling a follow-up | `context.justifies(...)` / `context.enforces(...)` | a link tag, and a `RuleFollowUp` for the payload |
