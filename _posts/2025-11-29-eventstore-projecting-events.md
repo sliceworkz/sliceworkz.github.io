@@ -94,7 +94,7 @@ The metadata is there when you need it:
 
 ## Implementing a Readmodel
 
-A readmodel is a projection that implements the `Projection` interface, combining an `EventQuery` with an event handler:
+A readmodel is a projection that implements the `Projection` interface, combining an `EventFilter` — which events it depends on — with an event handler:
 
 ```java
 public class CustomerSummary implements Projection<CustomerEvent> {
@@ -107,9 +107,9 @@ public class CustomerSummary implements Projection<CustomerEvent> {
     }
 
     @Override
-    public EventQuery eventQuery() {
-        // Query all events for this specific customer
-        return EventQuery.forTags(Tags.of("customer", customerId));
+    public EventFilter eventFilter() {
+        // All events for this specific customer
+        return EventFilter.forTags("customer", customerId);
     }
 
     @Override
@@ -126,9 +126,23 @@ public class CustomerSummary implements Projection<CustomerEvent> {
 }
 ```
 
-The `eventQuery()` method defines which events are relevant. The Projector will only call `when()` for matching events.
+The `eventFilter()` method defines which events are relevant. The Projector reads that filter forward and will only call `when()` for matching events.
 
-**`eventQuery()` is read once per run.** Storage is asked with that query and every event of the run is matched against it, so a projection that computes its query cannot answer differently halfway through a run — and is not asked once per event, either.
+**A filter, and a query only where the read needs one.** `eventFilter()` is the one method a projection has to implement. `eventQuery()` — how the events are read — has a default: the filter read forward, with no limit and no read bound, which is what nearly every projection wants. Override `eventQuery()` only for a read that is something else, and build it on `eventFilter()` so the two never describe different events:
+
+```java
+@Override
+public EventQuery eventQuery() {
+    return EventQuery.of(eventFilter()).backwards().limit(1);   // only the newest matching event
+}
+```
+
+A `null` from `eventFilter()` is refused with an `IllegalStateException`: say `EventFilter.matchAll()` or `EventFilter.matchNone()` when that is what you mean.
+
+> **Coming from 0.12?** `eventQuery()` used to be the abstract method. Rename it to `eventFilter()` and return the filter: `EventQuery eventQuery() { return EventQuery.forTags(tags); }` becomes `EventFilter eventFilter() { return EventFilter.forTags(tags); }`. Keep an `eventQuery()` override only where it reads backwards, with a limit, or bounded.
+{: .prompt-warning }
+
+**The query is read once per run.** Storage is asked with it and every event of the run is matched against it, so a projection that computes its filter cannot answer differently halfway through a run — and is not asked once per event, either.
 
 ## Using the Projector
 
@@ -152,7 +166,7 @@ System.out.println("Customer: " + projection.getName());
 ```
 
 The Projector:
-1. Queries events matching the projection's `eventQuery()`
+1. Queries events matching the projection's `eventFilter()` (through its `eventQuery()`)
 2. Reads them in pages — batches — to avoid memory issues
 3. Calls `when()` for each matching event
 4. Returns metrics about the projection execution
@@ -305,7 +319,7 @@ With this configuration:
 
 For projections that are created on-the-fly — for example, to answer a query in an API request — replaying the entire event history on every instantiation can be expensive. The **savepoint pattern** addresses this by allowing projections to initialize from a recent snapshot event rather than replaying from the beginning.
 
-A projection can optionally implement `initQuery()` to find the most recent savepoint event before the main `eventQuery()` runs:
+A projection can optionally implement `initQuery()` to find the most recent savepoint event before its main read runs:
 
 ```java
 public class StockLevelProjection implements Projection<StockEvent> {
@@ -318,18 +332,13 @@ public class StockLevelProjection implements Projection<StockEvent> {
 
     @Override
     public EventQuery initQuery() {
-        return EventQuery.forEvents(
-            EventTypesFilter.of(StockCounted.class),
-            Tags.of("product", product)
-        ).backwards().limit(1);
+        return EventQuery.of(EventFilter.forTypes(StockCounted.class).tagged("product", product))
+                         .backwards().limit(1);
     }
 
     @Override
-    public EventQuery eventQuery() {
-        return EventQuery.forEvents(
-            EventTypesFilter.of(StockAdded.class, StockPicked.class),
-            Tags.of("product", product)
-        );
+    public EventFilter eventFilter() {
+        return EventFilter.forTypes(StockAdded.class, StockPicked.class).tagged("product", product);
     }
 
     @Override
@@ -345,7 +354,7 @@ public class StockLevelProjection implements Projection<StockEvent> {
 }
 ```
 
-The `initQuery()` runs once on the first projector execution. If a savepoint is found, the projection initializes from it and the main `eventQuery()` processes only the events that occurred after. When no savepoint exists, the pattern degrades gracefully — the full stream is replayed.
+The `initQuery()` runs once on the first projector execution. If a savepoint is found, the projection initializes from it and the main read (`eventFilter()`) processes only the events that occurred after. When no savepoint exists, the pattern degrades gracefully — the full stream is replayed.
 
 A savepoint handler that throws fails the run as a `ProjectorException` naming the savepoint event, exactly as a failing batch does, and the cursor goes back to where the run started — so the next run re-runs `initQuery()` rather than starting the main query from a read model that was never initialised.
 
@@ -668,13 +677,13 @@ class CustomerListProjection implements BatchAwareProjection<CustomerEvent> {
     }
 
     @Override
-    public EventQuery eventQuery() {
-        return EventQuery.forEvents(EventTypesFilter.of(CustomerRegistered.class), Tags.none());
+    public EventFilter eventFilter() {
+        return EventFilter.forTypes(CustomerRegistered.class);
     }
 }
 ```
 
-`beforeBatch()` is not called for a batch in which nothing matched the projection's query.
+`beforeBatch()` is not called for a batch in which nothing matched the projection's filter.
 
 ### What the Batch Boundary Guarantees
 

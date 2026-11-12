@@ -47,11 +47,11 @@ If you do split, **read an entity through its own stream.** Addressing one entit
 // per-entity layout: read the entity through its OWN stream
 EventStream<InventoryEvent> widget =
     eventStore.getEventStream(EventStreamId.forContext("inventory").withPurpose("WIDGET-42"), InventoryEvent.class);
-List<Event<InventoryEvent>> history = widget.query(EventQuery.matchAll());
+List<Event<InventoryEvent>> history = widget.query(EventFilter.matchAll());
 
 // NOT: the whole context, narrowed by tag -- the worst of both layouts
 eventStore.getEventStream(EventStreamId.forContext("inventory").anyPurpose(), InventoryEvent.class)
-          .query(EventQuery.forTags(Tags.of("sku", "WIDGET-42")));
+          .query(EventFilter.forTags("sku", "WIDGET-42"));
 ```
 
 ### The Cost the Benchmarks Do Not Include
@@ -81,7 +81,7 @@ That makes the reference you present the whole story:
 
 - **A reference that is the last relevant event of a long-idle entity is stale.** Its last matching event simply *is* old, and every stream event written since has to be walked. Re-reading the boundary does not help: it cannot advance a cursor past events that do not exist. Measured with a boundary pinned half a ten-million-event stream back: ~590 ms per check, perfectly linear.
 - **Under ordinary traffic the average walk is about one event per entity active in the stream** — so on a per-context layout the average check prices at ~0.2 µs × the number of entities, whatever the skew and whatever the volume. At ten million events with a realistic mix: ~26 ms per check.
-- **Present the head instead.** Take `stream.head()` *before* the decision's read, bound the read with `until(head)`, and hand the head to `AppendCriteria`. The read proved nothing matching sits between the old event and the head, so the head is exactly what the decision may claim — and the probe starts where the reader stopped. Measured at ten million events, a whole decision done this way — two bounded reads plus the checked append — takes **~4 ms**, against **~500 ms** for the same decision with unbounded reads and the last relevant event as the reference. It is also the one conditional write that scales with writers on a per-context stream (3.0× from one writer to eight), because the lock now covers only a sliver of the operation.
+- **Present the head instead.** Take `stream.head()` *before* the decision's read, bound the read with `notAfter(head)`, and hand the head to `AppendCriteria`. The read proved nothing matching sits between the old event and the head, so the head is exactly what the decision may claim — and the probe starts where the reader stopped. Measured at ten million events, a whole decision done this way — two bounded reads plus the checked append — takes **~4 ms**, against **~500 ms** for the same decision with unbounded reads and the last relevant event as the reference. It is also the one conditional write that scales with writers on a per-context stream (3.0× from one writer to eight), because the lock now covers only a sliver of the operation.
 
 The pattern is spelled out in [Optimistic Locking](/posts/eventstore-appending-events/#optimistic-locking). A check with **no** reference — "I decided on an empty boundary", the uniqueness pattern — takes a different path, answered by the tag index at ~2.3 ms at ten million events.
 
@@ -89,7 +89,7 @@ The pattern is spelled out in [Optimistic Locking](/posts/eventstore-appending-e
 
 **Deserialization is roughly 2–3 µs per event, and on an ordinary page it is most of the wait.** A 500-event page spends 60–83% of its time in JDBC and deserialization rather than in PostgreSQL. The figure holds across two orders of magnitude: reading one hot entity returns 6.876 events from a 100.000-event store and 455.092 from a ten-million-event one, at about 3 µs per event either way — linear in the rows returned, not in the size of the store. Two consequences:
 
-- **Bounding a read with `EventQuery.limit(n)` is worth more than it looks**, because the cost it bounds is mostly per event and downstream of the query.
+- **Bounding a read with `EventQuery.of(filter).limit(n)` is worth more than it looks**, because the cost it bounds is mostly per event and downstream of the query.
 - **Tuning the database is the wrong first move** for a read returning thousands of events: the database is not where the time goes.
 
 **Eight of eleven read shapes do not move at a hundred times the volume** — a page, a lookup by id, a query by type, a cold entity, a cursor walk, the last event of an entity, a needle tag query, an OR of facts — measured on the external server at 100.000 and at 10.000.000 events.

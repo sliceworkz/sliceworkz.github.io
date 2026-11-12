@@ -54,9 +54,9 @@ class Registrations {
     }
 
     boolean subscribe ( String studentId, String courseId ) {
-        EventQuery relevant = EventQuery.forTags(Tags.of("course", courseId));
+        EventFilter relevant = EventFilter.forTags("course", courseId);
         EventReference head = stream.head().orElse(null);
-        List<Event<LearningEvent>> facts = stream.query(relevant.until(head));
+        List<Event<LearningEvent>> facts = stream.query(EventQuery.of(relevant).notAfter(head));
 
         // ... decide from the facts ...
 
@@ -309,7 +309,7 @@ The TCK scenarios are main classes of the testing module, not test classes of yo
 </plugin>
 ```
 
-Every scenario now runs against your backend. Among what it pins down: basic append and query semantics, tag round-tripping over the full legal character set, the `until` boundary, query limits and paging (`EventPageTest`), `head()` (`HeadTest`), the stream scope each wildcard reads (`StreamScopeTest`), raw streams, sealed-interface type filters, `@EventName`, upcast chains, event timestamps as instants, concurrent optimistic locking, idempotent batches at the stream and the SPI level, payloads that are not JSON documents, append-notification granularity, subscription and storage lifecycle — including that a stream whose last subscription closed becomes unreachable — serde failure reporting, bookmark rejection of a reference the store never stored and bookmarks answered with the store's own coordinates — for the read position as for the reference — per-batch projector durability, how a projector keeps its read position (`ProjectorReadPositionTest`), what each operation reports to an observer (`ObservationTest`), crypto-shredding and reader entitlement against your own key store, and — where supported — importing and leases.
+Every scenario now runs against your backend. Among what it pins down: basic append and query semantics, tag round-tripping over the full legal character set, the `notAfter` read bound (`NotAfterBoundaryTest`), per-item `after`/`until` bounds and how a union of differently bounded items reads (`ItemBoundsTest`), query limits and paging (`EventPageTest`), `head()` (`HeadTest`), the stream scope each wildcard reads (`StreamScopeTest`), raw streams, sealed-interface type filters, `@EventName`, upcast chains, event timestamps as instants, concurrent optimistic locking, idempotent batches at the stream and the SPI level, payloads that are not JSON documents, append-notification granularity, subscription and storage lifecycle — including that a stream whose last subscription closed becomes unreachable — serde failure reporting, bookmark rejection of a reference the store never stored and bookmarks answered with the store's own coordinates — for the read position as for the reference — per-batch projector durability, how a projector keeps its read position (`ProjectorReadPositionTest`), what each operation reports to an observer (`ObservationTest`), crypto-shredding and reader entitlement against your own key store, and — where supported — importing and leases.
 
 Several SPI methods have defaults, so a storage need not implement everything to compile: `head()` has a default over `query()`, `unsubscribe` a no-op default, the four-argument `bookmark(reader, reference, readUpTo, tags)` a default that drops the read position, `bookmarkReadPosition(reader, readUpTo, tags)` a default that records nothing, `findBookmark` a default over `getBookmarks()`, the lease methods defaults that throw. The TCK is what tells you a default is not good enough — `EventStreamSubscriptionLifecycleTest` catches a backend relying on the no-op `unsubscribe` by asserting a closed stream is released.
 
@@ -339,7 +339,7 @@ class MyStorageQuirksTest extends AbstractEventStoreTest {
 
         stream.append(Event.of(new CustomerRegistered("John"), Tags.none()));
 
-        assertEquals(1, stream.query(EventQuery.matchAll()).size());
+        assertEquals(1, stream.query(EventFilter.matchAll()).size());
     }
 
     @ForEachBackend(requires = Capability.IMPORT)

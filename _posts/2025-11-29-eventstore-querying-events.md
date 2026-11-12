@@ -10,20 +10,33 @@ tags: [events,query,tags,paging,head,raw stream]
 
 This guide covers the various ways to query events from the EventStore, including filtering, paging, backward queries, temporal queries, raw reads and cross-stream querying.
 
-## EventQuery Concept
+## Filters and Queries
 
-An `EventQuery` is the fundamental mechanism for selecting events from the EventStore. It wraps an `EventFilter` (which defines matching criteria based on event types, tags, and an optional temporal boundary) together with traversal semantics: a direction (forward or backward) and an optional limit.
+Two types select events, and each says one thing:
 
-**An event matches an EventQuery if:**
-1. The event's type is **any** of the types allowed by the query (OR condition)
-2. **All** tags specified by the query are present on the event (AND condition)
+- An **`EventFilter`** says **which** events are relevant: event types, tags, and optionally the part of the history they are about. It is the business half of a read, and it is also what a consistency boundary (`AppendCriteria`) checks.
+- An **`EventQuery`** says **how** a filter is read: `EventQuery.of(filter)` plus a direction (`backwards()`), a `limit(n)` and a read bound (`notAfter(ref)`). None of those says what is relevant, so none of them ever reaches an `AppendCriteria`.
 
-Events may have additional tags beyond those specified in the query—the query only requires that the specified tags are present.
+A query is always built from a filter, and a plain forward read needs no query at all — `stream.query(filter)` reads what the filter selects, forward, with no limit:
 
 ```java
-// Query for CustomerRegistered OR CustomerUpdated events with region=EU tag
-EventQuery query = EventQuery.forTypes(CustomerRegistered.class, CustomerUpdated.class)
-                             .tagged("region", "EU");
+EventFilter relevant = EventFilter.forTypes(CustomerEvent.class).tagged("customer", "123");
+
+List<Event<CustomerEvent>> all    = stream.query(relevant);                                    // forward, everything
+List<Event<CustomerEvent>> newest = stream.query(EventQuery.of(relevant).backwards().limit(1)); // how it is read
+```
+
+**An event matches a filter if:**
+1. The event's type is **any** of the types allowed by the filter (OR condition)
+2. **All** tags specified by the filter are present on the event (AND condition)
+3. It lies within the filter's bounds, when it has any (see [Bounding What Is Relevant](#bounding-what-is-relevant-after-and-until))
+
+Events may have additional tags beyond those specified in the filter—the filter only requires that the specified tags are present.
+
+```java
+// CustomerRegistered OR CustomerUpdated events with region=EU tag
+EventFilter filter = EventFilter.forTypes(CustomerRegistered.class, CustomerUpdated.class)
+                                .tagged("region", "EU");
 
 // This matches:
 Event.of(new CustomerRegistered("John"), Tags.of("region", "EU")) // ✓ Type matches, has required tag
@@ -35,58 +48,84 @@ Event.of(new CustomerChurned("Alice"), Tags.of("region", "EU")) // ✗ Has requi
 Event.of(new CustomerUpdated("Dave"), Tags.none()) // ✗ Type matches, but missing required tag
 ```
 
-The same query can be used both for database-level filtering and in-process filtering, as explained further down.
+The same filter can be used both for database-level filtering and in-process filtering, as explained further down.
 
-## Building a Query
+> **Coming from 0.12?** `EventQuery` no longer has filter builders: `EventQuery.forTypes(...)`, `forTags(...)`, `forEvents(...)`, `matchAll()`, `matchNone()`, `tagged(...)` and `or(...)` are gone. Build the `EventFilter` and wrap it — `EventQuery.forTypes(X.class).tagged(k, v)` becomes `EventQuery.of(EventFilter.forTypes(X.class).tagged(k, v))`, or just the filter where the read is a plain forward one. A query's `until(ref)` is now `notAfter(ref)`, and `EventFilter.forEvents(types, tags)` is `EventFilter.of(types, tags)`.
+{: .prompt-warning }
 
-There are two spellings, and they build the same query — a query built one way compares equal to the same query built the other way.
+## Building a Filter
 
-**Fluently**, starting from the types or from the tags:
+There are two spellings, and they build the same filter — a filter built one way compares equal to the same filter built the other way.
+
+**Fluently**, starting from the types or from the tags, as a chain: the types first, then the tags every matching event must carry, then its bounds, then a union where a decision spans several boundaries:
 
 ```java
 // all events of the CustomerEvent hierarchy, for one customer
-EventQuery.forTypes(CustomerEvent.class).tagged("customer", "123");
+EventFilter.forTypes(CustomerEvent.class).tagged("customer", "123");
 
-// any type, carrying the tags -- the usual shape of a consistency boundary
-EventQuery.forTags(Tags.of("customer", "123"));
+// any type, carrying the tag -- the usual shape of a consistency boundary
+EventFilter.forTags("customer", "123");
 
 // narrowing accumulates: each tagged(...) adds a required tag
-EventQuery.forTypes(OrderPlaced.class, OrderShipped.class)
-          .tagged("customer", "123")
-          .tagged("region", "EU");
+EventFilter.forTypes(OrderPlaced.class, OrderShipped.class)
+           .tagged("customer", "123")
+           .tagged("region", "EU");
 ```
+
+Every builder has a form for what you already hold:
+
+| You hold | Spelling |
+|---|---|
+| event classes | `EventFilter.forTypes(CustomerRegistered.class, CustomerRenamed.class)` |
+| stored type names (a raw stream, an import, a browsing tool) | `EventFilter.forTypes(EventType.named("CustomerRegistered"))` — taken literally, nothing resolved |
+| one tag as key and value | `EventFilter.forTags("customer", "123")`, `.tagged("customer", "123")` |
+| `Tag` objects made elsewhere (an entity's tag, a rule tag) | `EventFilter.forTags(customerTag)`, `.tagged(customerTag, regionTag)` |
+| a `Tags` set | `EventFilter.forTags(Tags.of("region", "EU", "priority", "high"))`, `.tagged(tags)` |
 
 **From its two halves**, when you already hold a types filter and a set of tags:
 
 ```java
-EventQuery.forEvents(EventTypesFilter.of(OrderPlaced.class, OrderShipped.class),
-                     Tags.of("customer", "123", "region", "EU"));
+EventFilter.of(EventTypesFilter.of(OrderPlaced.class, OrderShipped.class),
+               Tags.of("customer", "123", "region", "EU"));
 ```
 
-`EventQuery.matchAll()` and `EventQuery.matchNone()` complete the set. The same builders exist on `EventFilter` — `EventFilter.forTypes(...).tagged(...)` — for where you need the matching criteria without a direction or limit, such as an `AppendCriteria`.
+`EventFilter.matchAll()` and `EventFilter.matchNone()` complete the set; `EventFilter.of(items...)` builds a filter directly from `EventFilterItem`s, and `EventFilter.of()` with none matches nothing.
 
 **A sealed interface stands for every event type under it.** `forTypes(CustomerEvent.class)` names the whole hierarchy, a nested sealed interface names its own branch, and the filter resolves them into the stored names of the records when it is built. A non-sealed interface is refused. See [Defining Events](/posts/eventstore-defining-events/#a-sealed-interface-names-its-whole-hierarchy).
 
 **Name current types, never legacy ones.** On a stream that registers upcasting, a filter naming a `@LegacyEvent` class is refused with `IllegalArgumentException`: name the current type it is read as, and its legacy events come along. See [Querying with legacy Events](#querying-with-legacy-events).
 
+### Building a Query
+
+Wrap the filter when the read is anything other than forward and complete:
+
+```java
+EventQuery.of(filter)                       // forward, no limit, no read bound
+EventQuery.of(filter).backwards()           // newest first
+EventQuery.of(filter).limit(500)            // read at most 500 stored events
+EventQuery.of(filter).notAfter(head)        // read nothing recorded after head
+```
+
+There is deliberately no shorthand that skips the filter, and no union of queries — see [Complex Event Filters](#complex-event-filters).
+
 ## In-Database vs In-Process Querying
 
-The same query can filter events at two different levels:
+The same filter can select events at two different levels:
 
-1. **Database-level filtering**: Pass the query to the event stream's `query()` method
-2. **In-process filtering**: Ask the query's filter whether an event matches: `query.filter().matches(event)`
+1. **Database-level filtering**: Pass the filter (or a query built on it) to the event stream's `query()` method
+2. **In-process filtering**: Ask the filter whether an event matches: `filter.matches(event)`
 
 ### Database-Level Filtering (Recommended)
 
-When you pass an `EventQuery` to the event stream, the filtering happens in the event storage (database):
+When you pass a filter or an `EventQuery` to the event stream, the filtering happens in the event storage (database):
 
 ```java
 EventStream<CustomerEvent> stream = eventstore.getEventStream(streamId, CustomerEvent.class);
 
-EventQuery query = EventQuery.forTypes(CustomerRegistered.class).tagged("region", "EU");
+EventFilter filter = EventFilter.forTypes(CustomerRegistered.class).tagged("region", "EU");
 
-// Query is executed in the database
-List<Event<CustomerEvent>> events = stream.query(query);
+// Filtering is executed in the database
+List<Event<CustomerEvent>> events = stream.query(filter);
 events.forEach(event -> processEvent(event));
 ```
 
@@ -98,18 +137,18 @@ events.forEach(event -> processEvent(event));
 
 ### In-Process Filtering
 
-The matching criteria of a query are its `EventFilter`, and the filter can test events in your Java code:
+An `EventFilter` can test events in your Java code:
 
 ```java
-EventQuery query = EventQuery.forTypes(CustomerRegistered.class).tagged("region", "EU");
+EventFilter filter = EventFilter.forTypes(CustomerRegistered.class).tagged("region", "EU");
 
 // Query all events from database, filter in Java
-List<Event<CustomerEvent>> filtered = stream.query(EventQuery.matchAll()).stream()
-    .filter(query.filter()::matches)
+List<Event<CustomerEvent>> filtered = stream.query(EventFilter.matchAll()).stream()
+    .filter(filter::matches)
     .toList();
 ```
 
-Whether an event matches, whether the query matches everything or nothing, its items and its `until` boundary are all questions for the filter: `query.filter().matches(e)`, `query.filter().isMatchAll()`, `query.filter().isMatchNone()`, `query.filter().until()`. The query itself answers only what it adds to the filter: `isBackwards()` and `limit()`.
+Whether an event matches, whether the filter matches everything or nothing, whether any of its items is bounded, and its items themselves are all questions for the filter: `filter.matches(e)`, `filter.isMatchAll()`, `filter.isMatchNone()`, `filter.isBounded()`, `filter.items()`. A query answers only what it adds to its `filter()`: `isBackwards()`, `limit()` and `notAfter()`.
 
 **Disadvantages:**
 - All events are read from the database
@@ -125,7 +164,7 @@ Sometimes it's beneficial to retrieve a limited set of events from the database 
 
 ```java
 // Coarse filter: Get all customer events for EU region
-List<Event<CustomerEvent>> euEvents = stream.query(EventQuery.forTags(Tags.of("region", "EU")));
+List<Event<CustomerEvent>> euEvents = stream.query(EventFilter.forTags("region", "EU"));
 
 // Now apply multiple fine-grained filters in-process
 EventFilter registrations = EventFilter.forTypes(CustomerRegistered.class).tagged("region", "EU");
@@ -139,7 +178,7 @@ long churnCount        = euEvents.stream().filter(churned::matches).count();
 ```
 
 **When to use this approach:**
-- You need to apply multiple related queries to the same dataset
+- You need to apply multiple related filters to the same dataset
 - The coarse query retrieves a manageable number of events
 - You want to avoid multiple database round-trips
 - Fine-grained filtering logic is complex or changes frequently
@@ -153,7 +192,7 @@ as long as you make sure the number of retrieved events is low enough to do so, 
 
 ## Querying all Domain Events in a Stream
 
-The simplest query retrieves all events from a stream using `EventQuery.matchAll()`:
+The simplest query retrieves all events from a stream using `EventFilter.matchAll()`:
 
 ```java
 EventStream<CustomerEvent> stream = eventstore.getEventStream(
@@ -161,7 +200,7 @@ EventStream<CustomerEvent> stream = eventstore.getEventStream(
     CustomerEvent.class
 );
 
-List<Event<CustomerEvent>> allEvents = stream.query(EventQuery.matchAll());
+List<Event<CustomerEvent>> allEvents = stream.query(EventFilter.matchAll());
 allEvents.forEach(event -> System.out.println(event));
 ```
 
@@ -173,16 +212,16 @@ This is the single most important thing to know about querying. `query()` hands 
 
 Three consequences follow directly:
 
-- **An unbounded query against a large stream is an `OutOfMemoryError`, not a slow read.** There is no back-pressure to arrive at. Bound the read with `EventQuery.limit(n)`, which is the limit storage is actually given — nothing applied to the returned list bounds anything.
+- **An unbounded query against a large stream is an `OutOfMemoryError`, not a slow read.** There is no back-pressure to arrive at. Bound the read with `EventQuery.of(filter).limit(n)`, which is the limit storage is actually given — nothing applied to the returned list bounds anything.
 - **A poison event fails the call itself.** An `EventDeserializationException` comes from `query()`, and a query holding one hands out none of its events. See [Error Handling](/posts/eventstore-error-handling/).
 - **Nothing needs closing.** No database resource is held open behind the list. (`EventSource.close()` is about subscriptions, not queries.)
 
 ```java
 // reads everything matching into heap before returning
-List<Event<CustomerEvent>> all = stream.query(EventQuery.matchAll());
+List<Event<CustomerEvent>> all = stream.query(EventFilter.matchAll());
 
 // reads 500 stored events
-List<Event<CustomerEvent>> page = stream.query(EventQuery.matchAll().limit(500));
+List<Event<CustomerEvent>> page = stream.query(EventQuery.of(EventFilter.matchAll()).limit(500));
 ```
 
 `.stream()` is one call away when you want stream operations over events already read.
@@ -199,32 +238,32 @@ Events can be filtered by combining event type filters with tags. The matching s
 - **Event Types**: The event must match **any** of the specified types (OR condition)
 - **Tags**: The event must contain **all** specified tags (AND condition)
 
-Note that events can have additional tags beyond those specified in the query—the query only requires that the specified tags are present.
+Note that events can have additional tags beyond those specified in the filter—the filter only requires that the specified tags are present.
 
 ```java
 // Match any event type
-EventQuery anyType = EventQuery.forTags(Tags.of("customer", "123"));
+EventFilter anyType = EventFilter.forTags("customer", "123");
 
 // Match a single type
-EventQuery singleType = EventQuery.forTypes(CustomerChurned.class);
+EventFilter singleType = EventFilter.forTypes(CustomerChurned.class);
 
 // Match multiple types (OR condition)
-EventQuery multipleTypes = EventQuery.forTypes(
+EventFilter multipleTypes = EventFilter.forTypes(
     CustomerRegistered.class,
     CustomerNameChanged.class,
     CustomerChurned.class
 );
 
 // Match a whole sealed hierarchy
-EventQuery everyCustomerEvent = EventQuery.forTypes(CustomerEvent.class);
+EventFilter everyCustomerEvent = EventFilter.forTypes(CustomerEvent.class);
 
 // Multiple tags (ALL must be present)
-EventQuery multipleTags = EventQuery.forTags(Tags.of("customer", "123", "region", "EU", "priority", "high"));
+EventFilter multipleTags = EventFilter.forTags(Tags.of("customer", "123", "region", "EU", "priority", "high"));
 // Matches events that have AT LEAST these three tags
 // (events can have additional tags)
 ```
 
-> **Tag matching is exact containment, never key-prefix.** A query for `Tag.of("customer")` does not return events tagged `customer:123` — see [What a Tag May Contain](/posts/eventstore-appending-events/#what-a-tag-may-contain).
+> **Tag matching is exact containment, never key-prefix.** A filter on `Tag.of("customer")` does not return events tagged `customer:123` — see [What a Tag May Contain](/posts/eventstore-appending-events/#what-a-tag-may-contain).
 {: .prompt-info }
 
 ## Paging Through a Stream
@@ -232,7 +271,7 @@ EventQuery multipleTags = EventQuery.forTags(Tags.of("customer", "123", "region"
 For large event streams, read in pages. `page(query, cursor)` answers an `EventPage`: the events, plus what it took from storage to produce them.
 
 ```java
-EventQuery query = EventQuery.matchAll().limit(500);
+EventQuery query = EventQuery.of(EventFilter.matchAll()).limit(500);
 EventReference cursor = null;
 EventPage<CustomerEvent> page;
 
@@ -255,10 +294,12 @@ do {
 `query(query, cursor)` is the same read without that account, read whole exactly as a page is. Where upcasting cannot produce more or fewer events than were stored, it is enough:
 
 ```java
-List<Event<CustomerEvent>> next = stream.query(EventQuery.matchAll().limit(100), lastRef);
+List<Event<CustomerEvent>> next = stream.query(EventQuery.of(EventFilter.matchAll()).limit(100), lastRef);
 ```
 
 The cursor tells the store where to start. For forward queries it acts as an "after" cursor; for backward queries as a "before" cursor. It doesn't affect which events match the query, only where the scan begins.
+
+**What a cursor is for.** Most reads need none: a decider pins its read with [`notAfter`](#bounding-a-read-notafter), and a read model or any other reader working through a long history is driven by a `Projector`, which keeps the cursor itself. The cursor overloads are for what is left to application code — *what is new since a reference I already hold*: a monitor polling a stream for what was appended since it last looked, or a test collecting what a command appended after its fixture. Give such a query a limit and continue from the last event it returned; `query(filter, cursor)` exists for the case where what follows the cursor is known to be little. The cursor is where an iteration stands, not part of what is asked, which is why it is an argument of the read and not a property of the `EventQuery`.
 
 ### What a Limit Actually Counts
 
@@ -271,7 +312,7 @@ The limit is a property of the query, and nothing else: no read takes a `Limit` 
 ```java
 // over an event that upcasts into two, this returns TWO events —
 // having read exactly one stored event
-stream.query(EventQuery.matchAll().limit(1));
+stream.query(EventQuery.of(EventFilter.matchAll()).limit(1));
 
 // over an event that upcasts into none, it returns ZERO —
 // also having read exactly one stored event
@@ -280,7 +321,7 @@ stream.query(EventQuery.matchAll().limit(1));
 Trimming the surplus would return a fragment of a stored event and leave a cursor pointing into its middle, so the store does not do it. Where you need exactly n events, take a `subList` of the returned list — cheap, since those events are already read:
 
 ```java
-List<Event<CustomerEvent>> read = stream.query(EventQuery.matchAll().limit(10));
+List<Event<CustomerEvent>> read = stream.query(EventQuery.of(EventFilter.matchAll()).limit(10));
 List<Event<CustomerEvent>> exactlyTen = read.subList(0, Math.min(10, read.size()));
 ```
 
@@ -293,19 +334,19 @@ Backward queries return events in reverse chronological order (newest first). Th
 ```java
 // Get the last 10 events
 List<Event<CustomerEvent>> recentEvents = stream.query(
-    EventQuery.matchAll().backwards().limit(10)
+    EventQuery.of(EventFilter.matchAll()).backwards().limit(10)
 );
 
 // Find the last CustomerRegistered event
 Optional<Event<CustomerEvent>> lastRegistration = stream.query(
-    EventQuery.forTypes(CustomerRegistered.class).backwards().limit(1)
+    EventQuery.of(EventFilter.forTypes(CustomerRegistered.class)).backwards().limit(1)
 ).stream().findFirst();
 ```
 
 ### Backward Pagination
 
 ```java
-EventQuery backwards = EventQuery.matchAll().backwards().limit(100);
+EventQuery backwards = EventQuery.of(EventFilter.matchAll()).backwards().limit(100);
 EventReference beforeRef = null;
 EventPage<CustomerEvent> page;
 
@@ -335,21 +376,21 @@ It is not the same as the `backwards().limit(1)` query idiom, and is better at t
 - **It names a stored event, whole.** A boundary at it includes every event that stored event upcasts into.
 - **An absent head is an empty stream**, and that is a valid answer — "I decided on nothing" — never to be replaced by some other reference.
 
-Its main use is to pin a consistency boundary *before* a decision is read: bound every read with `until(head)` and hand the same reference to `AppendCriteria`. See [Optimistic Locking](/posts/eventstore-appending-events/#optimistic-locking).
+Its main use is to pin a consistency boundary *before* a decision is read: bound every read with `notAfter(head)` and hand the same reference to `AppendCriteria`. See [Optimistic Locking](/posts/eventstore-appending-events/#optimistic-locking).
 
-## Querying until a certain moment in time
+## Bounding a Read: `notAfter`
 
-The `until` parameter allows querying events up to a specific point in history. This is fundamental to event sourcing, enabling reconstruction of system state as it existed at any past moment:
+`EventQuery.notAfter(reference)` reads nothing recorded after a reference. It is the **read bound**: a property of *how* a filter is read, not of which events are relevant. Its main use is to pin every read of a decision at one moment — the head taken before reading — and it is equally what reconstructs how things stood at any past moment:
 
 ```java
-EventQuery customer123 = EventQuery.forTags(Tags.of("customer", "123"));
+EventFilter customer123 = EventFilter.forTags("customer", "123");
 
-// Get all events up to a specific reference
+// Get all events, and pick a moment in time
 List<Event<CustomerEvent>> allEvents = stream.query(customer123);
 EventReference momentInTime = allEvents.get(5).reference(); // 6th event
 
-// Query events up to that moment
-List<Event<CustomerEvent>> pastEvents = stream.query(customer123.until(momentInTime));
+// Read the events up to that moment
+List<Event<CustomerEvent>> pastEvents = stream.query(EventQuery.of(customer123).notAfter(momentInTime));
 // Returns only the first six events
 ```
 
@@ -361,29 +402,59 @@ CustomerSummary historicalState = new CustomerSummary("123");
 Projector.from(stream).into(historicalState).build().runUntil(checkpoint);
 ```
 
-`untilIfEarlier(reference)` narrows an existing boundary only when the new one is earlier — useful for combining a caller's boundary with one of your own.
+`notAfter` replaces any read bound already set, and `notAfter(null)` removes it.
 
-### How the `until` Boundary Behaves
+### How the Read Bound Behaves
 
 Four properties are worth being precise about:
 
 **It is inclusive.** The event named by the reference is returned.
 
-**It is direction-independent.** `until` is compared over the total `(tx, position)` order of *stored* events, not against the direction of travel, so `.backwards()` returns exactly the same events as forward — just newest first:
+**It is direction-independent.** The bound is compared over the total `(tx, position)` order of *stored* events, not against the direction of travel, so `.backwards()` returns exactly the same events as forward — just newest first. A backwards read starts at the bound and walks into history; it never reads what was recorded after it:
 
 ```java
-EventQuery upTo = customer123.until(checkpoint);
+EventQuery upTo = EventQuery.of(customer123).notAfter(checkpoint);
 
 List<Event<CustomerEvent>> forward  = stream.query(upTo);
 List<Event<CustomerEvent>> backward = stream.query(upTo.backwards());
 // same events, opposite order
 ```
 
-**It names a stored event, whole.** The `index` on a reference distinguishes the events one stored event upcasts into, and a boundary compares stored events: every event the stored event at the boundary upcasts into is at or before it, whatever its index. A reference obtained without upcasting — `head()`, a bookmark read back from PostgreSQL — therefore bounds a typed read without cutting the newest stored event in pieces.
+**It names a stored event, whole.** The `index` on a reference distinguishes the events one stored event upcasts into, and a bound compares stored events: every event the stored event at the bound upcasts into is at or before it, whatever its index. A reference obtained without upcasting — `head()`, a bookmark read back from PostgreSQL — therefore bounds a typed read without cutting the newest stored event in pieces.
 
-**It is part of the filter, so it also bounds a consistency boundary.** An `AppendCriteria` built from a query carrying an `until` will not raise `OptimisticLockingException` for an event past that boundary. That is why a criteria's filter must carry **no** `until`: use the bounded query for the read and the unbounded one, with the head as its reference, for the append — see [Optimistic Locking](/posts/eventstore-appending-events/#why-the-head-and-not-the-last-relevant-event).
+**It never reaches a consistency boundary.** `AppendCriteria.of(query, head)` takes the query's *filter* only; its direction, limit and read bound say how the facts were read, not which facts are relevant. So the query a decider read with is exactly the one to hand to the append — the read is bounded at the head, the check looks past it. See [Optimistic Locking](/posts/eventstore-appending-events/#optimistic-locking).
 
 Note that the ordering compared is the tuple, not the position alone. Positions and transactions are assigned independently, so an event can hold a lower position and a higher transaction than one that committed before it. Comparing positions would silently drop such events.
+
+> In 0.12 this bound was `EventQuery.until(ref)`, and it lived on the filter — which is why an `AppendCriteria` built from a bounded query used to miss conflicts, and why the criteria had to be built from an unbounded one. With the bound on the query, that trap is gone.
+{: .prompt-info }
+
+## Bounding What Is Relevant: `after` and `until`
+
+Some decisions are about part of the history by their nature: *the stock movements after the last count*, *the invoices recorded up to the year close*. That is a **business bound**, and it lives on the filter, per item:
+
+```java
+EventFilter movements = EventFilter.forTypes(StockAdded.class, StockPicked.class)
+                                   .tagged("product", product)
+                                   .after(lastCount);                 // exclusive
+
+EventFilter invoices  = EventFilter.forTypes(InvoiceIssued.class)
+                                   .tagged("customer", customer)
+                                   .until(yearClosed);                // inclusive
+
+// one read over both, each item keeping its own bounds
+List<Event<ShopEvent>> facts = stream.query(movements.or(invoices));
+```
+
+- **`after(ref)` is exclusive, `until(ref)` is inclusive**, both in recording order over stored events, and both select the same events in either direction.
+- **They apply to every item of the filter they are called on**, and replace whatever bound an item had; `null` removes it. `afterIfLater(ref)` and `untilIfEarlier(ref)` *narrow* instead: an item bounded tighter keeps its own bound.
+- **A bound set before a union stays with the items it was set on.** That is what lets one read unite facts bounded at different points of the history — something a single read bound cannot express.
+- On a match-all filter they produce one item of any type bounded that way; a match-none filter stays match-none.
+
+Because item bounds are part of what is relevant, they *do* reach a consistency boundary — sensibly. When an `AppendCriteria` is made, each item's bounds are judged against its expected reference: an item `until` a reference at or before it can match nothing appended later and is left out of the check, and an `after` at or before it is dropped, since everything after the expected reference is after it too. See [Appending Events](/posts/eventstore-appending-events/#items-bounded-before-the-reference).
+
+> **`notAfter` or `until`?** If the bound is *where you happened to read up to* — the head pinned for a decision, a checkpoint — it is a read bound: `EventQuery.notAfter`. If it is *part of what the decision is about* — a period closed, a savepoint taken — it belongs to the filter: `EventFilter.until` / `after`.
+{: .prompt-tip }
 
 ## Querying by Event ID
 
@@ -412,7 +483,7 @@ So `isPresent()` is the presence check, on a typed stream and a raw one alike, a
 ```java
 EventSource<String> raw = eventstore.getRawEventStream(EventStreamId.forContext("customer"));
 
-for ( Event<String> event : raw.query(EventQuery.matchAll().limit(100)) ) {
+for ( Event<String> event : raw.query(EventQuery.of(EventFilter.matchAll()).limit(100)) ) {
     System.out.println(event.type() + " " + event.data());   // data() is the stored JSON document
 }
 ```
@@ -444,7 +515,7 @@ EventStream<CustomerEvent> allCustomers = eventstore.getEventStream(
     CustomerEvent.class
 );
 
-List<Event<CustomerEvent>> allCustomerEvents = allCustomers.query(EventQuery.matchAll().limit(500));
+List<Event<CustomerEvent>> allCustomerEvents = allCustomers.query(EventQuery.of(EventFilter.matchAll()).limit(500));
 ```
 
 > Where a context is split into a stream per entity, a context-wide read like this is a cross-entity read. It is served by its own index on PostgreSQL, so it pages efficiently in order — but reading **one** entity this way, by tag through the wildcard, rather than through its own stream, gives up everything the split bought. See [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/).
@@ -458,7 +529,7 @@ EventSource<String> specificPurpose = eventstore.getRawEventStream(
     EventStreamId.anyContext().withPurpose("analytics")
 );
 
-List<Event<String>> events = specificPurpose.query(EventQuery.matchAll().limit(500));
+List<Event<String>> events = specificPurpose.query(EventQuery.of(EventFilter.matchAll()).limit(500));
 ```
 
 ### Query across all contexts and purposes
@@ -470,7 +541,7 @@ EventStream<Object> everything = eventstore.getEventStream(
     Set.of(CustomerEvent.class, OrderEvent.class)
 );
 
-List<Event<Object>> page = everything.query(EventQuery.matchAll().limit(500));
+List<Event<Object>> page = everything.query(EventQuery.of(EventFilter.matchAll()).limit(500));
 ```
 
 **Use case example**: Global event monitoring or cross-context analytics — raw, so no event type can fail to map:
@@ -479,7 +550,7 @@ List<Event<Object>> page = everything.query(EventQuery.matchAll().limit(500));
 // Find all events tagged with a specific correlation ID across the entire store
 EventSource<String> global = eventstore.getRawEventStream(EventStreamId.anyContext());
 
-List<Event<String>> correlated = global.query(EventQuery.forTags(Tags.of("correlationId", "abc-123")));
+List<Event<String>> correlated = global.query(EventFilter.forTags("correlationId", "abc-123"));
 ```
 
 `EventStreamId.covers(other)` says whether an id's scope contains a stream — it is what scopes every read, and what decides which subscribers a notification is relevant to.
@@ -510,7 +581,7 @@ EventStream<CustomerEvent> stream = eventstore.getEventStream(
 
 // Query by current type - includes upcast legacy events
 List<Event<CustomerEvent>> registrations = stream.query(
-    EventQuery.forTypes(CustomerEvent.CustomerRegisteredV2.class)
+    EventFilter.forTypes(CustomerEvent.CustomerRegisteredV2.class)
 );
 
 // All events are typed as CustomerEvent (never CustomerLegacyEvent)
@@ -528,45 +599,46 @@ for (Event<CustomerEvent> event : registrations) {
 - When a legacy event is upcast into multiple current events, all appear in query results in their correct position with distinct index values
 - When a legacy event is upcast to zero events (filtering), it is silently skipped
 
-## Complex Event Queries
+## Complex Event Filters
 
-For advanced scenarios, you can combine multiple query criteria using `or()`. This creates a UNION of queries, allowing you to retrieve events that match any of several different patterns.
+For advanced scenarios, you can combine filters using `or()`. This creates a UNION of filters, allowing you to retrieve events that match any of several different patterns — in a single read.
 
-### Understanding Query Matching Semantics
+### Understanding Filter Matching Semantics
 
-Event queries follow specific matching rules that combine AND and OR logic:
+An `EventFilter` is a union of `EventFilterItem`s, and matching combines AND and OR logic:
 
-**Within a single query item:**
+**Within a single item:**
 - **Event Types**: The event must match **ANY** of the specified types (OR condition)
 - **Tags**: The event must contain **ALL** specified tags (AND condition)
+- **Bounds**: The event must lie within the item's `after`/`until`, if it has any
 
-**Across multiple query items:**
-- If **ANY** item matches, the event matches the overall query (OR condition)
+**Across multiple items:**
+- If **ANY** item matches, the event matches the overall filter (OR condition)
 
 This gives you powerful flexibility to express complex selection criteria.
 
-### Basic Query Combination
+### Basic Filter Combination
 
-Combine two queries to match events that satisfy either query:
+Combine two filters to match events that satisfy either:
 
 ```java
-// Query 1: All CustomerRegistered events
-EventQuery newCustomers = EventQuery.forTypes(CustomerRegistered.class);
+// Filter 1: All CustomerRegistered events
+EventFilter newCustomers = EventFilter.forTypes(CustomerRegistered.class);
 
-// Query 2: All events for VIP customers
-EventQuery vipActivity = EventQuery.forTags(Tags.of("customerType", "VIP"));
+// Filter 2: All events for VIP customers
+EventFilter vipActivity = EventFilter.forTags("customerType", "VIP");
 
 // Combined: CustomerRegistered events OR any VIP customer events
-EventQuery combined = newCustomers.or(vipActivity);
+EventFilter combined = newCustomers.or(vipActivity);
 
 List<Event<CustomerEvent>> events = stream.query(combined);
 ```
 
-The combined query will return:
+The combined filter will return:
 - All `CustomerRegistered` events (regardless of tags)
 - All events (any type) with the tag `customerType=VIP`
 
-No duplicates are returned: events matching multiple items in the query are returned once.
+No duplicates are returned: events matching multiple items in the filter are returned once.
 As always, events are returned in stream order.
 
 ### Narrowing a Union
@@ -574,81 +646,75 @@ As always, events are returned in stream order.
 `tagged(...)` distributes over a union: `a.or(b).tagged(t)` is `a.tagged(t).or(b.tagged(t))`. That makes it easy to scope a combination of facts to one entity:
 
 ```java
-EventQuery courseFacts = EventQuery.forTypes(CourseDefined.class, CourseCapacityUpdated.class)
-                                   .or(EventQuery.forTypes(StudentSubscribedToCourse.class))
-                                   .tagged("course", "CS101");
+EventFilter courseFacts = EventFilter.forTypes(CourseDefined.class, CourseCapacityUpdated.class)
+                                     .or(EventFilter.forTypes(StudentSubscribedToCourse.class))
+                                     .tagged("course", "CS101");
 ```
 
-A match-all narrowed by a tag is `forTags(tag)`; a match-none stays match-none.
+A match-all narrowed by a tag is `forTags(tag)`; a match-none stays match-none. The same distribution holds for `after`, `until` and their `IfLater`/`IfEarlier` forms: called on a union, they bound every item of it.
 
-### Combining Queries with Different Types and Tags
+### Combining Filters with Different Types and Tags
 
-Create complex selection criteria by combining queries with different event types and tag requirements:
+Create complex selection criteria by combining filters with different event types and tag requirements:
 
 ```java
 // Events related to a specific student
-EventQuery studentEvents = EventQuery.forTypes(StudentRegistered.class, StudentSubscribedToCourse.class)
-                                     .tagged("student", "S123");
+EventFilter studentEvents = EventFilter.forTypes(StudentRegistered.class, StudentSubscribedToCourse.class)
+                                       .tagged("student", "S123");
 
 // Events related to a specific course
-EventQuery courseEvents = EventQuery.forTypes(CourseDefined.class, CourseCapacityUpdated.class, StudentSubscribedToCourse.class)
-                                    .tagged("course", "CS101");
+EventFilter courseEvents = EventFilter.forTypes(CourseDefined.class, CourseCapacityUpdated.class, StudentSubscribedToCourse.class)
+                                      .tagged("course", "CS101");
 
 // Combined: All events relevant to this student-course interaction
-EventQuery relevantFacts = studentEvents.or(courseEvents);
+EventFilter relevantFacts = studentEvents.or(courseEvents);
 ```
 
-The combined query matches events where **any** of these conditions are true:
+The combined filter matches events where **any** of these conditions are true:
 - Event is `StudentRegistered` OR `StudentSubscribedToCourse` AND has tag `student=S123`
 - Event is `CourseDefined` OR `CourseCapacityUpdated` OR `StudentSubscribedToCourse` AND has tag `course=CS101`
 
 Notice that `StudentSubscribedToCourse` events with **either** tag will be included.
 
-### Query Combination Rules
+### Combination Rules
 
-`or` combines the matching criteria of two queries, and refuses what it cannot combine faithfully, with an `IllegalArgumentException`:
+`or` on filters always succeeds. The items of both sides are kept side by side, each with its own types, tags **and bounds**, so filters narrowed to different entities, or bounded at different points of the history, unite freely. A match-all on either side makes the union match-all; a match-none contributes nothing.
 
-- **The same `until` on both sides, or none on either.** Two different boundaries have no single meaning for the union.
-- **The same direction on both sides.**
-- **No limit on either side**, even an identical one.
-
-The last one deserves a word. A shared limit over a union does not preserve what either query meant on its own. Two `backwards().limit(1)` queries each ask for "the most recent event matching *me*"; combined into `(A OR B) limit 1` they ask for "the most recent event matching either", which answers neither. Since there is no correct way to fold them, they are refused rather than quietly reinterpreted. Combine the queries without limits and apply the limit afterwards, or run them separately.
-
-A match-all on either side makes the union match-all.
+There is **no union of queries**. A direction, a limit or a read bound cannot be united meaningfully: two `backwards().limit(1)` savepoint queries each ask for "the most recent event matching *me*"; united into `(A OR B) limit 1` they would ask for "the most recent event matching either", which answers neither. So unite the *filters*, and wrap the union in one query where the read needs a direction, limit or bound — or run the queries separately when each needs its own limit.
 
 ### Practical Use Case: Dynamic Consistency Boundary
 
-Query combination is particularly useful for Dynamic Consistency Boundaries where business decisions depend on multiple types of facts:
+Filter combination is particularly useful for Dynamic Consistency Boundaries where business decisions depend on multiple types of facts:
 
 ```java
 public class SubscribeToCourseCommand {
     private final String studentId;
     private final String courseId;
 
-    public EventQuery relevantFacts() {
+    public EventFilter relevantFacts() {
         // Student-specific facts
-        EventQuery studentQuery = EventQuery.forTypes(StudentRegistered.class, StudentSubscribedToCourse.class)
-                                            .tagged("student", studentId);
+        EventFilter student = EventFilter.forTypes(StudentRegistered.class, StudentSubscribedToCourse.class)
+                                         .tagged("student", studentId);
 
         // Course-specific facts
-        EventQuery courseQuery = EventQuery.forTypes(CourseDefined.class, CourseCapacityUpdated.class, StudentSubscribedToCourse.class)
-                                           .tagged("course", courseId);
+        EventFilter course = EventFilter.forTypes(CourseDefined.class, CourseCapacityUpdated.class, StudentSubscribedToCourse.class)
+                                        .tagged("course", courseId);
 
         // All relevant facts for this business decision
-        return studentQuery.or(courseQuery);
+        return student.or(course);
     }
 
     public void execute(EventStream<LearningEvent> stream) {
-        EventQuery relevant = relevantFacts();
+        EventFilter relevant = relevantFacts();
 
         // Pin the boundary, then load current state as of that boundary
         EventReference head = stream.head().orElse(null);
-        List<Event<LearningEvent>> facts = stream.query(relevant.until(head));
+        List<Event<LearningEvent>> facts = stream.query(EventQuery.of(relevant).notAfter(head));
 
         // Make business decision based on facts
         SubscriptionDecision decision = SubscriptionDecision.from(facts);
         if (decision.hasCapacity()) {
-            // Append new event with optimistic locking: the query unbounded, the head as reference
+            // Append new event with optimistic locking: the same filter, the head as reference
             stream.append(
                 AppendCriteria.of(relevant, head),
                 Event.of(
@@ -663,7 +729,7 @@ public class SubscribeToCourseCommand {
 
 This pattern ensures that if **any** new relevant fact emerges (either about the student or the course) between reading facts and appending the new event, the append will fail with an `OptimisticLockingException`.
 
-> On PostgreSQL, an OR-of-facts read like this one is not served by the tag index — the index answers a single tag containment, not a disjunction — so it walks the stream in order and filters. Keep the number of OR-ed items small on hot paths.
+> On PostgreSQL, an OR-of-facts read like this one is not served by the tag index — the index answers a single tag containment, not a disjunction — so it walks the stream in order and filters. Keep the number of OR-ed items small on hot paths. A union whose items carry *different* bounds is read as one ordered branch per item, merged in order, so each item uses its own range instead of one walk over the widest; items sharing their bounds (every filter without any) keep the single statement.
 {: .prompt-info }
 
 ### Matching Examples
@@ -673,8 +739,8 @@ To clarify the matching semantics, consider these examples:
 **Example 1: Simple combination**
 
 ```java
-EventQuery q = EventQuery.forTypes(CustomerRegistered.class).tagged("region", "EU")
-                         .or(EventQuery.forTypes(OrderPlaced.class).tagged("priority", "high"));
+EventFilter f = EventFilter.forTypes(CustomerRegistered.class).tagged("region", "EU")
+                           .or(EventFilter.forTypes(OrderPlaced.class).tagged("priority", "high"));
 ```
 
 This matches events where:
@@ -684,9 +750,9 @@ This matches events where:
 **Example 2: Multiple types and tags per item**
 
 ```java
-EventQuery q = EventQuery.forTypes(CustomerRegistered.class, CustomerUpdated.class)
-                         .tagged("region", "EU").tagged("verified", "true")
-                         .or(EventQuery.forTypes(OrderPlaced.class, OrderShipped.class).tagged("priority", "high"));
+EventFilter f = EventFilter.forTypes(CustomerRegistered.class, CustomerUpdated.class)
+                           .tagged("region", "EU").tagged("verified", "true")
+                           .or(EventFilter.forTypes(OrderPlaced.class, OrderShipped.class).tagged("priority", "high"));
 ```
 
 This matches events where:
@@ -696,8 +762,8 @@ This matches events where:
 **Example 3: Any type with specific tags**
 
 ```java
-EventQuery q = EventQuery.forTags(Tags.of("correlationId", "abc-123"))
-                         .or(EventQuery.forTypes(ErrorOccurred.class));
+EventFilter f = EventFilter.forTags("correlationId", "abc-123")
+                           .or(EventFilter.forTypes(ErrorOccurred.class));
 ```
 
 This matches events where:
@@ -705,3 +771,14 @@ This matches events where:
 - Event type is `ErrorOccurred` (regardless of tags)
 
 This pattern is useful for debugging: retrieve all events in a specific correlation chain plus any error events.
+
+**Example 4: Items bounded at different points**
+
+```java
+EventFilter f = EventFilter.forTypes(StockAdded.class, StockPicked.class).tagged("product", "P1").after(lastCount)
+                           .or(EventFilter.forTypes(PriceChanged.class).tagged("product", "P1"));
+```
+
+This matches events where:
+- Event type is `StockAdded` OR `StockPicked` AND has tag `product=P1` AND was recorded after `lastCount`, **OR**
+- Event type is `PriceChanged` AND has tag `product=P1`, whenever it was recorded

@@ -124,26 +124,32 @@ stream.placeReadPosition(
 );
 ```
 
-A reader with such a bookmark **still resumes from the beginning**, exactly as one without a bookmark does: `getBookmark(reader)` — the resume point — answers empty, since the read position is never a resume point. A `Projector` built with `resumeAfterReadPosition()` is the deliberate exception, for a reader [started from now on](/posts/eventstore-projecting-events/#starting-a-reader-from-now-on). Placing a read position alone **never clears a handled reference** the bookmark already names; only the read position, tags and update time are replaced. The first `placeBookmark` that names a handled event fills the reference in. A bookmarked `Projector` places a read-position-only bookmark itself, after a run that read to the end without handling anything.
+A reader with such a bookmark **still resumes from the beginning**, exactly as one without a bookmark does: its resume point, `findBookmark(reader).flatMap(Bookmark::reference)`, is empty, since the read position is never a resume point. A `Projector` built with `resumeAfterReadPosition()` is the deliberate exception, for a reader [started from now on](/posts/eventstore-projecting-events/#starting-a-reader-from-now-on). Placing a read position alone **never clears a handled reference** the bookmark already names; only the read position, tags and update time are replaced. The first `placeBookmark` that names a handled event fills the reference in. A bookmarked `Projector` places a read-position-only bookmark itself, after a run that read to the end without handling anything.
 
 **It is held to the same rules as the reference**, independently: it must name an event this store holds (or the placement is rejected and the previous bookmark stays), only its event id is stored, and it reads back as the store's own coordinates for that event — as the two sections above describe. A storage does not judge whether `readUpTo` is at or after `reference`; that is the writer's to keep.
 
 ## Retrieving a Bookmark
 
-The `getBookmark()` method retrieves the last bookmarked position for a reader:
+There is one read of a reader's bookmark: `findBookmark(reader)`. It answers the whole bookmark — both positions, its tags, and when it was last placed — including the bookmark of a reader that has read the stream without handling anything yet, or `Optional.empty()` when the reader has none.
+
+The **resume point** — the last handled event, where a reader continues after — is its `reference()`:
 
 ```java
-Optional<EventReference> bookmark = stream.getBookmark("customer-summary-builder");
+Optional<EventReference> resumeAfter = stream.findBookmark("customer-summary-builder")
+                                             .flatMap(Bookmark::reference);
 
-bookmark.ifPresentOrElse(
+resumeAfter.ifPresentOrElse(
     ref -> System.out.println("Resume from position: " + ref.position()),
     () -> System.out.println("No bookmark - start from beginning")
 );
 ```
 
-Returns `Optional.empty()` if no bookmark exists for that reader (first run scenario), or if its bookmark records a read position only — a reader that has handled nothing yet starts from the beginning either way.
+The resume point is empty if no bookmark exists for that reader (first run scenario), or if its bookmark records a read position only — a reader that has handled nothing yet starts from the beginning either way.
 
-`getBookmark()` answers the resume point only. `findBookmark()` answers the whole bookmark of one reader — both positions, its tags, and when it was last placed — including the bookmark of a reader that has read the stream without handling anything yet:
+> **Coming from 0.12?** `EventSource.getBookmark(reader)` is gone. It answered the resume point while `findBookmark` answered the whole bookmark, and for a reader with a read position only the two disagreed about whether it had a bookmark at all. Replace `stream.getBookmark(reader)` with `stream.findBookmark(reader).flatMap(Bookmark::reference)`. (The storage SPI keeps `EventStorage.getBookmark` as a cheaper read for backends; only the application-facing stream lost it.)
+{: .prompt-warning }
+
+The whole bookmark also says how far a reader has *read*:
 
 ```java
 Optional<Bookmark> bookmark = stream.findBookmark("order-dashboard");
@@ -169,7 +175,7 @@ Comparing with the read position rather than the reference is what makes this wo
 
 ## Retrieving All Bookmarks
 
-`getBookmarks()` returns every bookmark on the stream, with the metadata that `getBookmark()` does not carry:
+`getBookmarks()` returns every bookmark on the stream, each with the same metadata `findBookmark()` answers for one reader:
 
 ```java
 public record Bookmark (
@@ -198,7 +204,7 @@ bookmarks.forEach(b -> System.out.printf(
     b.readUpToOrReference().position(), b.updatedAt(), b.tags()));
 ```
 
-This is the API behind an operational view of a system's readers. Where `getBookmark(reader)` answers "where is *this* processor", `getBookmarks()` answers "where is everything, and which of it has stopped moving":
+This is the API behind an operational view of a system's readers. Where `findBookmark(reader)` answers "where is *this* processor", `getBookmarks()` answers "where is everything, and which of it has stopped moving":
 
 ```java
 // which readers have fallen behind the head of the stream?
@@ -247,8 +253,8 @@ EventStream<CustomerEvent> stream = eventstore.getEventStream(
 
 String readerName = "customer-analytics";
 
-// Retrieve last bookmark
-Optional<EventReference> bookmark = stream.getBookmark(readerName);
+// Retrieve last bookmark: the resume point is the last handled event
+Optional<EventReference> bookmark = stream.findBookmark(readerName).flatMap(Bookmark::reference);
 EventReference startAfter = bookmark.orElse(null);
 
 if (startAfter == null) {
@@ -260,8 +266,8 @@ if (startAfter == null) {
 // Register listener for new events appended to stream
 Subscription subscription = stream.subscribe((EventReference atLeastUntil) -> {
     // Process new events since the last bookmark
-    EventReference from = stream.getBookmark(readerName).orElse(null);
-    for (Event<CustomerEvent> event : stream.query(EventQuery.matchAll().limit(100), from)) {
+    EventReference from = stream.findBookmark(readerName).flatMap(Bookmark::reference).orElse(null);
+    for (Event<CustomerEvent> event : stream.query(EventQuery.of(EventFilter.matchAll()).limit(100), from)) {
         processEvent(event);
 
         // Update bookmark after processing
@@ -275,7 +281,7 @@ Subscription subscription = stream.subscribe((EventReference atLeastUntil) -> {
 });
 
 // Initial catch-up: process all existing events
-for (Event<CustomerEvent> event : stream.query(EventQuery.matchAll(), startAfter)) {
+for (Event<CustomerEvent> event : stream.query(EventFilter.matchAll(), startAfter)) {
     processEvent(event);
     stream.placeBookmark(readerName, event.reference(), Tags.none());
 }
@@ -304,10 +310,10 @@ EventStream<OrderEvent> stream = eventstore.getEventStream(
 );
 
 // Retrieve bookmark
-Optional<EventReference> lastProcessed = stream.getBookmark(readerName);
+Optional<EventReference> lastProcessed = stream.findBookmark(readerName).flatMap(Bookmark::reference);
 
 // Query events after bookmark, 500 stored events at a time
-EventQuery query = EventQuery.matchAll().limit(500);
+EventQuery query = EventQuery.of(EventFilter.matchAll()).limit(500);
 EventReference after = lastProcessed.orElse(null);
 
 while (true) {
@@ -345,7 +351,7 @@ This hand-written loop is what a bookmarked [`Projector`](/posts/eventstore-proj
 // Bookmark persisted at position 1000
 
 // Server 2 takes over
-Optional<EventReference> bookmark = stream.getBookmark("order-fulfillment");
+Optional<EventReference> bookmark = stream.findBookmark("order-fulfillment").flatMap(Bookmark::reference);
 // Resumes from position 1000
 ```
 
@@ -360,7 +366,7 @@ int bookmarkEvery = 100; // Update bookmark every 100 events
 int processedCount = 0;
 EventReference lastEventRef = null;
 
-for (Event<OrderEvent> event : stream.query(EventQuery.matchAll().limit(1000), after)) {
+for (Event<OrderEvent> event : stream.query(EventQuery.of(EventFilter.matchAll()).limit(1000), after)) {
     processEventIdempotently(event); // Idempotent handler
     processedCount++;
     lastEventRef = event.reference();

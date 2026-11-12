@@ -450,7 +450,7 @@ A bookmark row holds two event ids: `event_id`, the last event the reader handle
 
 `event_id` is nullable too: a reader whose query selects event types that have not occurred yet records its [read position alone](/posts/eventstore-bookmarking/#two-positions-handled-and-read) — "read up to here, handled nothing yet" — and still resumes from the beginning. The check `ck_bookmarks_handled_or_read_position` keeps a row from naming neither. The foreign key is `MATCH SIMPLE`, PostgreSQL's default, so a null `event_id` is not checked and a present one still has to name a stored event. Placing a read position alone never clears the `event_id` a row already holds — the upsert keeps it with `COALESCE` — and the notification payload's `event*` fields are null for a row that names no handled event.
 
-**A bookmark stores event ids and nothing else about the events.** `getBookmark`, `findBookmark` and `getBookmarks` join the events row on its unique `event_id` index — one probe, and a second (`LEFT JOIN`) for the read position — to answer each position's transaction and position, and the bookmark trigger does the same for its notification payload. So a bookmark always reads back with the store's own coordinates for the event it names, and a bookmarks table copied between stores by id is valid as it stands.
+**A bookmark stores event ids and nothing else about the events.** `findBookmark` and `getBookmarks` (and the storage-level `getBookmark` behind a projector's resume point) join the events row on its unique `event_id` index — one probe, and a second (`LEFT JOIN`) for the read position — to answer each position's transaction and position, and the bookmark trigger does the same for its notification payload. So a bookmark always reads back with the store's own coordinates for the event it names, and a bookmarks table copied between stores by id is valid as it stands.
 
 Neither foreign key cascades, deliberately: an event deletion would otherwise silently remove the bookmarks of the readers still pointing into the deleted range — the lagging ones — and an absent bookmark means "replay from the beginning". With the default `NO ACTION`, deleting events out from under an outstanding bookmark fails loudly.
 
@@ -733,21 +733,21 @@ When a query would exceed this limit, an `EventStorageException` is thrown:
 ```java
 try {
     // Query that exceeds the limit
-    stream.query(EventQuery.matchAll());
+    stream.query(EventFilter.matchAll());
 } catch (EventStorageException e) {
     // Handle: "Query result exceeded absolute limit of 10000"
 }
 ```
 
 **Important**: This is an emergency brake, not a substitute for proper query design. Applications should:
-- Page through large result sets with `EventQuery.limit(n)`
+- Page through large result sets with `EventQuery.of(filter).limit(n)`
 - Design queries to stay well below the hard limit
 - Process results incrementally rather than loading everything into memory
 
 Example of proper batched querying:
 
 ```java
-EventQuery query = EventQuery.matchAll().limit(500);   // well below the hard limit
+EventQuery query = EventQuery.of(EventFilter.matchAll()).limit(500);   // well below the hard limit
 EventReference cursor = null;
 EventPage<CustomerEvent> page;
 do {

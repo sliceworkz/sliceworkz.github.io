@@ -267,7 +267,7 @@ Every event carries one `dek:` tag per distinct key its payload was sealed under
 SubjectErasureReport report = eventStore.erase("customer", "alice-42", ErasureReason.of("art.17 request #4711"));
 
 for ( KeyId key : report.shreddedKeys() ) {
-    stream.query(EventQuery.forTags(Tags.of(KeyId.TAG_KEY, key.value())))
+    stream.query(EventFilter.forTags(KeyId.TAG_KEY, key.value()))
           .forEach(…);
 }
 ```

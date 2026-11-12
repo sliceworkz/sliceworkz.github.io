@@ -32,7 +32,7 @@ Add the EventStore BOM to your project pom.xml to manage dependency versions:
 ```xml
 ...
 <properties>
-    <sliceworkz.eventstore.version>0.12.0</sliceworkz.eventstore.version>
+    <sliceworkz.eventstore.version>0.13.0</sliceworkz.eventstore.version>
 </properties>
 ...
 <dependencyManagement>
@@ -158,7 +158,7 @@ EventStore eventstore = InMemoryFsEventStorage.newBuilder()
     .buildStore();
 ```
 
-This stores events and bookmarks as human-readable JSON files on disk. Events are kept in memory for fast access and automatically reloaded on restart. The default directory is `eventstore-data`.
+This stores events and bookmarks as human-readable JSON files on disk. Events are kept in memory for fast access and automatically reloaded on restart. The default directory is `eventstore-data`. Each file is written whole — to a `.tmp` file beside it, then renamed into place — so a process stopped mid-write leaves no half-written event behind; the next start removes the stray `.tmp`, and a file that still cannot be read fails the load with an `EventStorageException` naming it.
 
 For production with PostgreSQL:
 
@@ -226,20 +226,20 @@ Of course, an EventStream can also be queried for the Events that are in it.
 Querying all events in the stream:
 
 ```java
-import org.sliceworkz.eventstore.query.EventQuery;
+import org.sliceworkz.eventstore.query.EventFilter;
 import java.util.List;
 
-List<Event<CustomerEvent>> allEvents = stream.query(EventQuery.matchAll());
+List<Event<CustomerEvent>> allEvents = stream.query(EventFilter.matchAll());
 allEvents.forEach(System.out::println);
 ```
 
-`query()` returns a `List`, read in full: storage has finished reading by the time it comes back. Bound a read over a large stream with `.limit(n)` — see [Querying Events](/posts/eventstore-querying-events/).
+`query()` returns a `List`, read in full: storage has finished reading by the time it comes back. Bound a read over a large stream with `EventQuery.of(filter).limit(n)` — see [Querying Events](/posts/eventstore-querying-events/).
 
 Query with filters, in this example only returning Events of a certain type:
 
 ```java
 List<Event<CustomerEvent>> registrations = stream.query(
-    EventQuery.forTypes(CustomerRegistered.class)
+    EventFilter.forTypes(CustomerRegistered.class)
 );
 ```
 
@@ -269,13 +269,17 @@ An immutable record containing the domain event data, tags, reference, timestamp
 
 Key-value pairs attached to events that enable dynamic querying across different event types. This is the foundation of <a href="https://dcb.events">Dynamic Consistency Boundary</a> approach.
 
+### EventFilter
+
+Says **which** events are relevant: event types, the tags a matching event must carry, and optionally the part of the history they are about (`after`/`until`). Build one fluently — `EventFilter.forTypes(CustomerEvent.class).tagged("customer", "123")`, where a sealed root stands for its whole hierarchy — or from its two halves with `EventFilter.of(types, tags)`. Unite filters with `or(...)`. A filter is what you query with, and what a consistency boundary checks.
+
 ### EventQuery
 
-Defines which events to retrieve from storage and how to traverse them. An `EventQuery` wraps an `EventFilter` (matching criteria: event types, tags, and an optional "until" reference) together with a direction (forward or backward) and an optional limit. Build one fluently — `EventQuery.forTypes(CustomerEvent.class).tagged("customer", "123")`, where a sealed root stands for its whole hierarchy — or from its two halves with `EventQuery.forEvents(types, tags)`.
+Says **how** a filter is read: `EventQuery.of(filter)` plus a direction (`backwards()`), a `limit(n)` and a read bound (`notAfter(reference)`). A plain forward read needs no query — `stream.query(filter)` does it.
 
 ### AppendCriteria
 
-Controls optimistic locking when appending events. Contains an `EventFilter` (the matching criteria extracted from an `EventQuery`) and an optional reference to the last known event. If new matching events exist after the reference, the append fails with `OptimisticLockingException`.
+Controls optimistic locking when appending events. Contains an `EventFilter` (which events are relevant to the decision) and an optional reference to the point the decision was based on. If new matching events exist after the reference, the append fails with `OptimisticLockingException`. Built from a query, it takes the query's filter only.
 
 
 ## Dynamic Consistency Boundary - Optimistic Locking with Tags
@@ -310,7 +314,7 @@ Retrieve events for a specific customer:
 import java.util.List;
 
 List<Event<CustomerEvent>> customer123Events = stream.query(
-    EventQuery.forTags(Tags.of("customer", "123"))
+    EventFilter.forTags("customer", "123")
 );
 ```
 
@@ -320,23 +324,25 @@ Ensure no new relevant events exist before appending:
 
 ```java
 import org.sliceworkz.eventstore.events.EventReference;
+import org.sliceworkz.eventstore.query.EventFilter;
+import org.sliceworkz.eventstore.query.EventQuery;
 import org.sliceworkz.eventstore.stream.AppendCriteria;
 import org.sliceworkz.eventstore.stream.OptimisticLockingException;
 import java.util.List;
 
-EventQuery customer123 = EventQuery.forTags(Tags.of("customer", "123"));
+EventFilter customer123 = EventFilter.forTags("customer", "123");
 
 // 1. Pin the boundary at the stream head, BEFORE reading.
 //    An absent head is an empty stream -- a valid boundary, so no special case is needed
 EventReference head = stream.head().orElse(null);
 
-// 2. Query the relevant facts, bounded at that head
-List<Event<CustomerEvent>> events = stream.query(customer123.until(head));
+// 2. Query the relevant facts, read up to that head
+List<Event<CustomerEvent>> events = stream.query(EventQuery.of(customer123).notAfter(head));
 
 // 3. Make business decision based on events
 // ... process events and decide to change name ...
 
-// 4. Append with optimistic lock: the query UNBOUNDED, the head as the expected last event
+// 4. Append with optimistic lock: the same filter, the head as the expected last event
 try {
     stream.append(
         AppendCriteria.of(customer123, head),
@@ -350,18 +356,18 @@ try {
 
 `head()` is the reference of the newest stored event in the stream, answered without reading it. Taking it *before* the read gives every read of the decision the same boundary, and gives the lock check a cursor at the stream head — which on PostgreSQL is markedly cheaper to check than the reference of the last relevant event.
 
-> **Hand `AppendCriteria` the query without its `until`.** `AppendCriteria.of(customer123.until(head), head)` — reusing the query the read used — deems nothing after the head relevant, so the check never finds a new fact and every append is admitted. Nothing fails to tell you: optimistic locking is simply off.
-{: .prompt-danger }
+> The read bound `notAfter(head)` belongs to the *read*, not to the filter. `AppendCriteria.of(query, head)` takes only the query's filter, so handing the append the very query you read with is just as correct as handing it the filter.
+{: .prompt-info }
 
 ### The DCB Pattern
 
 This pattern implements the <a href="https://dcb.events/specification">Dynamic Consistency Boundary specification</a>:
 
 1. **Pin** the boundary: take the stream's `head()` (or, for a single read, note the reference of the last relevant event)
-2. **Query** relevant events with an `EventQuery`, bounded with `until(head)`
+2. **Query** relevant events: an `EventFilter`, read with `EventQuery.of(filter).notAfter(head)`
 3. **Decide** based on the events retrieved
-4. **Append** new events with `AppendCriteria` containing the same query — without the `until` — and that reference
-5. If new events matching the query exist after the reference, the append **fails**
+4. **Append** new events with `AppendCriteria` containing the same filter and that reference
+5. If new events matching the filter exist after the reference, the append **fails**
 
 This ensures your business decisions are based on complete information and prevents conflicts.
 Any new Events that were appended to the Eventstore that wouldn't have influenced your decision are not blocking the append.
@@ -377,7 +383,7 @@ An example of subscribing to newly appended events:
 ```java
 import org.sliceworkz.eventstore.events.Event;
 import org.sliceworkz.eventstore.events.EventReference;
-import org.sliceworkz.eventstore.query.EventQuery;
+import org.sliceworkz.eventstore.query.EventFilter;
 import org.sliceworkz.eventstore.stream.EventSource;
 import org.sliceworkz.eventstore.stream.Subscription;
 import java.util.List;
@@ -392,7 +398,8 @@ AtomicReference<EventReference> lastSeen = new AtomicReference<>(everything.head
 // Subscribe to new appends. The listener is a functional interface:
 // it receives the reference appended to at least, and returns the one it reached.
 Subscription subscription = everything.subscribe(atLeastUntil -> {
-    List<Event<String>> newEvents = everything.query(EventQuery.matchAll(), lastSeen.get());
+    // what is new since the reference we hold: little, between two notifications
+    List<Event<String>> newEvents = everything.query(EventFilter.matchAll(), lastSeen.get());
 
     newEvents.forEach(e -> System.out.println(e.type() + " " + e.data()));
 
@@ -504,7 +511,7 @@ void testCustomerNameChange() {
     stream.append(Event.of(new CustomerRegistered("John"), Tags.none()));
     stream.append(Event.of(new CustomerNameChanged("Jane"), Tags.none()));
 
-    List<Event<CustomerEvent>> events = stream.query(EventQuery.matchAll());
+    List<Event<CustomerEvent>> events = stream.query(EventFilter.matchAll());
 
     assertEquals(2, events.size());
     assertEquals("Jane", ((CustomerNameChanged) events.get(1).data()).name());
@@ -517,7 +524,7 @@ See [Testing Your Application](/posts/eventstore-testing/) for the full fixture 
 
 - Read the [DCB Specification](https://dcb.events/specification/) to understand the theoretical foundation
 - Explore the `sliceworkz-eventstore-examples` module for more complex scenarios
-- Learn about [projections](/posts/eventstore-projecting-events/) and [point-in-time queries](/posts/eventstore-querying-events/#querying-until-a-certain-moment-in-time)
+- Learn about [projections](/posts/eventstore-projecting-events/) and [point-in-time queries](/posts/eventstore-querying-events/#bounding-a-read-notafter)
 - Consider implementing [event upcasting](/posts/eventstore-defining-events/#approach-2-upcasting) for schema evolution
 - Choose your [stream layout](/posts/eventstore-stream-design-and-performance/) with the measured trade-offs in hand
 - Report what the store does to your metrics or tracing library through an [observer](/posts/eventstore-observability-micrometer-prometheus-grafana/)

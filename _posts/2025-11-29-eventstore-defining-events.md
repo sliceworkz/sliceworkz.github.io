@@ -68,7 +68,7 @@ sealed interface OrderEvent {
 
 ### A Sealed Interface Names Its Whole Hierarchy
 
-A sealed interface is not only a compile-time convenience: in a type filter it stands for every event type under it. `EventTypesFilter.of(CustomerEvent.class)` — or `EventQuery.forTypes(CustomerEvent.class)` — is resolved, when the filter is built, into the records the interface permits, recursively, so the root names the whole hierarchy and a nested sealed interface names its own branch. Events are stored under the simple name of their record, never under an interface, which is why the resolution happens up front: the storage query, the lock check of an append and a projector's filtering then all agree on the same set of stored names.
+A sealed interface is not only a compile-time convenience: in a type filter it stands for every event type under it. `EventTypesFilter.of(CustomerEvent.class)` — or `EventFilter.forTypes(CustomerEvent.class)` — is resolved, when the filter is built, into the records the interface permits, recursively, so the root names the whole hierarchy and a nested sealed interface names its own branch. Events are stored under the simple name of their record, never under an interface, which is why the resolution happens up front: the storage query, the lock check of an append and a projector's filtering then all agree on the same set of stored names.
 
 A non-sealed interface is refused with `IllegalArgumentException`, since nothing says which types it stands for. A filter built from `EventType`s rather than classes is literal: `EventType.of(SomeInterface.class)` names a stored type no record has.
 
@@ -302,7 +302,7 @@ EventStream<CustomerEvent> stream = eventstore.getEventStream(
 );
 
 // Queries automatically upcast legacy events
-for (Event<CustomerEvent> event : stream.query(EventQuery.matchAll())) {
+for (Event<CustomerEvent> event : stream.query(EventFilter.matchAll())) {
     // All events are of type CustomerEvent
     CustomerEvent current = event.data();
 }

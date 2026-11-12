@@ -68,20 +68,15 @@ static class StockLevelProjection implements Projection<StockEvent> {
 
     @Override
     public EventQuery initQuery() {
-        // Find the last stock count (savepoint) for this product
-        return EventQuery.forEvents(
-            EventTypesFilter.of(StockCounted.class),
-            Tags.of("product", product)
-        ).backwards().limit(1);
+        // Find the last stock count (savepoint) for this product: newest first, one event
+        return EventQuery.of(EventFilter.forTypes(StockCounted.class).tagged("product", product))
+                         .backwards().limit(1);
     }
 
     @Override
-    public EventQuery eventQuery() {
+    public EventFilter eventFilter() {
         // Only process movements — savepoints are handled exclusively by initQuery
-        return EventQuery.forEvents(
-            EventTypesFilter.of(StockAdded.class, StockPicked.class),
-            Tags.of("product", product)
-        );
+        return EventFilter.forTypes(StockAdded.class, StockPicked.class).tagged("product", product);
     }
 
     @Override
@@ -103,7 +98,7 @@ static class StockLevelProjection implements Projection<StockEvent> {
 The key elements:
 
 - **`initQuery()`** returns a backward query with limit 1 — it finds the most recent `StockCounted` event for this product
-- **`eventQuery()`** returns the movements (`StockAdded`, `StockPicked`) — but **not** `StockCounted`
+- **`eventFilter()`** selects the movements (`StockAdded`, `StockPicked`) — but **not** `StockCounted`. It is read forward, which is what the default `eventQuery()` does with it, so there is no query to write
 - **`when()`** handles all three event types, since it receives events from both queries
 
 ## How the Projector Executes It
@@ -112,11 +107,11 @@ When the Projector runs a projection that has an `initQuery()`, the execution pr
 
 1. **Phase 1 — Initialization**: The `initQuery()` is executed. If a savepoint is found, it is passed to the `when()` handler to initialize state. The savepoint's event reference becomes the cursor position.
 
-2. **Phase 2 — Delta processing**: The `eventQuery()` is executed starting from the cursor position set by the initQuery. Only events after the savepoint are processed.
+2. **Phase 2 — Delta processing**: The main query — `eventFilter()` read forward — is executed starting from the cursor position set by the initQuery. Only events after the savepoint are processed.
 
 On subsequent runs of the same Projector instance, the initQuery is skipped — the projector already has a cursor position and continues from there.
 
-If the handler throws on the savepoint — a savepoint written by a buggy version, say — the run fails as a `ProjectorException` naming the savepoint event, and the cursor goes back to where the run started. The next run therefore re-runs `initQuery()` rather than starting the delta query from a projection that was never initialised. `initQuery()` returning `null` is tolerated and means the same as the default, `EventQuery.matchNone()`: no savepoint phase.
+If the handler throws on the savepoint — a savepoint written by a buggy version, say — the run fails as a `ProjectorException` naming the savepoint event, and the cursor goes back to where the run started. The next run therefore re-runs `initQuery()` rather than starting the delta query from a projection that was never initialised. `initQuery()` returning `null` is tolerated and means the same as the default, `EventQuery.of(EventFilter.matchNone())`: no savepoint phase.
 
 ## A Full Example
 
@@ -149,7 +144,7 @@ System.out.println("Stock level: " + projection.level());           // 115
 System.out.println("Events handled: " + metrics.eventsHandled());   // 5
 ```
 
-No savepoint exists yet, so the `initQuery()` returns nothing and the `eventQuery()` replays all five movements from the beginning. The pattern degrades gracefully — no special handling needed.
+No savepoint exists yet, so the `initQuery()` returns nothing and the main query replays all five movements from the beginning. The pattern degrades gracefully — no special handling needed.
 
 ### Append a savepoint
 
@@ -174,7 +169,7 @@ System.out.println("Events handled: " + metrics2.eventsHandled());      // 3
 System.out.println("Queries done: " + metrics2.queriesDone());          // 2
 ```
 
-This time the `initQuery()` finds the `StockCounted(115)` savepoint. The projection initializes with `level = 115`, then processes only the two movements after it. Three events handled total (1 savepoint + 2 movements), two queries done (1 initQuery + 1 eventQuery) — instead of replaying all eight events from the beginning.
+This time the `initQuery()` finds the `StockCounted(115)` savepoint. The projection initializes with `level = 115`, then processes only the two movements after it. Three events handled total (1 savepoint + 2 movements), two queries done (1 initQuery + 1 main query) — instead of replaying all eight events from the beginning.
 
 ### Fixing a bad savepoint
 
@@ -193,13 +188,13 @@ The `initQuery()` always finds the most recent savepoint. If a previous savepoin
 
 ## Design Decisions
 
-### Keep initQuery and eventQuery separate
+### Keep initQuery and eventFilter separate
 
-The `StockCounted` event type appears **only** in the `initQuery()`, not in the `eventQuery()`. This is intentional:
+The `StockCounted` event type appears **only** in the `initQuery()`, not in the `eventFilter()`. This is intentional:
 
 - The main query never processes savepoint events, which protects against buggy historical savepoints
-- There is no risk of double-processing a savepoint that happens to fall within the eventQuery range
-- Each query has a clear responsibility: initQuery initializes, eventQuery processes deltas
+- There is no risk of double-processing a savepoint that happens to fall within the main query's range
+- Each has a clear responsibility: initQuery initializes, eventFilter selects the deltas
 
 ### Savepoints are pure domain events
 
@@ -212,7 +207,31 @@ Savepoints are ordinary events appended to the stream with `stream.append()`. Th
 
 ### Graceful degradation
 
-When no savepoint exists — for example, on the very first run before any savepoint has been appended — the `initQuery()` returns nothing and the main `eventQuery()` replays from the beginning. No special configuration or fallback logic is needed.
+When no savepoint exists — for example, on the very first run before any savepoint has been appended — the `initQuery()` returns nothing and the main read replays from the beginning. No special configuration or fallback logic is needed.
+
+## Savepoints in a Decision
+
+The same shape works without a `Projector`, when a command reads its facts by hand. A savepoint is then a business bound on the filter: the movements recorded *after* the last count are relevant, nothing before it. Since 0.13 each item of a filter carries its own bounds, so that is one filter, and the read and the consistency check agree on it:
+
+```java
+EventReference head = stream.head().orElse(null);
+
+// the newest count, read up to the head
+Optional<Event<StockEvent>> lastCount = stream.query(
+        EventQuery.of(EventFilter.forTypes(StockCounted.class).tagged("product", product))
+                  .backwards().limit(1).notAfter(head))
+    .stream().findFirst();
+
+// the movements after it -- after(null) is no bound, so no count means every movement
+EventFilter movements = EventFilter.forTypes(StockAdded.class, StockPicked.class)
+                                   .tagged("product", product)
+                                   .after(lastCount.map(Event::reference).orElse(null));
+
+List<Event<StockEvent>> delta = stream.query(EventQuery.of(movements).notAfter(head));
+// ... decide on the count plus the delta, then append with AppendCriteria.of(movements, head)
+```
+
+The `after` bound costs the consistency check nothing: it lies before the head, so `AppendCriteria` drops it and checks for any movement after the head, as it should. A new `StockCounted` appended meanwhile does not invalidate the decision — add `StockCounted` to the checked filter with `.or(...)` if it should.
 
 ## Savepoints vs Bookmarking
 
