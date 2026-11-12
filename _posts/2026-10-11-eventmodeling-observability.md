@@ -68,9 +68,18 @@ The corollary: **nothing replays what a failing listener missed**. The event is 
 |---|---|
 | `BoundedContextStarting` | `start()` begins: the instance (logical, physical, process), the deployed and undeployed feature slices with their members, the aspects this instance runs, the declared rulebook, and every port binding with the slices that asked for it |
 | `BoundedContextStarted` | the context is usable; `startupDurationMicros` is the time spent in `start()` |
-| `BoundedContextStopping` / `BoundedContextStopped` | `stop()` or `terminate()`, before and after |
+| `BoundedContextStopping` / `BoundedContextStopped` | `stop()` or `terminate()`, before and after. `restartable` tells them apart: `true` for `stop()` — in code, or by an operator's `StopBoundedContext` — where the process lives on and a `BoundedContextStarting` may follow; `false` for `terminate()`, nothing of this context runs here again. An event stored before 0.9.0 reads `false`: back then only a termination reported anything |
 
 `BoundedContextStarting` is the inventory: it is the one place a dashboard learns what a deployment *carries* before any of it has done anything — a read model nothing has updated yet, a business rule never violated, a port never called.
+
+### The slice inventory
+
+Every `FeatureSlice` descriptor — on `BoundedContextStarting` and on each event attributed to a slice — carries its name, its `SliceType` (`STATE_CHANGE`, `STATE_VIEW`, `AUTOMATION`, `TRANSLATION`, ...) and its members. A `SliceMember` names the component, its kind and aspect and, for a read model, how it is projected and from which stream (`inbound` or `outbound` for one registered on `builder.inbound()`/`outbound()`, absent for the domain stream).
+
+Since 0.9.0 a member also says what it **reads**: the stored names of the event types it is fed, read at registration off a translator's, publisher's, dispatcher's or policy's `eventFilter()`, and off the filter of a read model registered as an instance. That lets a reader wire a context's members together before any of them has run — which dispatcher sends which outbound event, which translator takes which inbound one. `reads` is empty for a filter that matches nothing, and absent (`null`) where the types are not known: a filter with an item naming no type (match-all, or tags only), a live read model (only its class is known at registration), a command, an aggregate, an automation, and an event stored before the field existed. "Fed nothing" and "fed everything" never read the same.
+
+> **Coming from 0.8?** The read-only slice type `STATE_READ` is now `STATE_VIEW`, as Event Modeling calls it. A monitoring store holding events from before the rename cannot be read by a dashboard on 0.9.0: clear such a store — development and test history only — when upgrading.
+{: .prompt-warning }
 
 **Commands, and the reads they make**
 
@@ -161,6 +170,32 @@ The same store is the natural home for the management stream an operator uses to
 
 > In production the monitoring store must be **durable**, and its growth is yours to bound: the context appends an event per command, per projection round and per automation batch, forever. An in-memory monitoring store is for development only. Schedule a retention job, or roll to a fresh store periodically.
 {: .prompt-warning }
+
+### The instance heartbeat
+
+A process that is killed — `SIGKILL`, an OOM kill, a lost machine — never reports that it stopped, so a context that was idle would read as running for as long as the stream is kept. `StreamAppendingBoundedContextListener` therefore keeps a **heartbeat** per bounded context it reports on: not an event per beat, but a read-position bookmark at the head of the monitoring stream, refreshed every 30 seconds. That is one row per deployed copy of a context, whatever its age, and since it sits at the head it never shows as a reader falling behind.
+
+```java
+// the default: a beat every 30 seconds
+.listener(new StreamAppendingBoundedContextListener(reports))
+
+// another interval, or Duration.ZERO for none
+.listener(new StreamAppendingBoundedContextListener(reports, Duration.ofSeconds(10)))
+```
+
+- **Keyed on the deployed copy.** The reader name is `InstanceHeartbeat.reader(boundedContext, logical, physical)`; the process is a tag, so a restart under the same name takes the row over.
+- **Beating from `BoundedContextStarting` until a termination**, the starting phase included — a context projecting a long history is alive. A context taken out of service with `stop()` keeps its process up and keeps beating; `terminate()` removes the row, since the stop events already say what became of it.
+- **Judged by the reader.** A row left behind with an ageing timestamp is exactly a context that went away without saying so:
+
+```java
+Instant now = Instant.now();
+reports.getBookmarks().stream()
+    .map(InstanceHeartbeat::of).flatMap(Optional::stream)
+    .filter(beat -> beat.overdue(now))   // more than three intervals old, allowing for clock skew
+    .forEach(beat -> alert(beat.boundedContext(), beat.logical(), beat.physical(), beat.at()));
+```
+
+The timestamp is on the storage's clock (the database server's on PostgreSQL), so `Beat.age(now)` and `overdue(now)` allow for the skew of a reader on another machine. `InstanceHeartbeat.isHeartbeat(reader)` tells a heartbeat from a processor's bookmark in a listing of the store's readers.
 
 ### The Sliceworkz dashboard
 
@@ -323,20 +358,11 @@ Every event a bounded context appends — domain, inbound, outbound and the moni
 
 `Tracing` is the record behind these tags, and `Tracing.readFrom(event)` reads it back off a stored event. Tag matching is containment, so the extra tags change no query and no consistency boundary.
 
-### Handing a tracing to the work
+Build a tracing with a factory, which mints a fresh correlation id, and refine it with the copying methods: `correlationId(id)`, `actor(...)`, `channel(...)` and `agent(id, name)` return a copy with one field changed. Only the factories (`init`, `actorAndChannel`, `automation`, `kernel`) mint a correlation id; copying a tracing or reading one back from an event reproduces the id exactly, so a flow is never silently split.
 
-Every capability that writes or reads has an overload taking a `Tracing`. Build it with a factory, which mints a fresh correlation id, and refine it with the copying methods:
+### Saying who a call is for: `TracingScope`
 
-```java
-Tracing tracing = Tracing.actorAndChannel("bob@bank", "batch-import");
-app.execute(new OpenAccountCommand(CUSTOMER.newId()), tracing);
-```
-
-`correlationId(id)`, `actor(...)`, `channel(...)` and `agent(id, name)` return a copy with one field changed. Only the factories (`init`, `actorAndChannel`, `automation`, `kernel`) mint a correlation id; copying a tracing or reading one back from an event reproduces the id exactly, so a flow is never silently split. An overload called without a tracing gets one minted for it, so every flow has an id from its first event.
-
-### One request, one flow: `TracingScope`
-
-An HTTP request typically checks access through a port, reads a read model and executes a command or two. Passing a tracing to each call is easy to forget, and every forgotten one starts a flow of its own. Instead, bind the request's tracing to the thread where the request enters, once:
+No capability takes a tracing as an argument. A caller says who it acts for by **binding** a tracing to its thread, once, where the work enters the application — typically as an HTTP request is authenticated:
 
 ```java
 try ( TracingScope scope = TracingScope.bind(
@@ -346,9 +372,19 @@ try ( TracingScope scope = TracingScope.bind(
 }
 ```
 
-While it is bound, every capability called **without** a tracing on that thread uses it — `execute`, `read`, `evaluate`, `aggregate`, `event`, `incoming`, `translate` — and so does a call through a monitored port that has no component tracing of its own (a REST endpoint's membership check). An explicit tracing always wins. Take the correlation id from an incoming header where the caller sends one, and echo it in the response.
+While it is bound, every capability called on that thread uses it — `execute`, `read`, `evaluate`, `aggregate`, `event`, and `incoming`/`translate` on `context.inbound()` — and so does a call through a monitored port that has no component tracing of its own (a REST endpoint's membership check). With nothing bound, a call gets a tracing minted for it, so every flow has an id from its first event. Take the correlation id from an incoming header where the caller sends one, and echo it in the response.
 
-A scope belongs to its thread: `close()` restores what was bound before (scopes nest), is idempotent, and does nothing on another thread. Nothing is inherited by other threads — processor threads carry the tracing of the events they handle instead.
+Where there is no statement to put a `try` around — a tracing for one call in the middle of an expression — `TracingScope.call(tracing, () -> ...)` and `TracingScope.run(tracing, () -> ...)` bind it for that work and restore what was bound before, also when the work throws:
+
+```java
+AccountId opened = TracingScope.call(Tracing.actorAndChannel("bob@bank", "batch-import"),
+        () -> app.execute(new OpenAccountCommand(CUSTOMER.newId())).response());
+```
+
+A scope belongs to its thread: `close()` restores what was bound before (scopes nest), is idempotent, and does nothing on another thread. Nothing is inherited by other threads — processor threads carry the tracing of the events they handle instead, and a component's own context (an automation's, a translator's, a policy's) binds the tracing of what it handles around every call it forwards.
+
+> **Coming from 0.8?** Every overload taking a `Tracing` — `execute(command, tracing)`, `read(X.class, tracing, ...)`, `event(..., tracing)` and the rest — is gone. Bind the tracing with `TracingScope.bind(...)`, or `TracingScope.call(...)`/`run(...)` for a single call. A `read(X.class, tracing, id)` left over still compiles (its parameters are `Object...`), and is refused up front with a message saying to bind the tracing instead.
+{: .prompt-warning }
 
 ### Across processors
 
@@ -380,10 +416,10 @@ public synchronized void when ( Event<BankingDomainEvent> event ) {
 
 ```java
 @Override
-public Optional<EventReference> handle ( CustomerToWelcome item,
-                                         AutomationContext<BankingDomainEvent, BankingOutboundEvent> context ) {
+public Optional<EventReference> handle ( CustomerToWelcome item, AutomationContext<BankingDomainEvent> context ) {
     // the context's tracing already carries item.correlationId(): what this raises joins the flow
-    return context.execute(new WelcomeCustomerCommand(item.customerId()), "welcome/" + item.customerId().value());
+    return context.execute(new WelcomeCustomerCommand(item.customerId()),
+            Execution.idempotent("welcome/" + item.customerId().value()));
 }
 ```
 
@@ -397,8 +433,7 @@ An item that does not implement it keeps the batch's own tracing, whose correlat
 EventStore store = EventStore.on(storage).build();
 EventSource<String> everything = store.getRawEventStream(EventStreamId.anyContext());
 
-List<Event<String>> flow = everything.query(EventQuery.forEvents(EventTypesFilter.any(),
-        Tags.of(Tracing.TAG_CORRELATION_ID, "req-42")));
+List<Event<String>> flow = everything.query(EventFilter.forTags(Tracing.TAG_CORRELATION_ID, "req-42"));
 ```
 
 For the request above, that returned the two events the request appended and the one the automation raised for it:

@@ -12,7 +12,7 @@ Every event your domain records is *about* something: an account, a customer, a 
 
 ## Why Tags, and Why Entities
 
-The [Dynamic Consistency Boundary](/posts/aggregates-and-dcb/) model has no aggregates and no stream per entity: an event is stored once, in its context's stream, and carries **tags** saying what it is about. `account:acc-42` on an event says it concerns account `acc-42`. Reading "everything about account acc-42" is a [query on that tag](/posts/eventstore-querying-events/), and a command deciding on account `acc-42` locks on that same query. An event about two things — a transfer between two accounts, an account opened for a customer — simply carries both tags.
+The [Dynamic Consistency Boundary](/posts/aggregates-and-dcb/) model has no aggregates and no stream per entity: an event is stored once, in its context's stream, and carries **tags** saying what it is about. `account:acc-42` on an event says it concerns account `acc-42`. Reading "everything about account acc-42" is a [filter on that tag](/posts/eventstore-querying-events/), and a command deciding on account `acc-42` locks on that same filter. An event about two things — a transfer between two accounts, an account opened for a customer — simply carries both tags.
 
 A tag is a key and a value, both strings. Left at that, every command builds its tags by hand: `Tag.of("account", accountId)` in one place, `Tag.of("acount", ...)` in another, a customer id passed where an account id belonged. None of those fails to compile, and each surfaces as a query that finds nothing. An `Entity` gives the domain a vocabulary over tags that the compiler checks.
 
@@ -57,8 +57,7 @@ The entity is the only place ids of its kind are made:
 |---|---|---|
 | `ACCOUNT.newId()` | a fresh `AccountId`, a random UUID | minting the id of a new account, inside the command that creates it |
 | `ACCOUNT.id(String)` | an `AccountId` | a request parameter, a value read from elsewhere, a fixture in a test |
-| `ACCOUNT.tag(id)` | `Tag` `account:<id>` | combining with other tags in `Tags.of(...)` |
-| `ACCOUNT.tags(id)` | `Tags` holding that one tag | a query, or an append with a single tag |
+| `ACCOUNT.tag(id)` | `Tag` `account:<id>` | a filter (`forTags`/`tagged`), raising an event, or `Tags.of(...)` where a `Tags` is asked for |
 | `ACCOUNT.tag()` | `Tag` `account` — the bare key | a flag (below) |
 | `ACCOUNT.idIn(tags)` | `Optional<AccountId>` | reading the account an event is about back off its tags |
 | `ACCOUNT.idsIn(tags)` | `Set<AccountId>` | reading every account an event is about |
@@ -76,20 +75,25 @@ public AccountId execute ( CommandContext<BankingDomainEvent, BankingDomainEvent
 
     result.raiseEvent(
         new AccountOpened(accountId, customerId, LocalDate.now()),
-        Tags.of(ACCOUNT.tag(accountId), CUSTOMER.tag(customerId)));
+        ACCOUNT.tag(accountId), CUSTOMER.tag(customerId));
 
     return accountId;
 }
 ```
 
-A read model queries by the same tag:
+A read model selects by the same tag:
 
 ```java
 @Override
-public EventQuery eventQuery ( ) {
-    return EventQuery.forTags(ACCOUNT.tags(accountId));
+public EventFilter eventFilter ( ) {
+    return EventFilter.forTags(ACCOUNT.tag(accountId));
 }
 ```
+
+`raiseEvent(event, Tag...)` and the eventstore's `EventFilter.forTags(Tag...)` / `.tagged(Tag...)` take an entity's `Tag` as it is. `Tags.of(ACCOUNT.tag(id))` is left for what takes a `Tags` alone: an aggregate's identity, `raiseEvent` with an idempotency key, a provided event, the test bases.
+
+> **Coming from 0.8?** `Entity.tags(id)` is gone — it was `tag(id)` wrapped in a `Tags`. Write `ACCOUNT.tag(id)` where a `Tag...` is taken (`raiseEvent`, `forTags`, `tagged`), and `Tags.of(ACCOUNT.tag(id))` elsewhere.
+{: .prompt-warning }
 
 And an endpoint turns a path parameter into an id:
 
@@ -187,16 +191,16 @@ The name is what an event carries; the id type is a compile-time convenience of 
 
 Tag an event with every entity it is about. `AccountOpened` is about the account and about the customer, so it carries both — and that is what lets two very different decisions find it:
 
-- "Does account acc-42 exist?" queries `ACCOUNT.tags(accountId)`.
-- "How many accounts does customer cust-7 hold?" queries `CUSTOMER.tags(customerId)`.
+- "Does account acc-42 exist?" filters on `ACCOUNT.tag(accountId)`.
+- "How many accounts does customer cust-7 hold?" filters on `CUSTOMER.tag(customerId)`.
 
-That an event can belong to several such boundaries at once is the point of DCB, and the reason the type is called `Entity` and not `Aggregate`: an aggregate boundary is a single owner of its events, which is exactly what tags are not. See [Commands and Decision Models](/posts/eventmodeling-commands-and-decision-models/) for how a decision model's query becomes a command's consistency boundary.
+That an event can belong to several such boundaries at once is the point of DCB, and the reason the type is called `Entity` and not `Aggregate`: an aggregate boundary is a single owner of its events, which is exactly what tags are not. See [Commands and Decision Models](/posts/eventmodeling-commands-and-decision-models/) for how a decision model's filter becomes a command's consistency boundary.
 
 A *month*, a *period* or another time-based concept can be an entity too, when events are about it and decisions are made per instance of it. The repository's [`BankingDomainWithClosingTheBooks`](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-examples/src/main/java/org/sliceworkz/eventmodeling/examples/banking/BankingDomainWithClosingTheBooks.java) declares a `MONTH` entity with a `MonthId`, and a helper that turns a `YearMonth` into one so every tag spells it the same way.
 
 ## The Kernel's Own Tags
 
-Your entity tags are not the only tags on an event. The framework adds tracing tags to everything it appends, all with an `x-` prefix: `x-actor`, `x-channel`, `x-correlation-id`, `x-instance-logical` and friends, and, on events raised in reaction to another event, `x-caused-by`. They say who did what, in which flow, from which process. Matching is containment, so they never get in the way of a query or a boundary built on your entity tags. Do not choose entity names starting with `x-`. [Observability and Tracing](/posts/eventmodeling-observability/) covers what they carry and how to read them.
+Your entity tags are not the only tags on an event. The framework adds tracing tags to everything it appends, all with an `x-` prefix: `x-actor`, `x-channel`, `x-correlation-id`, `x-instance-logical` and friends, and, on events raised in reaction to another event, `x-caused-by`. They say who did what, in which flow, from which process. Matching is containment, so they never get in the way of a filter or a boundary built on your entity tags. Do not choose entity names starting with `x-`. [Observability and Tracing](/posts/eventmodeling-observability/) covers what they carry and how to read them.
 
 ## Testing with Unpredictable Ids
 
@@ -215,7 +219,7 @@ class OpenAccountCommandTest extends CommandTest<BankingDomainEvent, BankingInbo
         .when(new OpenAccountCommand(customer))
         .then()
             .event(new AccountOpened(ACCOUNT.id(IGNORE_ID()), customer, LocalDate.now()),
-                   CUSTOMER.tags(customer));
+                   Tags.of(CUSTOMER.tag(customer)));
     }
 }
 ```
@@ -239,7 +243,7 @@ The marker applies to the payload, not to tags: the tag assertion checks that th
 ## Summary
 
 - Declare an `Entity` per kind of thing your events are about, next to a one-line `EntityId` record: `Entity<AccountId> ACCOUNT = Entity.of("account", AccountId::new)`.
-- Mint with `newId()`, normalise with `id(String)`, tag with `tag(id)`/`tags(id)`, read back with `idIn`/`idsIn`.
+- Mint with `newId()`, normalise with `id(String)`, tag with `tag(id)`, read back with `idIn`/`idsIn`.
 - One id type per entity is what makes swapped arguments and mistyped tags compile errors.
 - Keep the id record lenient, with its component called `value`; put rules in the factory or the command.
 - The entity name is the tag key and is stored; so is the component name `value`. The record's class name is not.

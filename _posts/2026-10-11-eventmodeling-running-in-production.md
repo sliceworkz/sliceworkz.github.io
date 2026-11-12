@@ -97,8 +97,10 @@ Commands and live read models are not processors at all: they run on whichever i
 
 The storage class is a property of the read model — `ReadModel.storage()`, `EPHEMERAL` unless it says otherwise — because it follows from where the read model writes. That is also why "in-memory state projected on one leader only" cannot be configured: every other instance would answer from an empty model. See [Choosing a Read Model](/posts/eventmodeling-read-models/) and [Durable SQL Read Models](/posts/eventmodeling-sql-read-models/).
 
-> `start()` does not return until every `EPHEMERAL` read model has been projected completely, so they are usable right after it. `LOCAL` and `SHARED` read models resume from their bookmarks and catch up in the background. The wait has a safety timeout of 5 minutes, after which startup continues with a warning; change it with `-Dsliceworkz.eventmodeling.readmodel.ephemeral.projection.timeout.ms=...`.
+> `start()` does not return until every `EPHEMERAL` read model has been projected completely, so they are usable right after it. `LOCAL` and `SHARED` read models resume from their bookmarks and catch up in the background. The wait has a safety timeout of 5 minutes, after which startup continues with a warning; change it with `-Dsliceworkz.eventmodeling.readmodel.ephemeral.projection.timeout.ms=...`. To have the probes answer during that wait, start with `startInBackground()` — see [Starting in the background](#starting-in-the-background-probes-during-a-long-projection).
 {: .prompt-info }
+
+An automation never works a to-do list that is still catching up. Whenever it begins working — started, restarted, or promoted to leader — it reads the stream head once and runs no round until its to-do list's projector has read up to it, so an `EPHEMERAL` to-do list rebuilt at startup is not worked half-way, where an item resolved later in the history would be handled anyway.
 
 ## Leader Election
 
@@ -108,9 +110,9 @@ One elector per bounded context renews every lease the instance holds on a heart
 
 `start()` runs one election round before any processor's first pass, and `stop()` and `terminate()` release the leases held, so a standby takes over within a heartbeat rather than waiting out the time-to-live.
 
-### Priority and pacing
+### Distribution, priority and pacing
 
-Two builder settings tune it:
+Four builder settings tune it:
 
 ```java
 Banking banking = BoundedContext.newBuilder(Banking.class)
@@ -118,6 +120,8 @@ Banking banking = BoundedContext.newBuilder(Banking.class)
         .eventStorage(storage)
         .instance(instance)
         .leadershipPriority(10)
+        .leadershipDistribution(LeadershipDistribution.BALANCED)     // the default
+        .leadershipStartupHoldBack(Duration.ofSeconds(5))            // off by default
         .leadershipIntervals(Duration.ofSeconds(5), Duration.ofSeconds(20))
         // ...
         .build();
@@ -125,8 +129,19 @@ Banking banking = BoundedContext.newBuilder(Banking.class)
 
 | setting | default | meaning |
 |---|---|---|
-| `leadershipPriority(long)` | `0` | when a live contender with a **strictly higher** priority appears, the leader finishes its batch and hands the lease over — the way a preferred instance (the one in the primary zone, the bigger machine) regains leadership when it comes back. Equal priorities never preempt, which keeps a symmetric deployment stable |
+| `leadershipPriority(long)` | `0` | when a live contender with a **strictly higher** priority appears, the leader finishes its batch and hands the lease over — the way a preferred instance (the one in the primary zone, the bigger machine) regains leadership when it comes back. Under `BALANCED` it must fit in an `int`; `build()` refuses one outside that range |
+| `leadershipDistribution(...)` | `BALANCED` | who wins a lease among instances of **equal** priority — below |
+| `leadershipStartupHoldBack(Duration)` | zero | under `BALANCED`, how long a starting instance holds the leases it won before running their processors — below |
 | `leadershipIntervals(heartbeat, ttl)` | 5 s, 20 s | the leader renews every `heartbeat`; a lease not renewed within `ttl` expires and is taken over. `ttl` must be at least twice the heartbeat, so a single failed renewal does not cost leadership |
+
+**Spreading the work over the instances.** Under `LeadershipDistribution.BALANCED`, the default since 0.9.0, every lease goes to the instance that *weighs most* for it: a hash (SHA-256) of the instance's logical and physical name and the lease name. Each instance therefore leads about an equal share of the processors, every instance computes the same assignment without knowing how many others there are, nothing moves while the set of live instances is stable, and an instance that restarts under the same physical name wins back exactly the leases it had. It needs no storage support beyond the eventstore's existing step-down protocol: the configured priority goes into the high 32 bits of the priority each lease is requested with, and the weight into the low 32, so a configured priority still wins every lease. What it costs is a hand-over whenever an instance joins: it takes over the leases it weighs most for, about one in N, each after its holder finished its batch. An instance that yielded a lease because it kept failing withholds its weight until it holds that lease again, so a failing instance does not grab it back every `ttl`.
+
+`LeadershipDistribution.FIRST_COME` is the behaviour before 0.9.0: whoever asks first keeps a lease until it stops, fails or a higher priority appears, so the first instance up usually leads everything and the others stand by.
+
+> A balanced distribution is only stable across restarts when every instance has a [physical name of its own](#naming-an-instance). Without one the weight comes from the process id: the leases spread just as evenly, but anew on every restart.
+{: .prompt-tip }
+
+**Instances that start together.** Replicas started at the same moment each find every lease free, and whichever asks first wins it, whether or not it weighs most for it. `leadershipStartupHoldBack(...)` — one heartbeat is enough for replicas started together — holds a won lease without running its processor for that long, so a lease won by the wrong instance is handed to the right one before any work ran on it. It is off by default because it delays every start, a single developer's run included; an instance joining later is not helped by it, its leases move through an ordinary hand-over.
 
 `ttl` is what a crash costs: an instance that dies without releasing its leases holds the work off for up to that long. Nothing is lost in that pause — the work is in the event store and the to-do lists — it just waits. A graceful stop or a step-down hands over within a heartbeat or two.
 
@@ -321,10 +336,33 @@ report.checks();                                  // what the framework checked
 report.check(BoundedContextHealth.PROCESSOR_LAG); // Optional<HealthCheck>, by name
 ```
 
-`state()` is read locally and at once. `STARTING` is a state of its own because `start()` does not return
+`state()` is read locally and at once. `STARTING` is a state of its own because a start is not over
 until the in-memory read models have been projected, which on a long history takes minutes: the context is
 wired and its processors run, and it is not yet fit to serve a read. A readiness probe waits for
-`RUNNING`.
+`RUNNING`. While `STARTING`, the `inMemoryReadModels` check names the read models still projecting.
+
+#### Starting in the background: probes during a long projection
+
+`start()` blocks for that whole projection, so a process calling it before opening its HTTP server has no
+probe to answer — and an orchestrator that sees no startup or liveness answer restarts it, mid-projection,
+for ever. `startInBackground()` does everything `start()` does except wait for the in-memory read models:
+
+```java
+CompletableFuture<Void> started = banking.startInBackground();   // returns with state() STARTING
+
+app.get("/health/live",    ctx -> ctx.status(200));
+app.get("/health/started", ctx -> ctx.status(banking.state() != BoundedContextState.BUILT ? 200 : 503));
+app.get("/health/ready",   ctx -> { /* RUNNING and not DOWN, as below */ });
+app.start();                                                     // registered while projecting
+
+started.join();   // RUNNING, or cut short by stop()/terminate() -- read state() to tell which
+```
+
+Nothing the context runs acts on a read model still catching up: commands, policies and publishers read
+live models, and an automation waits for its to-do list. An eventually consistent read model read from
+*outside* — a request, a port — is partial until `RUNNING`, so an endpoint serving one answers 503 until
+then. `start()` called while a background start is under way waits for it; `startInBackground()` on a
+running context returns a completed future.
 
 `health()` puts the event storage's own report — its database, notification channels, visibility barrier
 and pools, see [Asking a Storage for Its Health](/posts/eventstore-observability-micrometer-prometheus-grafana/#asking-a-storage-for-its-health)
@@ -335,7 +373,7 @@ applies:
 | check | reports |
 |---|---|
 | `lifecycle` | `UP` while `RUNNING`, `DOWN` otherwise |
-| `inMemoryReadModels` | `DEGRADED` while a context that stopped waiting at the startup timeout still has in-memory read models catching up |
+| `inMemoryReadModels` | while `STARTING`, names the in-memory read models still projecting; `DEGRADED` while a context that stopped waiting at the startup timeout still has in-memory read models catching up |
 | `readModels`, `automations`, `translators`, `dispatchers`, `publishers`, `policies` | one per kind deployed here, judged while `RUNNING`: retired on a failure or retrying is `DEGRADED`, named in the message; stopped by an operator is counted and `UP` — it was asked for |
 | `processorLag` | the age of the oldest unread event per projector-driven processor running (and leading) here; `DEGRADED` beyond `processorLagTolerance` |
 | `leadership` | the leases contended and held; `DEGRADED` once the storage has left lease requests unanswered for longer than the ttl |
@@ -398,7 +436,7 @@ Hand each bounded context a stream of its own (open it per context, as above): `
 | `StopAutomation` / `StartAutomation` | `stopAutomation` / `restartAutomation` |
 | `StopProcessor` / `StartProcessor` | `stopProcessor` / `restartProcessor` |
 | `SkipStalledEvent` | `skipStalledEvent` |
-| `StopBoundedContext` / `StartBoundedContext` | `stop()` / `start()` of the context itself |
+| `StopBoundedContext` / `StartBoundedContext` | `stop()` / `start()` of the context itself; the stop is reported as `BoundedContextStopping`/`Stopped` with `restartable = true` |
 | `ReportStatus` | answers with an `InstanceStatusReported` carrying the same status lists |
 
 | `Target` | reaches |
@@ -451,7 +489,8 @@ Two consequences for sizing: count processors freely, and look for the load in w
 ## A Checklist
 
 - Build the storage, hand it to the context, and close it yourself after `terminate()` — then whatever you gave the storage.
-- Name every instance with a stable, distinct physical name.
+- Name every instance with a stable, distinct physical name — it keys `LOCAL` bookmarks and keeps a balanced lease distribution stable across restarts.
+- Start with `startInBackground()` and open the probes before the in-memory read models have caught up.
 - Put `EPHEMERAL` read models a request reads in `configureQuery`; `SHARED` ones in `configureProjection`; automations, policies, publishers and dispatchers in `configureAutomation`.
 - Derive idempotency keys from the item or the triggering event; make external receivers idempotent where they can be.
 - Register a listener writing to a durable monitoring store, and alert on `...Failed` and `...Stopped` events (see [Observability and Tracing](/posts/eventmodeling-observability/)).

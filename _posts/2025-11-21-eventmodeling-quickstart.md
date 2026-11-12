@@ -17,7 +17,7 @@ Every box on an event model has a home in the framework: a **command** raises **
 
 # Quickstart Guide
 
-We build a small banking context: open an account, deposit money into it, and read it back two ways — one read model projected on demand, one projected in the background. The guide uses version **0.8.0**.
+We build a small banking context: open an account, deposit money into it, and read it back two ways — one read model projected on demand, one projected in the background. The guide uses version **0.9.0**, built on Eventstore 0.13.0.
 
 
 ## Prerequisites
@@ -31,7 +31,7 @@ Sliceworkz EventModeling is available in <a href="https://mvnrepository.com/arti
 
 ```xml
 <properties>
-    <sliceworkz.eventmodeling.version>0.8.0</sliceworkz.eventmodeling.version>
+    <sliceworkz.eventmodeling.version>0.9.0</sliceworkz.eventmodeling.version>
 </properties>
 
 <dependencyManagement>
@@ -78,6 +78,9 @@ For production, use `sliceworkz-eventstore-infra-postgres` instead of the in-mem
 {: .prompt-info }
 
 The framework logs through SLF4J; add the binding of your choice (Logback, for instance) to see what it reports.
+
+> **Coming from 0.8?** 0.9.0 moves to Eventstore 0.13's split of filters and queries, and makes several API choices single values. The changes you will meet first: read models, decision models, todo lists, translators, publishers, policies and dispatchers declare `eventFilter()` instead of `eventQuery()`; `Entity.tags(id)` is gone in favour of `tag(id)`; `executeWithRetry(...)` and `execute(command, key)` become `execute(command, Execution...)`; a `Tracing` is bound with `TracingScope` instead of passed; `ApplicationCapabilities` and `Automation`'s context lose their outbound type parameter; translators, publishers and dispatchers are registered on `builder.inbound()` and `builder.outbound()`; and the `STATE_READ` slice type is `STATE_VIEW`. Each guide notes the changes in its own area.
+{: .prompt-warning }
 
 ## Step 2: Define the Domain
 
@@ -136,9 +139,8 @@ package com.example.banking;
 
 import org.sliceworkz.eventmodeling.boundedcontext.ApplicationCapabilities;
 import com.example.banking.BankingDomain.BankingDomainEvent;
-import com.example.banking.BankingDomain.BankingOutboundEvent;
 
-public interface BankingApi extends ApplicationCapabilities<BankingDomainEvent, BankingOutboundEvent> {
+public interface BankingApi extends ApplicationCapabilities<BankingDomainEvent> {
 }
 ```
 
@@ -157,7 +159,7 @@ public interface Banking
 
 **Key concepts:**
 - `Banking` groups the three event types into one type, so feature slices and the builder name `Banking` instead of three type arguments.
-- A built `Banking` can do everything: execute commands, erase personal data, stop automations, terminate itself. `BankingApi` carries only what application code needs — `execute`, `executeWithRetry`, `evaluate`, `read` and `aggregate` — and since `Banking` extends it, handing it out costs nothing but the reference type. See [Who May Do What](/posts/eventmodeling-who-may-do-what/).
+- A built `Banking` can do everything: execute commands, erase personal data, stop automations, terminate itself. `BankingApi` carries only what application code needs — `execute`, `evaluate`, `read` and `aggregate` — and since `Banking` extends it, handing it out costs nothing but the reference type. See [Who May Do What](/posts/eventmodeling-who-may-do-what/).
 
 ## Step 4: A State Change — Opening an Account
 
@@ -192,7 +194,6 @@ import java.time.LocalDate;
 
 import org.sliceworkz.eventmodeling.commands.CommandContext;
 import org.sliceworkz.eventmodeling.commands.CommandWithResult;
-import org.sliceworkz.eventstore.events.Tags;
 import com.example.banking.BankingDomain.AccountId;
 import com.example.banking.BankingDomain.BankingDomainEvent;
 import com.example.banking.BankingDomain.BankingDomainEvent.AccountOpened;
@@ -222,7 +223,7 @@ public class OpenAccountCommand implements CommandWithResult<BankingDomainEvent,
 
         result.raiseEvent(
             new AccountOpened(accountId, customerId, LocalDate.now()),
-            Tags.of(ACCOUNT.tag(accountId), CUSTOMER.tag(customerId)));
+            ACCOUNT.tag(accountId), CUSTOMER.tag(customerId));
 
         return accountId;   // handed to the caller once the event is stored
     }
@@ -230,11 +231,11 @@ public class OpenAccountCommand implements CommandWithResult<BankingDomainEvent,
 ```
 
 **Key concepts:**
-- `@FeatureSlice` marks the class for discovery. It carries only what the code cannot say — the `chapter` of the event model the slice sits in. The slice's name comes from the class name, its bounded context from `Slice<Banking>`, and its type (state change, state read, automation, translation) is derived from what it registers.
+- `@FeatureSlice` marks the class for discovery. It carries only what the code cannot say — the `chapter` of the event model the slice sits in. The slice's name comes from the class name, its bounded context from `Slice<Banking>`, and its type (state change, state view, automation, translation) is derived from what it registers.
 - `configureCommand` is where a slice registers its command-side components. `builder.command(...)` is declarative: commands are instantiated by the caller, and registering one makes it part of the slice's inventory from startup.
 - A command implements `Command<E>` (the caller gets the reference of the appended event) or `CommandWithResult<E, R>` (the caller also gets what `execute` returns, once the events are stored).
 - `noDecisionModels()` is the explicit statement that this command decides on nothing; it hands back the result to raise events on.
-- Every event is tagged with the entities it is about. Tags are how read models and decision models find events.
+- Every event is tagged with the entities it is about: `raiseEvent(event, Tag...)` takes the entities' tags directly. Tags are how read models and decision models find events.
 
 ## Step 5: A State Change with a Decision — Depositing Money
 
@@ -247,8 +248,7 @@ package com.example.banking.features.deposit;
 
 import org.sliceworkz.eventmodeling.commands.DecisionModel;
 import org.sliceworkz.eventstore.events.Event;
-import org.sliceworkz.eventstore.query.EventQuery;
-import org.sliceworkz.eventstore.query.EventTypesFilter;
+import org.sliceworkz.eventstore.query.EventFilter;
 import com.example.banking.BankingDomain.AccountId;
 import com.example.banking.BankingDomain.BankingDomainEvent;
 import com.example.banking.BankingDomain.BankingDomainEvent.AccountOpened;
@@ -265,8 +265,8 @@ public class AccountExistsDecisionModel implements DecisionModel<BankingDomainEv
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forEvents(EventTypesFilter.of(AccountOpened.class), ACCOUNT.tags(accountId));
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(AccountOpened.class).tagged(ACCOUNT.tag(accountId));
     }
 
     @Override
@@ -324,7 +324,7 @@ public class DepositCommand implements Command<BankingDomainEvent> {
         BusinessException.when(!account.exists(), "Account " + accountId.value() + " does not exist");
 
         // 3. raise
-        result.raiseEvent(new MoneyDeposited(accountId, amount), ACCOUNT.tags(accountId));
+        result.raiseEvent(new MoneyDeposited(accountId, amount), ACCOUNT.tag(accountId));
     }
 }
 ```
@@ -344,11 +344,12 @@ public class DepositFeatureSlice implements Slice<Banking> {
 
 **Key concepts:**
 - **Select, check, raise** is the shape of every command that decides.
-- `decisionModels(...)` projects the models *and* makes their queries the command's consistency boundary. The append is checked against it: if an event matching any of those queries is appended between the read and the append, the command fails with an `OptimisticLockingException` instead of deciding on stale facts. Re-executing re-reads and re-decides; `executeWithRetry` does that for you with a bounded number of attempts.
+- A decision model says which events it decides on with `eventFilter()` — an `EventFilter` of types and tags. It is read forward, which is what nearly every model wants.
+- `decisionModels(...)` projects the models *and* makes their filters the command's consistency boundary. The append is checked against it: if an event matching any of those filters is appended between the read and the append, the command fails with an `OptimisticLockingException` instead of deciding on stale facts. Re-executing re-reads and re-decides; `execute(command, Execution.retrying())` does that for you with a bounded number of attempts.
 - A rule history rejects is a `BusinessException`, not an `IllegalStateException`: the framework reports it as a rejection (`CommandRejected`), not as a failure, and the caller can tell the two apart.
 - Commands never decide on a read model. A read model read from a command sits outside the consistency boundary — see [Commands and Decision Models](/posts/eventmodeling-commands-and-decision-models/).
 
-## Step 6: A State Read — Account Details
+## Step 6: A State View — Account Details
 
 A read model answers a question out of events. This one is **live**: projected when it is read, so it is always current.
 
@@ -363,7 +364,7 @@ import java.util.Optional;
 
 import org.sliceworkz.eventmodeling.readmodels.ReadModel;
 import org.sliceworkz.eventstore.events.Event;
-import org.sliceworkz.eventstore.query.EventQuery;
+import org.sliceworkz.eventstore.query.EventFilter;
 import com.example.banking.BankingDomain.AccountId;
 import com.example.banking.BankingDomain.BankingDomainEvent;
 import com.example.banking.BankingDomain.BankingDomainEvent.AccountOpened;
@@ -381,9 +382,9 @@ public class AccountDetailsReadModel implements ReadModel<BankingDomainEvent> {
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
+    public EventFilter eventFilter ( ) {
         // every event about this one account, whatever its type
-        return EventQuery.forTags(ACCOUNT.tags(accountId));
+        return EventFilter.forTags(ACCOUNT.tag(accountId));
     }
 
     @Override
@@ -428,12 +429,12 @@ public class AccountDetailsFeatureSlice implements Slice<Banking> {
 ```
 
 **Key concepts:**
-- A read model implements `ReadModel<E>`: `eventQuery()` says which events it is projected from, and `when(Event<E>)` handles each one. The domain event is `event.data()`; its tags, timestamp and reference sit beside it on the `Event`.
+- A read model implements `ReadModel<E>`: `eventFilter()` says which events it is projected from, and `when(Event<E>)` handles each one. The domain event is `event.data()`; its tags, timestamp and reference sit beside it on the `Event`.
 - A live read model is registered **by class**, and constructed per read with the arguments the read passes (`read(AccountDetailsReadModel.class, accountId)`).
 - Every registration says how the read model is projected — `.live()` or `.eventuallyConsistent()`. `build()` rejects one that does not.
 - A live read model is right whenever the events it replays are bounded by design, as here: one account's events. See [Choosing a Read Model](/posts/eventmodeling-read-models/) for what to do when they are not.
 
-## Step 7: A State Read in the Background — Account Overview
+## Step 7: A State View in the Background — Account Overview
 
 A list of every account spans all accounts, so replaying it per read would get slower forever. It is projected once, in the background, and reads become free. That makes it **eventually consistent**: it lags the latest events by a moment.
 
@@ -449,7 +450,7 @@ import java.util.Set;
 
 import org.sliceworkz.eventmodeling.readmodels.PublishingReadModel;
 import org.sliceworkz.eventstore.events.Event;
-import org.sliceworkz.eventstore.query.EventQuery;
+import org.sliceworkz.eventstore.query.EventFilter;
 import com.example.banking.BankingDomain.BankingDomainEvent;
 import com.example.banking.BankingDomain.BankingDomainEvent.AccountOpened;
 
@@ -460,8 +461,8 @@ public class AccountOverviewReadModel
     public static final AccountOverviewReadModel INSTANCE = new AccountOverviewReadModel();
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forTypes(AccountOpened.class);
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(AccountOpened.class);
     }
 
     @Override
@@ -566,7 +567,8 @@ public class BankingApplication {
         System.out.println("Details: " + details.getAccountDetails().orElseThrow());
 
         // 6. an eventually consistent read model answers with the position it reflects
-        ReadModelResult<Set<AccountSummary>> overview = AccountOverviewReadModel.INSTANCE.published();
+        //    read(X.class) without parameters answers the registered instance
+        ReadModelResult<Set<AccountSummary>> overview = app.read(AccountOverviewReadModel.class).published();
         boolean includesOurAccount = overview.upTo() != null
             && !openedAt.happenedAfter(overview.upTo());
         System.out.println("Overview: " + overview.data() + " (includes our account: " + includesOurAccount + ")");
@@ -582,6 +584,7 @@ public class BankingApplication {
 - `BoundedContext.newBuilder(Banking.class)` resolves the three event types from the interface. `name` names the context (and the streams it keeps its events in), `instance` identifies this deployment, and `features().rootPackage(...)` scans for feature slices declared for `Banking`.
 - `build()` assembles the context and checks every registration — a read model without a projection mode, a component of another context's event types, two components sharing a name. `start()` runs it.
 - `read(AccountDetailsReadModel.class, accountId)` is typed by the class it asks for: no cast.
+- `read(AccountOverviewReadModel.class)` with no parameters answers the instance an eventually consistent read model was registered with, so a caller needs no static reference to it — and the slices of a context can share one read model that one of them registers.
 - `published()` hands back the state and the position it reflects as one observation, so a caller can check whether its own write is included instead of guessing.
 - The context closes the event store it built; the storage came from you, so you close it, after the context.
 
@@ -640,7 +643,7 @@ class DepositCommandTest extends CommandTest<BankingDomainEvent, BankingInboundE
             .event(new AccountOpened(account, customer, LocalDate.now()), Tags.of(ACCOUNT.tag(account), CUSTOMER.tag(customer)))
         .when(new DepositCommand(account, new BigDecimal("100")))
         .then()
-            .event(new MoneyDeposited(account, new BigDecimal("100")), ACCOUNT.tags(account));
+            .event(new MoneyDeposited(account, new BigDecimal("100")), Tags.of(ACCOUNT.tag(account)));
     }
 
     @Test
