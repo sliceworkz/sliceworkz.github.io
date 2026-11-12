@@ -42,7 +42,7 @@ public interface BankingDomain {
     }
 }
 
-public interface BankingApi extends ApplicationCapabilities<BankingDomainEvent, BankingOutboundEvent> { }
+public interface BankingApi extends ApplicationCapabilities<BankingDomainEvent> { }
 
 public interface Banking extends BoundedContext<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent>, BankingApi { }
 ```
@@ -52,7 +52,7 @@ The three type parameters are the three kinds of event a context deals with:
 | Type | Role | Written by |
 |---|---|---|
 | **Domain events** (`D`) | The facts this context records about its own domain | Commands, aggregates, automations, policies, translators |
-| **Inbound events** (`I`) | Integration events received from other systems | The inbound edge (`incoming(...)`), turned into domain events by translators |
+| **Inbound events** (`I`) | Integration events received from other systems | The inbound edge (`context.inbound().incoming(...)`), turned into domain events by translators |
 | **Outbound events** (`O`) | Integration events this context publishes | Publishers only, sent on by dispatchers |
 
 Each root is a sealed interface of records — see [Defining Events](/posts/eventstore-defining-events/) for why, and for how a record's simple name becomes its stored type name. The `Entity` declarations are covered in [Entities, Typed Ids and Tags](/posts/eventmodeling-entities-and-tags/), and `BankingApi` — the narrow surface application code holds instead of `Banking` — in [Who May Do What](/posts/eventmodeling-who-may-do-what/).
@@ -86,8 +86,9 @@ banking.start();
 | `listener(...)` | no | Receives every `BoundedContextEvent` the kernel produces. `LoggingBoundedContextListener` logs them; `StreamAppendingBoundedContextListener` appends them to a stream for a dashboard. See [Observability and Tracing](/posts/eventmodeling-observability/) |
 | `adapter(x).forPort(T.class)` | no | Binds an adapter to a port a slice asks for. See [Ports, Adapters and Monitored Calls](/posts/eventmodeling-ports-and-adapters/) |
 | `features()` | no | The feature-slice sub-builder: where to scan, which slices, which aspects. Closed with `done()` |
+| `inbound()` / `outbound()` | no | The sub-builders of the inbound and outbound streams: translators, publishers, dispatchers, read models over those streams, and their legacy event types. Closed with `done()` |
 
-`build()` throws an `IllegalArgumentException` when `name` or `instance` is missing. The builder carries more settings — `observer(...)`, `shredding(...)`, `businessRules(...)`, `leadershipPriority(...)`, `management(...)` — which the guides on [observability](/posts/eventmodeling-observability/), [personal data](/posts/eventmodeling-personal-data/), [business rules](/posts/eventmodeling-business-rules/) and [running in production](/posts/eventmodeling-running-in-production/) cover.
+`build()` throws an `IllegalArgumentException` when `name` or `instance` is missing. The builder carries more settings — `observer(...)`, `shredding(...)`, `businessRules(...)`, `leadershipPriority(...)`, `leadershipDistribution(...)`, `leadershipStartupHoldBack(...)`, `management(...)` — which the guides on [observability](/posts/eventmodeling-observability/), [personal data](/posts/eventmodeling-personal-data/), [business rules](/posts/eventmodeling-business-rules/) and [running in production](/posts/eventmodeling-running-in-production/) cover.
 
 ### The Instance
 
@@ -101,7 +102,7 @@ Every event the context appends carries them as `x-instance-*` tags, and process
 
 ### Registering Directly on the Builder
 
-Every component a slice registers can also be registered straight on the builder — `builder.readmodel(...)`, `.automation(...)`, `.translator(...)` and so on. That is useful for a small test or a context with a handful of parts. For an application, register them from feature slices: a slice keeps a component next to the code that wires it, and it is what lets a deployment run only some of its parts.
+Every component a slice registers can also be registered straight on the builder — `builder.readmodel(...)`, `.automation(...)`, `.policy(...)`, and on its two edges `builder.inbound().translator(...)` and `builder.outbound().publisher(...)` / `.dispatcher(...)`. That is useful for a small test or a context with a handful of parts. For an application, register them from feature slices: a slice keeps a component next to the code that wires it, and it is what lets a deployment run only some of its parts.
 
 ## Feature Slices
 
@@ -133,7 +134,7 @@ The builder's `features().rootPackage(...)` scans that package and its subpackag
 
 - **Its name** is the class's simple name without the `FeatureSlice` suffix (`AccountDetails`), from `Slice.name()`.
 - **Its bounded context** is the `C` of `Slice<C>`.
-- **Its type** — state change, state read, automation, translation — is derived from what it registers (below).
+- **Its type** — state change, state view, automation, translation — is derived from what it registers (below).
 
 A value repeated in an annotation is one nobody checks against the code, and it agrees with the code only until the first refactoring. So the annotation holds the chapter, and nothing that could drift.
 
@@ -152,7 +153,7 @@ A slice has four **aspects**, and two hooks per aspect:
 |---|---|---|---|
 | `COMMAND` | `configureCommand(builder)` | `startCommand(context)` | Commands (`builder.command(...)`), aggregates, and the endpoints that execute them |
 | `QUERY` | `configureQuery(builder)` | `startQuery(context)` | Live read models, in-memory eventually consistent read models, query objects, and the endpoints that read them |
-| `AUTOMATION` | `configureAutomation(builder)` | `startAutomation(context)` | Automations and their todo lists, policies, publishers, translators and dispatchers |
+| `AUTOMATION` | `configureAutomation(builder)` | `startAutomation(context)` | Automations and their todo lists, policies, and the edges: translators (`builder.inbound()`), publishers and dispatchers (`builder.outbound()`) |
 | `PROJECTION` | `configureProjection(builder)` | `startProjection(context)` | The projectors of durable, shared read models (an SQL read model's projector) |
 
 The two kinds of hook do different work:
@@ -180,7 +181,7 @@ public void configureQuery ( BoundedContextBuilder<Projects> builder ) {
 }
 ```
 
-An eventually consistent read model held **in memory** — a `PublishingReadModel` like the quickstart's account overview — is different: its state lives in the process that projects it, so it has to be registered where it is read, from `configureQuery`. See [Choosing a Read Model](/posts/eventmodeling-read-models/) and [Durable SQL Read Models](/posts/eventmodeling-sql-read-models/).
+An eventually consistent read model held **in memory** — a `PublishingReadModel` like the quickstart's account overview — is different: its state lives in the process that projects it, so it has to be registered where it is read, from `configureQuery`. It is read by its class, `read(AccountOverviewReadModel.class)` with no parameters, so the slices of a context can share one such read model that one of them registers. One instance registered from two aspects of a slice (`configureCommand` and `configureQuery`) is one read model with one projector. See [Choosing a Read Model](/posts/eventmodeling-read-models/) and [Durable SQL Read Models](/posts/eventmodeling-sql-read-models/).
 
 ### Where Components Must Be Registered
 
@@ -223,11 +224,13 @@ The framework works out which Event Modeling pattern a slice is (`SliceType`) fr
 | Registered | Type |
 |---|---|
 | a command or an aggregate | `STATE_CHANGE` |
-| read models only | `STATE_READ` |
+| read models only | `STATE_VIEW` |
 | an automation and its todo list, a policy, a command beside a read model, or only a publisher | `AUTOMATION` |
 | a translator | `TRANSLATION` |
 | parts of more than one pattern | `UNCLEAR` |
 | nothing | `UNDEFINED` |
+
+The read-only slice is a *state view*, as Event Modeling calls it.
 
 The rule is the one the Sliceworkz Modeler applies to a modeled slice, so a slice in the code and the same slice in the model come out as the same type. Three consequences:
 
@@ -235,7 +238,7 @@ The rule is the one the Sliceworkz Modeler applies to a modeled slice, so a slic
 - **A command beside a read model is an automation**, exactly as in the model: the read model is read as the todo list the command is issued from. A command and the live read model its screen shows are two slices in Event Modeling — split them, and both types come out right.
 - **Only what is deployed is registered.** A slice is configured only for the aspects its instance runs, so the type reported by an instance is the type of what that instance deployed of the slice.
 
-The type is reported on `BoundedContextStarting` and on every kernel event attributed to the slice, together with its name, chapter and members.
+The type is reported on `BoundedContextStarting` and on every kernel event attributed to the slice, together with its name, chapter and members. Each member also says which event types it reads — see [Observability and Tracing](/posts/eventmodeling-observability/#the-slice-inventory).
 
 ## Feature Package Layout
 
@@ -319,7 +322,8 @@ A slice that the filter leaves out is still instantiated and reported as *undepl
 | Mistake | Message (abridged) | What would happen otherwise |
 |---|---|---|
 | A read model registered without `.live()` or `.eventuallyConsistent()` | `readmodel registered without saying how it is projected: Overview` | Nobody decided whether the read model is current or lags; every caller lives with that difference |
-| A component declared over another context's event types | `component registered over another bounded context's event types: readmodel PaymentsReadModel (its domain event type is ...PaymentEvent, where this context's is ...BankingDomainEvent)` | Its query names types that never occur on this stream, so it stays empty for good |
+| An eventually consistent read model or todo list whose `eventQuery()` reads backwards, is limited, carries a `notAfter`, or which declares an `initQuery()` | names the read model | Its projector reads forward from a bookmark, so it would project something other than what it declares |
+| A component declared over another context's event types | `component registered over another bounded context's event types: readmodel PaymentsReadModel (its domain event type is ...PaymentEvent, where this context's is ...BankingDomainEvent)` | Its filter names types that never occur on this stream, so it stays empty for good |
 | A live read model class that is abstract or has no reachable constructor | names the class | Every read of it fails |
 | An automation whose todo list is not projected on this instance | `automation registered without a projector for its todo list on this instance: ...` | The automation waits forever on a bookmark nobody writes |
 | A publisher or a policy registered from a hook other than `configureAutomation` | `... registered outside the automation aspect: ...` | It runs on the wrong instances |
@@ -352,14 +356,28 @@ When `build()` throws, you get no context back, so you could not release what it
 4. It **waits until every `EPHEMERAL` read model has been projected completely**, so an in-memory read model is usable as soon as `start()` returns. Durable read models catch up in the background from their bookmarks. The wait has a safety timeout of five minutes (`-Dsliceworkz.eventmodeling.readmodel.ephemeral.projection.timeout.ms=...`), after which startup continues with a warning.
 5. It reports `BoundedContextStarted`, with the startup duration.
 
-A second `start()` on a started context is ignored with a warning.
+A `start()` on a running context is ignored with a warning; one called while a background start is under way waits for that start.
+
+**An automation never works a todo list that is still catching up.** Whenever an automation begins working — started, restarted, or promoted to leader — it reads the stream head once and runs no round until its todo list's projector has read up to it. An `EPHEMERAL` todo list rebuilt at startup is therefore never worked half-way through its catch-up, where an item resolved later in the history would be handled anyway.
+
+### Starting in the Background
+
+A context over a long history can take a while to project its in-memory read models, and a process whose probes do not answer meanwhile gets restarted by its orchestrator. `startInBackground()` does everything `start()` does except wait for those read models:
+
+```java
+CompletableFuture<Void> started = banking.startInBackground();   // returns with the context STARTING
+routes.start();                                                  // probes answer while it projects
+started.join();                                                  // RUNNING, or cut short by stop()/terminate()
+```
+
+The future completes once the context is `RUNNING`, or once a `stop()` or `terminate()` cut the start short — read `state()` to tell which. Nothing the context runs acts on a read model still catching up: commands, policies and publishers read live models, and an automation waits for its todo list as above. An eventually consistent read model read from *outside* — a request, a port — is partial until `RUNNING`, so an endpoint serving one should answer 503 until then. See [Running in Production](/posts/eventmodeling-running-in-production/).
 
 ## Stopping and Terminating
 
 | Call | What it does | Can it start again? |
 |---|---|---|
-| `stop()` | Stops the processors and hands back the leases this instance holds, so another instance takes over | Yes, `start()` again |
-| `terminate()` | Stops everything, drains the processor threads, releases the leases and **closes the `EventStore` the context built** | No: `start()` on a terminated context throws `IllegalStateException` |
+| `stop()` | Stops the processors and hands back the leases this instance holds, so another instance takes over. Reported as `BoundedContextStopping`/`BoundedContextStopped` with `restartable = true` | Yes, `start()` again |
+| `terminate()` | Stops everything, drains the processor threads, releases the leases and **closes the `EventStore` the context built**. Reported with `restartable = false` | No: `start()` on a terminated context throws `IllegalStateException` |
 
 Ownership decides who closes what:
 
@@ -386,7 +404,7 @@ A context writes to three streams, named after it:
 | Stream | Id for the context `banking` | Holds |
 |---|---|---|
 | `BoundedContextStreams.domain("banking")` | `banking#domain` | Domain events |
-| `BoundedContextStreams.inbound("banking")` | `banking#inbound` | Inbound events received through `incoming(...)` |
+| `BoundedContextStreams.inbound("banking")` | `banking#inbound` | Inbound events received through `inbound().incoming(...)` |
 | `BoundedContextStreams.outbound("banking")` | `banking#outbound` | Outbound events written by publishers |
 
 That layout is wire format: a dashboard, a test asserting on what a command appended, or a migration script finds the events there, usually from another process that holds no built context — which is why it is a public function of the context's name. It also means **the context name is stored data**: renaming a context sends every new event to new streams and leaves the old ones behind.
@@ -396,7 +414,7 @@ That layout is wire format: a dashboard, a test asserting on what a command appe
 | You want to... | Use |
 |---|---|
 | decide | a command, or an aggregate |
-| read | a read model |
+| read | a read model — over the domain stream, or registered on `builder.inbound()`/`outbound()` to read what came in or went out |
 | react to what happened | an automation and its todo list, or a policy |
 | take in what other systems say | a translator |
 | tell other systems | a publisher and a dispatcher |
@@ -409,9 +427,11 @@ A hand-rolled subscription on a raw stream gives all of that up: it misses whate
 - Declare a context as an interface extending `BoundedContext<D,I,O>` over three sealed event roots, and build it with `BoundedContext.newBuilder(...)`: `name`, `eventStorage` and `instance` are required.
 - A feature slice is `@FeatureSlice(chapter = ...)` on a class implementing `Slice<C>`. Its name, context and type are read off the code.
 - `configure...` hooks register components during `build()`; `start...` hooks wire endpoints during `start()`. One pair per aspect: command, query, automation, projection.
+- Translators are registered on `builder.inbound()`, publishers and dispatchers on `builder.outbound()`.
 - Publishers and policies go in `configureAutomation`, and an automation's todo list is registered next to it.
 - `features()` selects slices with `filter(...)` and aspects with `disableX()`, which is how one context is split over front and batch processes.
 - `build()` rejects, naming every offender, what would otherwise fail silently: a read model without a mode, a component of another context, an unprojected todo list, an anonymous or duplicate component name.
+- `startInBackground()` lets a process answer its probes while a long history is projected.
 - `terminate()` closes the store the context built; the storage is yours to close afterwards.
 - `BoundedContextStreams` says where a context's events live, for tooling. Application code reaches its events only through commands, read models and processors.
 

@@ -128,14 +128,14 @@ ImportReport q1 = EventStoreImporter.from(live).to(cold)
 
 // every event carrying a tag, of the given types
 ImportReport period = EventStoreImporter.from(live).to(cold)
-    .matching(EventFilter.forTags(Tags.of("period", "2024Q1")))
+    .matching(EventFilter.forTags("period", "2024Q1"))
     .run();
 ```
 
 That is what makes the importer an archiving tool. On PostgreSQL a run over one closed period costs what that period's events cost, answered from the stream and tag indexes, not a walk over the table. The alternative — dropping unwanted events in `transform` — reads the whole source to discard most of it: fine against the in-memory store, a full pass over the table in production. The two compose, and the transformation only sees what the selection read.
 
-- **Types are matched by stored name**, since nothing is upcast on this path: select a legacy type by its legacy name, with `EventTypesFilter.of(Set.of(EventType.named("CustomerRegistered")))`.
-- **A filter carrying its own `until`** bounds the run there when it is earlier than the source head, and `ImportReport.sourceTo()` then names that boundary, so a later `.after(report.sourceTo())` continues correctly.
+- **Types are matched by stored name**, since nothing is upcast on this path: select a legacy type by its legacy name, with `EventFilter.forTypes(EventType.named("CustomerRegistered"))`.
+- **The filter's item bounds are applied by the storage too**, so a filter `until` the close of a period — `EventFilter.forTags("period", "2024Q1").until(quarterClosed)` — selects that period's events. The run itself is always bounded at the source head, which `ImportReport.sourceTo()` reports, so a later `.after(report.sourceTo())` continues correctly.
 - **Selecting does not touch the source.** An archive is a copy. Removing the copied range from the live store is a separate, deliberate operator act — and the bookmarks foreign key makes it fail loudly for a reader still pointing into that range.
 
 ## Transforming Events on the Way Through

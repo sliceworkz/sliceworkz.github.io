@@ -29,8 +29,8 @@ But another option is to put all events in one stream, use the `Tag` concept to 
 - **EventStreamId**: To separate different aggregate types (e.g., `EventStreamId.forContext("students")`)
 
 ```java
-// Query all events for aggregate instance "123"
-EventQuery query = EventQuery.forTags(Tags.of("student", "123"));
+// All events for aggregate instance "123"
+EventFilter student123 = EventFilter.forTags("student", "123");
 ```
 
 The aggregates below share one stream, `EventStreamId.forContext("learning")`, and each opens it typed at its own root. A handle is cheap and shares its serializer, and a stream typed at `StudentDomainEvent` answers events of that root, so the aggregate's handler takes the events as they are — no casting anywhere:
@@ -129,21 +129,21 @@ class Student implements EventHandler<StudentDomainEvent> {
 // The one description of a student's relevant facts, used by the read AND by the boundary of
 // the append. Written out twice, the two drift the moment someone widens only the read: the
 // consistency boundary then silently narrows, and nothing catches it
-EventQuery studentQuery(String studentId) {
-    return EventQuery.forTypes(StudentDomainEvent.class).tagged("student", studentId);
+EventFilter studentFacts(String studentId) {
+    return EventFilter.forTypes(StudentDomainEvent.class).tagged("student", studentId);
 }
 
 // Load aggregate from events. The sealed interface stands for every event type under it
 Student loadStudent(String studentId) {
     Student student = new Student(studentId);
-    students.query(studentQuery(studentId)).forEach(student::when);
+    students.query(studentFacts(studentId)).forEach(student::when);
     return student;
 }
 
 // Save events with optimistic locking
 void saveStudent(Student student, List<StudentDomainEvent> events) {
     students.append(
-        AppendCriteria.of(studentQuery(student.studentId), student.lastEventReference()),
+        AppendCriteria.of(studentFacts(student.studentId), student.lastEventReference()),
         events.stream()
             .map(e -> Event.of(e, Tags.of("student", student.studentId)))
             .toList()
@@ -235,21 +235,21 @@ class Course implements EventHandler<CourseDomainEvent> {
 **Loading and saving**:
 
 ```java
-EventQuery courseQuery(String courseId) {
-    return EventQuery.forTypes(CourseDomainEvent.class).tagged("course", courseId);
+EventFilter courseFacts(String courseId) {
+    return EventFilter.forTypes(CourseDomainEvent.class).tagged("course", courseId);
 }
 
 // Load aggregate from events
 Course loadCourse(String courseId) {
     Course course = new Course(courseId);
-    courses.query(courseQuery(courseId)).forEach(course::when);
+    courses.query(courseFacts(courseId)).forEach(course::when);
     return course;
 }
 
 // Save events with optimistic locking
 void saveCourse(Course course, List<CourseDomainEvent> events) {
     courses.append(
-        AppendCriteria.of(courseQuery(course.courseId), course.lastEventReference()),
+        AppendCriteria.of(courseFacts(course.courseId), course.lastEventReference()),
         events.stream()
             .map(e -> Event.of(e, Tags.of("course", course.courseId)))
             .toList()
@@ -356,15 +356,15 @@ class RegistrationDecisionModel implements EventHandler<LearningDomainEvent> {
 		this.courseId = courseId;
 	}
 
-	public EventQuery getEventQuery ( ) {
-		// this query will deliver all events linked to the student at hand, including subscriptions to other courses
-		EventQuery studentQuery = EventQuery.forTypes(StudentSubscribedToCourse.class).tagged("student", studentId);
+	public EventFilter getEventFilter ( ) {
+		// all events linked to the student at hand, including subscriptions to other courses
+		EventFilter studentFacts = EventFilter.forTypes(StudentSubscribedToCourse.class).tagged("student", studentId);
 
-		// this query will deliver all events linked to the course at hand, including subscriptions from other students
-		EventQuery courseQuery = EventQuery.forTypes(CourseDefined.class, CourseCapacityUpdated.class, StudentSubscribedToCourse.class).tagged("course", courseId);
+		// all events linked to the course at hand, including subscriptions from other students
+		EventFilter courseFacts = EventFilter.forTypes(CourseDefined.class, CourseCapacityUpdated.class, StudentSubscribedToCourse.class).tagged("course", courseId);
 
-		// ask for all matching events (union query)
-		return studentQuery.or(courseQuery);
+		// all matching events (a union of filters)
+		return studentFacts.or(courseFacts);
 	}
 
 
@@ -426,14 +426,13 @@ public boolean subscribeStudentToCourse(String studentId, String courseId) {
     // boundary, so a student or course without any history yet needs no special case
     EventReference head = stream.head().orElse(null);
 
-    // the read is bounded at the head; the append below hands the criteria the same query UNBOUNDED,
-    // with the head as its expected last event. Passing the until form to AppendCriteria instead
-    // reads as the more careful of the two, and is the one that turns optimistic locking off
-    stream.query(dm.getEventQuery().until(head)).forEach(dm::when);
+    // the read is bounded at the head (notAfter, a property of the read); the append below hands the
+    // criteria the same filter, with the head as its expected last event
+    stream.query(EventQuery.of(dm.getEventFilter()).notAfter(head)).forEach(dm::when);
 
     if ( dm.canSubscribe() ) {
         stream.append(
-                AppendCriteria.of(dm.getEventQuery(), head),
+                AppendCriteria.of(dm.getEventFilter(), head),
                 Event.of(
                     new StudentSubscribedToCourse(studentId, courseId),
                     Tags.of("student", studentId, "course", courseId)

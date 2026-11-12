@@ -131,7 +131,8 @@ public class ExecuteTransferFeatureSlice implements Slice<Banking> {
 ```java
 @Override
 public void configureAutomation ( BoundedContextBuilder<Banking> builder ) {
-    builder.publisher(new AccountAnnouncedPublisher())
+    builder.outbound()
+           .publisher(new AccountAnnouncedPublisher())
            .dispatcher(new AccountAnnouncedDispatcher(builder.port(MessageBus.class)));
 }
 ```
@@ -332,13 +333,14 @@ public static Object handle ( String actor, String correlationIdHeader, Supplier
 Two things pick the bound tracing up:
 
 - **A monitored port call with no component tracing** — the endpoint's own `directory.verify(...)` — is reported under it, so its `PortCalled` carries `x-correlation-id` of the request.
-- **The no-tracing overloads of the context's capabilities** — `execute(command)`, `read(...)`, `evaluate(...)` — use it instead of minting a fresh one, so the `AccountOpened` the command raises carries the same `x-correlation-id`, `x-actor:alice` and `x-channel:api`.
+- **The context's capabilities** — `execute(command)`, `read(...)`, `event(...)`, `evaluate(...)`, `aggregate(...)`, and `inbound().incoming(...)`/`translate(...)` — use it instead of minting a fresh one, so the `AccountOpened` the command raises carries the same `x-correlation-id`, `x-actor:alice` and `x-channel:api`.
 
 Called as `handle("alice", "req-42", ...)`, the port event and the `AccountOpened` event both carry `x-correlation-id:req-42`. The publisher's `AccountAnnounced` continues the same flow, since a publisher carries the correlation id of the event it publishes.
 
 The rules of the binding:
 
-- An **explicit tracing always wins** over the bound one, and a component running on the thread keeps its own.
+- **Binding is the only way to say who a call is for.** No capability takes a `Tracing` argument; a component's own context (an automation's, a translator's, a policy's) carries the tracing of the event it handles, whatever is bound.
+- A call in the middle of an expression binds for just that call: `TracingScope.call(alice, () -> banking.execute(command))`, or `TracingScope.run(alice, () -> ...)` for work that answers nothing. Both restore what was bound before, also when the work throws.
 - A binding **belongs to its thread**. Nothing is inherited by a thread the request starts, nor by the processor threads of automations and dispatchers, which carry the tracing of the events they handle.
 - `close()` restores what was bound before, so scopes nest; it is idempotent and does nothing on another thread. `TracingScope.bind(null)` is an `IllegalArgumentException` — an edge that forgot its tracing should be visible.
 
@@ -388,7 +390,7 @@ private final Deque<Supplier<String>> answers = new ArrayDeque<>();
 private final TransferGateway gateway = ( toIban, amountInCents, key ) -> answers.pop().get();
 
 @Override
-public Automation<TransferToExecute, BankingDomainEvent, BankingOutboundEvent> automation ( ) {
+public Automation<TransferToExecute, BankingDomainEvent> automation ( ) {
     return new ExecuteTransferAutomation(new TransfersToExecuteTodoList(), gateway);
 }
 
@@ -397,7 +399,7 @@ void anUnreachableGatewayKeepsTheItem ( ) {
     answers.add(() -> { throw new GatewayUnavailableException("connection refused"); });
     answers.add(() -> "gw-1");
     given()
-        .event(new TransferRequested(T_1, ACC_1, "BE01", 100), TRANSFER.tags(T_1))
+        .event(new TransferRequested(T_1, ACC_1, "BE01", 100), Tags.of(TRANSFER.tag(T_1)))
         .whenBatchRuns()
             .itemsFailed(1)
             .noEvents()

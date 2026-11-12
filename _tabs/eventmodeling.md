@@ -25,7 +25,7 @@ It builds upon the <a href="/eventstore/">Sliceworkz Eventstore</a>, and decides
 | pattern | flow | in the framework |
 |---|---|---|
 | **State change** | Trigger → Command → Event | `Command`, deciding on `DecisionModel`s |
-| **State read** | Events → Read model → UI/API | `ReadModel`, live or eventually consistent |
+| **State view** | Events → Read model → UI/API | `ReadModel`, live or eventually consistent |
 | **Automation** | Events → To-do list → Processor → Command → Event | `TodoListReadModel` + `Automation` |
 | | or: Event → Policy → Command → Event | `Policy` — whenever an event happens, issue a command |
 | **Translation** | External event → Processor → Command → Event | `Translator` |
@@ -41,16 +41,17 @@ And telling the outside world, in two halves:
 
 - **Feature slices** discovered by package scanning, each registering its parts per aspect — command, query, automation, projection — so a deployment can run some aspects and not others
 - **DCB commands**: the consistency boundary is pinned at the stream head before a command reads, and is the union of everything it decided on — conflicts are detected, never silently admitted
-- **Bounded retries** of optimistic-locking conflicts with `executeWithRetry`, and **idempotency keys** for safe resubmission
+- **One value says how a command runs** — `execute(command, Execution.retrying())` for bounded retries of optimistic-locking conflicts, `Execution.idempotent(key)` for safe resubmission, or both
 - **Typed entity ids and tags** — an `AccountId` cannot be passed where a `CustomerId` is expected
 - **Business rules with SBVR enforcement levels** — rules people may override under conditions, decided by the command on history, recorded on the events, and **previewable** with `evaluate(...)` before anything is submitted
 - **A ladder of read models**: live, savepoint-bounded, eventually consistent in memory (`PublishingReadModel`), durable in SQL, seeded reads that are current without replaying, and snapshots
 - **Automations that survive failure**: per-item failure handling, backoff, dead letters as events, at-least-once delivery with the to-do list as the queue
 - **Policies**: whenever an event happens, issue a command — redelivery-safe, with an explicit choice of where to start and what a rejection means
 - **Publishers and dispatchers**: every outbound event traces back to the domain event it was published for
+- **Read models over every stream**: project what came in or went out, registered on `builder.inbound()` or `builder.outbound()`
 - **Ports and adapters**, with monitored calls: every call to an external system reported as returned, rejected or failed
-- **Leader election**: automations, policies, shared read models, translators, publishers and dispatchers run on exactly one instance of a deployment, with fencing for durable read models
-- **Operable**: stop, restart and inspect processors on any instance, locally or through a management stream
+- **Leader election**: automations, policies, shared read models, translators, publishers and dispatchers run on exactly one instance of a deployment, **spread evenly over the instances**, with fencing for durable read models
+- **Operable**: stop, restart and inspect processors on any instance, locally or through a management stream; health checks for probes, a background start that answers them while history is projected, and an instance heartbeat that tells a dead process from an idle one
 - **Capabilities filed by audience** — application code, inbound edge, operator, privacy — so each caller holds only what it needs
 - **Observability through its own SPI**: lifecycle events for every component, an observer for metrics and tracing, correlation ids across a whole flow
 - **GDPR erasure by crypto-shredding**, configured with one call

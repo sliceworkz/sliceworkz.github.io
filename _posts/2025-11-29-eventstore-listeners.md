@@ -62,7 +62,7 @@ AtomicReference<EventReference> lastProcessed = new AtomicReference<>();
 // Subscribe to notifications
 Subscription subscription = stream.subscribe((EventReference atLeastUntil) -> {
     // Query new events since last processed
-    for (Event<OrderEvent> event : stream.query(EventQuery.matchAll().limit(500), lastProcessed.get())) {
+    for (Event<OrderEvent> event : stream.query(EventQuery.of(EventFilter.matchAll()).limit(500), lastProcessed.get())) {
         System.out.println("Processing: " + event.type());
         lastProcessed.set(event.reference());
     }
@@ -165,7 +165,7 @@ Bookmark listeners get the same failure containment as append listeners: an exce
 
 **Why bookmark notifications are asynchronous too.** Bookmarks are placed after processing each event or batch, potentially hundreds or thousands of times per second. Blocking those operations with synchronous notifications would severely degrade throughput and couple readers tightly to whoever is watching them.
 
-Bookmark placement is also typically done by autonomous background processors that shouldn't be coupled to the rest of the system, and in many deployments wouldn't even run in the same process, making a synchronous notification impossible in the first place. The asynchronous model lets readers work independently while still providing visibility into their progress. If you need the current position on demand rather than on change, query it directly with `getBookmark(reader)` — or `getBookmarks()` for all readers at once.
+Bookmark placement is also typically done by autonomous background processors that shouldn't be coupled to the rest of the system, and in many deployments wouldn't even run in the same process, making a synchronous notification impossible in the first place. The asynchronous model lets readers work independently while still providing visibility into their progress. If you need the current position on demand rather than on change, query it directly with `findBookmark(reader)` — or `getBookmarks()` for all readers at once.
 
 ## Delivery Guarantees in Practice
 

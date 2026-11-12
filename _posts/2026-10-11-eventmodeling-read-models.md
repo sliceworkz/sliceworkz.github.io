@@ -53,8 +53,8 @@ public class AccountDetailsReadModel implements ReadModel<BankingDomainEvent> {
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forEvents(EventTypesFilter.of(AccountOpened.class), ACCOUNT.tags(accountId));
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(AccountOpened.class).tagged(ACCOUNT.tag(accountId));
     }
 
     @Override
@@ -98,6 +98,10 @@ Keep these points in mind, because everything later builds on them:
   technically redundant: a class can only be live, and calling `.eventuallyConsistent()` on a class
   registration throws `IllegalArgumentException`. It is required anyway, because how a read model is
   projected is a decision every caller of it lives with, so it should be visible where it is made.
+- **`eventFilter()` says which events, `eventQuery()` how they are read.** `eventFilter()` is the one
+  method to implement. `eventQuery()` defaults to reading that filter forward; a live model that reads
+  otherwise, the newest event only for instance, overrides it on top of the filter:
+  `EventQuery.of(eventFilter()).backwards().limit(1)`.
 - **One `when`, taking the `Event`.** Switch on `event.data()` for the domain event. The tags, the
   timestamp and the `reference()` are on the same argument when a projection needs them.
 - **The read is typed by the class you ask for.** `read(AccountDetailsReadModel.class, id)` *is* an
@@ -137,7 +141,7 @@ When a live model gets slow, the reflex is to cache it. That is usually the expe
 problem the *domain* can solve more cheaply. There are two techniques, and both keep you at step 1's cost
 model.
 
-**Narrow `eventQuery()` with tags.** Tags are the query dimension of the event store. A model that filters
+**Narrow `eventFilter()` with tags.** Tags are the query dimension of the event store. A model that filters
 on an entity's tag replays that entity's events, not the whole stream. Design the tags so the query stays
 small. The banking example's
 [`MonthStatementReadModel`](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-examples/src/main/java/org/sliceworkz/eventmodeling/examples/banking/features/monthstatement/MonthStatementReadModel.java)
@@ -162,14 +166,14 @@ public class CurrentPeriodReadModel implements ReadModel<BankingDomainEvent> {
 
     @Override
     public EventQuery initQuery ( ) {                      // the newest savepoint, and nothing before it
-        return EventQuery.forEvents(EventTypesFilter.of(AccountOpened.class, MonthOpened.class), ACCOUNT.tags(accountId))
+        return EventQuery.of(EventFilter.forTypes(AccountOpened.class, MonthOpened.class).tagged(ACCOUNT.tag(accountId)))
                 .backwards().limit(1);
     }
 
     @Override
-    public EventQuery eventQuery ( ) {                     // only what happened after it
-        return EventQuery.forEvents(EventTypesFilter.of(MoneyDeposited.class, MoneyWithdrawn.class, MonthClosed.class),
-                ACCOUNT.tags(accountId));
+    public EventFilter eventFilter ( ) {                   // only what happened after it
+        return EventFilter.forTypes(MoneyDeposited.class, MoneyWithdrawn.class, MonthClosed.class)
+                .tagged(ACCOUNT.tag(accountId));
     }
 
     @Override
@@ -185,18 +189,19 @@ public class CurrentPeriodReadModel implements ReadModel<BankingDomainEvent> {
 }
 ```
 
-The projector runs `initQuery()` first and feeds its result through `when(...)`. It then starts
-`eventQuery()` after that event. When there is no savepoint yet, the init query finds nothing and the
+The projector runs `initQuery()` first and feeds its result through `when(...)`. It then reads
+`eventFilter()` forward from after that event. When there is no savepoint yet, the init query finds nothing and the
 model replays from the beginning.
 
-- **Give the two queries disjoint event types.** The savepoint types belong to `initQuery()` only.
+- **Give the init query and the filter disjoint event types.** The savepoint types belong to `initQuery()` only.
   Otherwise savepoints are processed twice, and you cannot recover from a buggy savepoint by
   ignoring it.
 - **The savepoint is written by the domain.** A `CloseMonthCommand` decides the books are closed. That is
   a business fact with its own meaning, and the faster read model follows from it.
 - **`initQuery()` applies to live models only.** A bookmarked background projection must see every event,
-  so eventually consistent read models ignore it, and `build()` logs a warning. In a `DecisionModel` it is
-  part of the consistency boundary: the command locks on both queries.
+  so `build()` refuses an eventually consistent read model that declares one, naming it. In a
+  `DecisionModel` it is part of the consistency boundary: the command locks on both the savepoint read
+  and the filter.
 
 The eventstore's [savepoint pattern](/posts/eventstore-savepoint-pattern/) post explains the mechanism in
 more depth. The banking example's
@@ -235,8 +240,8 @@ public class AccountBalancesReadModel extends PublishingReadModel<BankingDomainE
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.matchAll();
+    public EventFilter eventFilter ( ) {
+        return EventFilter.matchAll();
     }
 
     public BigDecimal balanceOf ( AccountId accountId ) {
@@ -273,8 +278,25 @@ public class CurrentBalanceFeatureSlice implements Slice<Banking> {
 }
 ```
 
-`read(...)` builds live models. An eventually consistent read model is read through the instance itself,
-which is why the slice passes it on.
+An eventually consistent read model is read through the instance. The slice that registers it can hand
+it to its own endpoints, as above; any other slice of the context reads it by its class, with no
+parameters, and gets that registered instance — nothing is projected for such a read:
+
+```java
+AccountBalancesReadModel balances = banking.read(AccountBalancesReadModel.class);
+```
+
+That is how several slices share one read model that one of them keeps current. Put such a read model
+where shared code lives rather than in the registering slice's package. A read that cannot tell which
+answer is meant is refused: a class registered eventually consistent under several names and read by its
+class alone, parameters for a class registered only eventually consistent, or no parameters for a class
+registered both ways (which stays readable live, with parameters).
+
+**Its projector reads forward from a bookmark**, so its query has to be the plain forward read of its
+filter. `build()` refuses an eventually consistent read model whose `eventQuery()` reads backwards, is
+limited or carries a `notAfter` bound, or that declares an `initQuery()` — each would make the projector
+project something other than what the read model declares. A business bound belongs on the filter
+(`EventFilter.after(...)` / `until(...)`), which the projector honours.
 
 ### Reading the State With Its Position
 
@@ -317,7 +339,10 @@ happens to its bookmark when the process starts:
 `PublishingReadModel` is always `EPHEMERAL`. That has a consequence: it is rebuilt from the start of the
 stream at every process start, and `bc.start()` **waits** until every `EPHEMERAL` read model has finished
 that initial projection. Those read models are therefore usable as soon as `start()` returns. The rebuild
-is start-up latency, not background noise. The wait has a safety timeout of 5 minutes, which you can
+is start-up latency, not background noise. A process that must answer its probes meanwhile starts with
+`startInBackground()` instead: it returns with the context `STARTING` and a future completed once it is
+`RUNNING`, and the `inMemoryReadModels` health check names the read models still projecting — see
+[Running in Production](/posts/eventmodeling-running-in-production/). The wait has a safety timeout of 5 minutes, which you can
 change with `-Dsliceworkz.eventmodeling.readmodel.ephemeral.projection.timeout.ms=...`. When the timeout
 expires, start-up continues with a warning and the read model keeps catching up in the background.
 `LOCAL` and `SHARED` read models resume from their bookmark and never hold up `start()`.
@@ -424,8 +449,8 @@ public class CurrentBalanceReadModel implements SeededReadModel<BankingDomainEve
     }
 
     @Override
-    public EventQuery eventQuery ( ) {                       // this account only, so the delta stays tiny
-        return EventQuery.forEvents(EventTypesFilter.any(), ACCOUNT.tags(accountId));
+    public EventFilter eventFilter ( ) {                     // this account only, so the delta stays tiny
+        return EventFilter.forTags(ACCOUNT.tag(accountId));
     }
 
     @Override
@@ -506,7 +531,7 @@ public class AccountHistoryReadModel implements ReadModel<BankingDomainEvent>, S
 
     private History history = new History(BigDecimal.ZERO, BigDecimal.ZERO, 0);
 
-    // constructor, eventQuery() and when(...) as for any live model
+    // constructor, eventFilter() and when(...) as for any live model
 
     @Override public History takeSnapshot ( )                 { return history; }
     @Override public void fromSnapshot ( History snapshot )   { history = snapshot; }
@@ -537,6 +562,35 @@ monitoring can tell a cold cache from a version bump.
 Snapshots are the last resort for a reason. They have more moving parts than a seeded read for the same
 effect, and the base is only as fresh as whoever last read past the threshold. If a projection exists
 that could seed the read, seed it (step 5). If a savepoint could bound the replay, bound it (step 2).
+
+## Which Stream: Domain, Inbound or Outbound
+
+Every step above applies to the stream a read model is projected from, and that is the domain stream
+unless the registration says otherwise. A read model over the **inbound** stream — what came in from
+outside, counted per type or per tag value, whether a translator claimed it or not — is registered on
+`builder.inbound()` and read through `context.inbound().read(...)`; one over the **outbound** stream —
+what went out — on `builder.outbound()` and `context.outbound().read(...)`. Nothing else changes: the same
+`ReadModel`, `PublishingReadModel` and `SqlReadModelProjector`, the same choice of live or eventually
+consistent, the same ladder.
+
+```java
+// in the inboundtraffic slice: projected in the background from the inbound stream
+builder.inbound().readmodel(InboundTrafficReadModel.INSTANCE).eventuallyConsistent();
+
+// a screen showing what came in holds only a read capability over the inbound events
+ReadModelCapability<BankingInboundEvent> inboundScreen = banking.inbound();
+ReadModelResult<Traffic> traffic = inboundScreen.read(InboundTrafficReadModel.class).published();
+```
+
+The read model is declared over the stream's event type — `ReadModel<BankingInboundEvent>` — and
+`build()` holds it to the stream it is registered on, so one registered on the wrong stream fails naming
+it, and one read through the wrong stream does not compile. Its bookmark is kept under a processor type of
+its own, so it may share a name with a domain read model.
+
+Such a read model reads and decides nothing. It is not a decision input — a command's consistency boundary
+covers the domain stream alone — not a todo list, and not something a publisher reads. The banking
+example's [`inboundtraffic`](https://github.com/sliceworkz/eventmodeling/tree/develop/sliceworkz-eventmodeling-examples/src/main/java/org/sliceworkz/eventmodeling/examples/banking/features/inboundtraffic)
+slice is the worked version.
 
 ## Shapes to Avoid
 
@@ -597,7 +651,9 @@ of hoping.
 ## Testing Read Models
 
 - **`LiveModelTest`** (in `sliceworkz-eventmodeling-testing`) seeds events, reads a live model with the
-  parameters you give it, and asserts on the result. It covers steps 1, 2, 5 and 6.
+  parameters you give it, and asserts on the result. It covers steps 1, 2, 5 and 6. `InboundLiveModelTest` and
+  `OutboundLiveModelTest` do the same for a read model over the inbound or outbound stream, seeding that
+  stream.
 - **`SqlReadModelTest`** drives a SQL projector through its batch lifecycle against H2 and PostgreSQL. See
   [Durable SQL Read Models](/posts/eventmodeling-sql-read-models/).
 - Annotate a scenario `@ForEachBackend` to run it against every registered event storage. A plain `@Test`

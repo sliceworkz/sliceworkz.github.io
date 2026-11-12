@@ -120,12 +120,12 @@ public void execute ( CommandContext<BankingDomainEvent, BankingDomainEvent> con
     ...
 
     result.raiseEvent(new MoneyWithdrawn(accountId, amount, description, context.ruleViolations()),
-        ACCOUNT.tags(accountId));
+        ACCOUNT.tag(accountId));
 }
 ```
 
 This is where invariants live, and the shape is always the same: **select decision models, check,
-raise.** A `DecisionModel` is a projection the command builds inline — `eventQuery()` scoped by tags to
+raise.** A `DecisionModel` is a projection the command builds inline — `eventFilter()` scoped by tags to
 the entity, `when(...)` folding state, accessors for the checks — see
 [Commands and Decision Models](/posts/eventmodeling-commands-and-decision-models/).
 
@@ -139,7 +139,7 @@ There are two kinds of "no" here, and they get different tools:
 
 What makes this more than a lookup: `context.decisionModels(...)` puts the events the models were read
 from **inside the command's consistency boundary**. The lock filter of the append is the union of every
-query the models were read with — each `eventQuery()`, and a savepoint model's `initQuery()` — so the
+filter the models were read with — each `eventFilter()`, and a savepoint model's `initQuery()` — so the
 check at append time re-asks exactly the question the command decided on. Three different failures come
 out of this step, and they want different responses:
 
@@ -147,7 +147,7 @@ out of this step, and they want different responses:
 |---|---|---|---|
 | `IllegalArgumentException` | the command, before any read | the request is malformed | never |
 | `BusinessException` | the command, after projecting | history says no | never — the answer *is* no |
-| `OptimisticLockingException` | the append | new relevant facts since the decision | yes — re-execute: `executeWithRetry` |
+| `OptimisticLockingException` | the append | new relevant facts since the decision | yes — re-execute: `Execution.retrying()` |
 
 The kernel also reports each outcome as its own event — `CommandRejected` (the reason, nothing else),
 `CommandFailedOnOptimisticLocking`, and `CommandFailed` (type, message and stack trace) — so a rejection
@@ -163,9 +163,10 @@ rejections.
 this command's append needs no guard, and hands the command its `CommandResult`.
 
 **Bound the replay, never the boundary.** A decision model is replayed on every execution, so bound it
-the way a live read model is bounded: by tags, and with a savepoint `initQuery()`. An `until` on a model's
-own query bounds its read only — the framework strips it from the lock filter, because a filter carrying
-one would admit every append.
+the way a live read model is bounded: by tags, and with a savepoint `initQuery()`. The command pins its
+reads at the head with the eventstore's read bound (`notAfter`), which never reaches the lock filter. A
+business bound on a model's own filter — `after` or `until` — does go in, and the eventstore prunes it
+against the head: what lies entirely before the head cannot conflict, and drops out of the check.
 
 ## 4. Uniqueness: the Boundary You Expect to Be Empty
 
@@ -180,8 +181,8 @@ public class EmailNotTakenDecisionModel implements DecisionModel<BankingDomainEv
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forEvents(EventTypesFilter.of(CustomerRegistered.class), Tags.of("email", email.value()));
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(CustomerRegistered.class).tagged("email", email.value());
     }
 
     @Override
@@ -202,7 +203,7 @@ BusinessException.when(claim.taken(), "Email address already registered: " + ema
 
 CustomerId customerId = CUSTOMER.newId();
 result.raiseEvent(new CustomerRegistered(customerId, email),
-    Tags.of(CUSTOMER.tag(customerId), Tag.of("email", email.value())));
+    CUSTOMER.tag(customerId), Tag.of("email", email.value()));
 ```
 
 "No two customers with one email address" is a rule about a *set*, not an entity, and the reflex is to
@@ -210,7 +211,7 @@ check a read model first — which is a race (see the shapes to avoid below). Th
 consistency boundary you expect to be empty: a decision model whose query matches the claim, reading
 **nothing**. An empty read is still a boundary — the head is pinned before the read, and the append is
 admitted only if *still* nothing matches. Of two concurrent registrations of the same address exactly one
-wins; the other gets an `OptimisticLockingException`, and under `executeWithRetry` its re-decide turns
+wins; the other gets an `OptimisticLockingException`, and under `Execution.retrying()` its re-decide turns
 that into the `BusinessException`. The `taken()` check gives the ordinary sequential case its message;
 the boundary is what makes the concurrent case safe.
 
@@ -234,7 +235,7 @@ inverts: **what has arrived can only be accepted; what you do about it is where 
   every inbound event behind it waiting, reported as `TranslatorFailed` each round. Decide about an
   invalid inbound event in-band instead — ignore it (a `default -> { }` arm), or record the rejection as a
   domain event, which makes the dead-letter view an ordinary read model. Through the synchronous
-  `translate(...)` path an exception propagates to the caller, and there it may validate loudly, because
+  `inbound().translate(...)` path an exception propagates to the caller, and there it may validate loudly, because
   there is a caller to reject.
 - **An automation classifies the failure of its effect in `onFailure`.** The external call it makes can
   fail in ways only the automation can judge, and `AutomationFailureAction` is that judgement: retry the
@@ -301,7 +302,7 @@ retries the design promises will happen.
 | Input check (command constructor) | before any read | a malformed request | `IllegalArgumentException` | no |
 | Decision model check | after projecting history | a request history rejects | `BusinessException`, `CommandRejected` | no — the answer is no |
 | Business rule with an enforcement level | judged after the command ran | a rule people may break under conditions | `RuleViolationException` (a `BusinessException`) unless overridden, or recorded on the events | no — override, or change the request |
-| DCB append check | inside the append | facts newer than the decision | `OptimisticLockingException` | yes — `executeWithRetry` |
+| DCB append check | inside the append | facts newer than the decision | `OptimisticLockingException` | yes — `Execution.retrying()` |
 | Empty boundary (uniqueness) | inside the append | a concurrent duplicate claim | `OptimisticLockingException`, then the re-decide's `BusinessException` | re-execute |
 | Idempotency key | inside the append | the same request twice | an empty result, silently | no — already done |
 | Automation `onFailure` | after an effect failed | a failing external effect | an `AutomationFailureAction` and an event | per the action |

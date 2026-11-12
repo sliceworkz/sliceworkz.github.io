@@ -13,7 +13,7 @@ Event Modeling has one pattern for "the system does something by itself": **even
 | | an **automation** | a **policy** |
 |---|---|---|
 | reacts to | the items of a to-do list, a read model of outstanding work | one domain event |
-| shape | `TodoListReadModel` + `Automation<T,D,O>` | `Policy<D>` |
+| shape | `TodoListReadModel` + `Automation<T,D>` | `Policy<D>` |
 | does | anything a handler can do: execute commands, append events, call a port | maps the event onto one command, nothing else |
 | failure | your `onFailure` decides, per item | the event stalls (or a rejection is skipped) |
 | reach for it when | there is a deadline, an outside call, several facts to gather, an item to put aside | "whenever X happens, do Y" |
@@ -79,9 +79,9 @@ public class TransfersToExecuteTodoList
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forTypes(TransferRequested.class, TransferExecuted.class,
-                                   TransferAttemptFailed.class, TransferAbandoned.class);
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(TransferRequested.class, TransferExecuted.class,
+                                    TransferAttemptFailed.class, TransferAbandoned.class);
     }
 
     @Override
@@ -129,10 +129,10 @@ Three things in there are worth copying:
 
 ### The automation
 
-`Automation<T, D, O>` takes the item type first, then the domain events, then the outbound events. Note the to-do list is declared the other way round, `TodoListReadModel<D, T>`. The one method that does work is `handle`:
+`Automation<T, D>` takes the item type first, then the domain events. Note the to-do list is declared the other way round, `TodoListReadModel<D, T>`. The one method that does work is `handle`:
 
 ```java
-public class ExecuteTransferAutomation implements Automation<TransferToExecute, BankingDomainEvent, BankingOutboundEvent> {
+public class ExecuteTransferAutomation implements Automation<TransferToExecute, BankingDomainEvent> {
 
     static final int MAX_ATTEMPTS = 3;
 
@@ -150,23 +150,24 @@ public class ExecuteTransferAutomation implements Automation<TransferToExecute, 
     }
 
     @Override
-    public Optional<EventReference> handle ( TransferToExecute transfer, AutomationContext<BankingDomainEvent, BankingOutboundEvent> context ) {
+    public Optional<EventReference> handle ( TransferToExecute transfer, AutomationContext<BankingDomainEvent> context ) {
         // derived from the item, never from the attempt: the same transfer always gets the same key
         String key = "transfer-executed:" + transfer.transferId().value();
         String gatewayReference = gateway.execute(transfer.toIban(), transfer.amountInCents(), key);
-        return context.event(new TransferExecuted(transfer.transferId(), gatewayReference),
-                             TRANSFER.tags(transfer.transferId()), key);
+        return context.event(EphemeralEvent.of(new TransferExecuted(transfer.transferId(), gatewayReference),
+                                               Tags.of(TRANSFER.tag(transfer.transferId())))
+                                           .withIdempotencyKey(key));
     }
 
     // onFailure, delayBeforeNextBatch: below
 }
 ```
 
-`handle` returns the reference of the last event it produced, or `Optional.empty()` when it produced none. The `AutomationContext` offers two things: executing commands (`execute`, `executeWithRetry`) and appending a domain event no command decided on (`event`). Nothing else — an automation writes to the domain stream only, and what it decides reaches the outside world through a [publisher](/posts/eventmodeling-translators-publishers-dispatchers/).
+`handle` returns the reference of the last event it produced, or `Optional.empty()` when it produced none. The `AutomationContext` offers two things: executing commands (`execute`) and appending a domain event no command decided on (`event`). `event(data)` appends the bare event; an event with tags or an idempotency key is given as the eventstore's own `EphemeralEvent`, built the way an append builds it. Nothing else — an automation writes to the domain stream only, and what it decides reaches the outside world through a [publisher](/posts/eventmodeling-translators-publishers-dispatchers/).
 
 **The idempotency key is derived from the item.** Since delivery is at least once, the same transfer will occasionally be handled twice. A key built from the transfer id makes the second append a no-op: the storage swallows a key it already holds on the stream and `event(...)` answers `Optional.empty()`. A key built from anything that changes per attempt — a random UUID, a timestamp, the attempt number — de-duplicates nothing. The gateway is handed the same key for the same reason: appending our event once is no use if the money moved twice.
 
-> A command a handler executes gets its key the same way: `context.execute(command, "close-month:" + item.accountId().value())`. A command raising several events turns one key into `<key>/1`, `<key>/2`, … so a retry is swallowed whole. See [Commands and Decision Models](/posts/eventmodeling-commands-and-decision-models/).
+> A command a handler executes gets its key the same way: `context.execute(command, Execution.idempotent("close-month:" + item.accountId().value()))`. A command raising several events turns one key into `<key>/1`, `<key>/2`, … so a retry is swallowed whole. See [Commands and Decision Models](/posts/eventmodeling-commands-and-decision-models/).
 {: .prompt-tip }
 
 ### Registering it: the slice owns its wiring
@@ -195,6 +196,8 @@ automation registered without a projector for its todo list on this instance:
   registered: add builder.readmodel(todoList).eventuallyConsistent())
 ```
 
+Its projector reads forward from a bookmark, so — as for any eventually consistent read model — `build()` also refuses a to-do list whose `eventQuery()` reads backwards, is limited or carries a `notAfter` bound, or that declares an `initQuery()`.
+
 A `SHARED` to-do list (a durable [SQL read model](/posts/eventmodeling-sql-read-models/)) is exempt: its projector holds a lease of its own and may legitimately run on another instance. That is how the projection and the automation run apart — the list projected where the projection aspect runs, worked where the automation aspect runs (see [A To-Do List in SQL](/posts/eventmodeling-sql-read-models/#a-to-do-list-in-sql-projected-here-worked-there)).
 
 ### When `handle` throws: `onFailure`
@@ -213,7 +216,7 @@ The distinction that decides the action is not "transient or permanent" but **wh
 
 ```java
 @Override
-public AutomationFailureAction onFailure ( TransferToExecute transfer, Throwable cause, AutomationContext<BankingDomainEvent, BankingOutboundEvent> context ) {
+public AutomationFailureAction onFailure ( TransferToExecute transfer, Throwable cause, AutomationContext<BankingDomainEvent> context ) {
     return switch ( cause ) {
         // the gateway, not the transfer: nothing to record, nothing to gain by moving on
         case GatewayUnavailableException down -> AutomationFailureAction.RETRY_ITEM;
@@ -227,10 +230,10 @@ public AutomationFailureAction onFailure ( TransferToExecute transfer, Throwable
             if ( attempt >= MAX_ATTEMPTS ) {
                 yield abandon(transfer, "declined %d times: %s".formatted(attempt, declined.getMessage()), context);
             }
-            context.event(new TransferAttemptFailed(transfer.transferId(), declined.getMessage(), attempt,
-                                                    Instant.now().plus(Duration.ofSeconds(5L << (attempt - 1)))),
-                          TRANSFER.tags(transfer.transferId()),
-                          "transfer-attempt-failed:%s:%d".formatted(transfer.transferId().value(), attempt));
+            context.event(EphemeralEvent.of(new TransferAttemptFailed(transfer.transferId(), declined.getMessage(), attempt,
+                                                                      Instant.now().plus(Duration.ofSeconds(5L << (attempt - 1)))),
+                                            Tags.of(TRANSFER.tag(transfer.transferId())))
+                          .withIdempotencyKey("transfer-attempt-failed:%s:%d".formatted(transfer.transferId().value(), attempt)));
             yield AutomationFailureAction.CONTINUE_AND_RETRY_ITEM_LATER;
         }
 
@@ -239,10 +242,10 @@ public AutomationFailureAction onFailure ( TransferToExecute transfer, Throwable
     };
 }
 
-private AutomationFailureAction abandon ( TransferToExecute transfer, String reason, AutomationContext<BankingDomainEvent, BankingOutboundEvent> context ) {
-    context.event(new TransferAbandoned(transfer.transferId(), reason, transfer.attempts() + 1),
-                  TRANSFER.tags(transfer.transferId()),
-                  "transfer-abandoned:" + transfer.transferId().value());
+private AutomationFailureAction abandon ( TransferToExecute transfer, String reason, AutomationContext<BankingDomainEvent> context ) {
+    context.event(EphemeralEvent.of(new TransferAbandoned(transfer.transferId(), reason, transfer.attempts() + 1),
+                                    Tags.of(TRANSFER.tag(transfer.transferId())))
+                  .withIdempotencyKey("transfer-abandoned:" + transfer.transferId().value()));
     return AutomationFailureAction.CONTINUE_AND_RETRY_ITEM_LATER;   // the item leaves once this is projected
 }
 ```
@@ -270,15 +273,15 @@ The events recorded from `onFailure` carry keys derived from the item and the at
 
 ### Executing commands from `handle`
 
-Most automations do not call the outside world; they execute a command per item. A command can conflict with another writer (`OptimisticLockingException`, the routine DCB outcome), and the bounded retry for that is `executeWithRetry`:
+Most automations do not call the outside world; they execute a command per item. A command can conflict with another writer (`OptimisticLockingException`, the routine DCB outcome), and the bounded retry for that is an `Execution` that retries — one value saying how the command is executed, with or without a key:
 
 ```java
 @Override
-public Optional<EventReference> handle ( AccountToLock item, AutomationContext<BankingDomainEvent, BankingOutboundEvent> context ) {
-    return context.executeWithRetry(
+public Optional<EventReference> handle ( AccountToLock item, AutomationContext<BankingDomainEvent> context ) {
+    return context.execute(
             new BlockCardsOfAccountCommand(item.accountId(), "account frozen: " + item.reason()),
-            "block-cards:" + item.frozenEventId(),          // derived from the item: the same on every redelivery
-            RetryPolicy.of(5));
+            Execution.idempotent("block-cards:" + item.frozenEventId())   // derived from the item: the same on every redelivery
+                     .withRetry(RetryPolicy.of(5)));
 }
 ```
 
@@ -287,6 +290,8 @@ Each attempt re-executes the command, which re-reads its decision models and dec
 ### Pacing: `batchSize`, `idlePollInterval`, `delayBeforeNextBatch`
 
 An automation handles items in **batches**. Within a batch the to-do list does not move: events raised for one item reach the list only after the batch, once its projector has caught up. Between batches the automation waits until the to-do list has been projected past what it produced.
+
+**When it begins working — started, restarted, or promoted to leader — it first waits for its to-do list to reach the stream head of that moment.** It reads `head()` once and runs no batch until the to-do list's projector has read up to it. An `EPHEMERAL` to-do list is rebuilt from the beginning at every start, bookmarking batch by batch; without this barrier the automation would work the list as it stood part-way through that catch-up, and handle an item that a later event in the history had already resolved — an outside call made for nothing. A durable to-do list catching up after downtime is the same case, smaller.
 
 | method | default | what it decides |
 |---|---|---|
@@ -349,8 +354,8 @@ A **policy** reacts to the event itself:
 public class BlockCardsOfAccountPolicy implements Policy<BankingDomainEvent> {
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forTypes(AccountFrozen.class, AccountClosed.class);
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(AccountFrozen.class, AccountClosed.class);
     }
 
     @Override
@@ -364,7 +369,7 @@ public class BlockCardsOfAccountPolicy implements Policy<BankingDomainEvent> {
 }
 ```
 
-- **`eventQuery()`** names one event type, or several variants of one fact that lead to the same reaction.
+- **`eventFilter()`** names one event type, or several variants of one fact that lead to the same reaction. A policy is always read forward from its bookmark, so it declares a filter, never a query with a direction or limit.
 - **`react(event)`** answers the command to issue, or `Optional.empty()` to let the event pass.
 - **`policyName()`** defaults to the class' simple name and keys the policy's bookmark, lease and idempotency keys. Override it to keep the old name when you rename the class — a new name is a new policy, which either replays the history or skips what happened in between.
 
@@ -381,8 +386,7 @@ public record BlockCardsOfAccountCommand ( AccountId accountId, String reason ) 
         var cards = new UsableCardsDecisionModel(accountId);
         var result = context.decisionModels(cards);
         for ( CardId cardId : cards.usable() ) {
-            result.raiseEvent(new CardBlocked(accountId, cardId, reason),
-                              Tags.of(ACCOUNT.tag(accountId), CARD.tag(cardId)));
+            result.raiseEvent(new CardBlocked(accountId, cardId, reason), ACCOUNT.tag(accountId), CARD.tag(cardId));
         }
     }
     // UsableCardsDecisionModel: CardIssued adds, CardBlocked removes, tagged with the account
@@ -501,8 +505,8 @@ void aRedeliveredTransferIsRecordedOnce ( ) {
 ```java
 @Test
 void aFrozenAccountsCardsAreBlockedOnce ( ) {
-    given(new CardIssued(A1, C1), ACCOUNT.tags(A1))
-        .and(new AccountFrozen(A1, "fraud"), ACCOUNT.tags(A1))
+    given(new CardIssued(A1, C1), Tags.of(ACCOUNT.tag(A1)))
+        .and(new AccountFrozen(A1, "fraud"), Tags.of(ACCOUNT.tag(A1)))
     .whenReacting()
         .events(new CardBlocked(A1, C1, "account frozen: fraud"))
     .and()

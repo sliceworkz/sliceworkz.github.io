@@ -18,12 +18,13 @@ The framework files every capability of a bounded context under an **audience** 
 
 | Audience | Interface | What it carries |
 |---|---|---|
-| **Application** — a controller, a scheduled job, any adapter driving the domain | `ApplicationCapabilities<D,O>` | `execute`, `executeWithRetry`, `evaluate`, `read`, `aggregate` |
-| **Inbound edge** — a webhook, a message consumer feeding the domain | `TranslationCapability<I>` | `incoming`, `translate` |
+| **Application** — a controller, a scheduled job, any adapter driving the domain | `ApplicationCapabilities<D>` | `execute`, `evaluate`, `read`, `aggregate` |
+| **Inbound edge** — a webhook, a message consumer feeding the domain | `TranslationCapability<I>`, from `inbound()` | `incoming`, `translate` |
+| **A reader of what came in or went out** — a screen, a report | `ReadModelCapability<I>` from `inbound()`, `ReadModelCapability<O>` from `outbound()` | `read` of a read model over that stream |
 | **Operator** — an admin endpoint, a dashboard | `OperationsCapabilities` | `automations`, `restartAutomation`, `stopAutomation`, `processors`, `restartProcessor`, `stopProcessor`, `skipStalledEvent`, `state`, `health` |
 | **Erasure requests** | `PrivacyCapability` | `erase`, `eraseCategory` |
 | **The escape hatch** | `ProvidedEventCapability<D>` | `event` |
-| **Owner** — whatever built the context | your context interface (`Banking`) | all of the above, plus `start`/`stop`/`terminate`, `port`, `getDeployedFeatureSlices`/`getUndeployedFeatureSlices` |
+| **Owner** — whatever built the context | your context interface (`Banking`) | all of the above, plus `start`/`startInBackground`/`stop`/`terminate`, `port`, `getDeployedFeatureSlices`/`getUndeployedFeatureSlices`, and `inbound()`/`outbound()`, whose results it narrows for the two audiences above |
 
 `OperationsCapabilities` is itself the composition of `AutomationAdminCapability` (the three automation methods), `ProcessorAdminCapability` (the four processor methods) and `HealthCapability` (`state` and `health`), for code that needs only one of them — a health endpoint holds a `HealthCapability` and can stop nothing.
 
@@ -40,23 +41,37 @@ A built context already *is* each of these interfaces, so there is nothing to wr
 Banking banking = BoundedContext.newBuilder(Banking.class) /* ... */ .build();
 banking.start();                                        // the owner, holding everything
 
-ApplicationCapabilities<BankingDomainEvent, BankingOutboundEvent> app = banking;
+ApplicationCapabilities<BankingDomainEvent> app = banking;
 app.execute(new OpenAccountCommand(customerId));        // compiles
 app.read(AccountDetailsReadModel.class, accountId);     // compiles
 app.terminate();                                        // does not compile
 app.erase("customer", id, reason);                      // does not compile
 app.event(new AccountOpened(...));                      // does not compile
 app.stopAutomation("MonthEndClosingAutomation");        // does not compile
+
+TranslationCapability<BankingInboundEvent> feed = banking.inbound();
+feed.incoming(new CustomerSuspended(customerId));       // compiles
+feed.read(InboundTrafficReadModel.class);               // does not compile
+
+ReadModelCapability<BankingInboundEvent> screen = banking.inbound();
+screen.read(InboundTrafficReadModel.class);             // compiles
+screen.read(AccountDetailsReadModel.class, accountId);  // does not compile: a domain read model
 ```
+
+**The inbound and outbound streams are reached through `inbound()` and `outbound()`, not on the context
+itself.** `inbound()` hands out one object for two audiences — the edge feeding the domain and a reader of
+what came in — and the owner narrows it to `TranslationCapability<I>` or `ReadModelCapability<I>` before
+handing it on. `outbound()` only reads: nothing but a publisher writes the outbound stream. The root of the
+context is the domain stream.
 
 Build the context in one place — your `main`, your dependency-injection configuration — and hand out the narrow types from there. A caller then gets the reach its job needs, and cannot be handed another's by a wiring change nobody looked at twice.
 
 ## An Alias Interface: `BankingApi`
 
-`ApplicationCapabilities<BankingDomainEvent, BankingOutboundEvent>` at every call site is the same noise `BoundedContext<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent>` would be, which is why the context interface `Banking` exists at all. Give the application surface the same treatment:
+`ApplicationCapabilities<BankingDomainEvent>` at every call site is the same noise `BoundedContext<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent>` would be, which is why the context interface `Banking` exists at all. Give the application surface the same treatment:
 
 ```java
-public interface BankingApi extends ApplicationCapabilities<BankingDomainEvent, BankingOutboundEvent> { }
+public interface BankingApi extends ApplicationCapabilities<BankingDomainEvent> { }
 
 public interface Banking extends BoundedContext<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent>,
                                  BankingApi { }
@@ -84,7 +99,7 @@ public class AccountsController {
 }
 ```
 
-The alias is optional — `Banking` is an `ApplicationCapabilities<BankingDomainEvent, BankingOutboundEvent>` whether you declare `BankingApi` or not — but it is what makes the narrow type the convenient one to write.
+The alias is optional — `Banking` is an `ApplicationCapabilities<BankingDomainEvent>` whether you declare `BankingApi` or not — but it is what makes the narrow type the convenient one to write.
 
 The same goes for the endpoints a feature slice wires in its `start...` hooks: the hook is handed a `Banking`, and the endpoint's constructor takes a `BankingApi`. See [Bounded Contexts and Feature Slices](/posts/eventmodeling-bounded-contexts-and-feature-slices/#two-hooks-per-aspect-configure-and-start).
 
@@ -109,7 +124,7 @@ public class BankingWiring {
         accounts     = new AccountsController(banking);     // a Banking is a BankingApi
         operations   = new OperationsEndpoint(banking);     // ... and an OperationsCapabilities
         erasures     = new ErasureRequests(banking);        // ... and a PrivacyCapability
-        customerFeed = new CustomerFeed(banking);           // ... and a TranslationCapability
+        customerFeed = new CustomerFeed(banking.inbound()); // its inbound() is a TranslationCapability
         legacyImport = new LegacyAccountImport(banking);    // ... and a ProvidedEventCapability
     }
 
@@ -151,14 +166,14 @@ public class LegacyAccountImport {
         AccountId accountId = ACCOUNT.id(legacyAccountNumber);
         CustomerId customerId = CUSTOMER.id(customerNumber);
         provided.event(
-            new AccountOpened(accountId, customerId, openedOn),
-            Tags.of(ACCOUNT.tag(accountId), CUSTOMER.tag(customerId)),
-            "legacy-import/" + legacyAccountNumber);   // derived from the fact, so a re-run stores nothing twice
+            EphemeralEvent.of(new AccountOpened(accountId, customerId, openedOn),
+                              Tags.of(ACCOUNT.tag(accountId), CUSTOMER.tag(customerId)))
+                          .withIdempotencyKey("legacy-import/" + legacyAccountNumber));   // derived from the fact, so a re-run stores nothing twice
     }
 }
 ```
 
-Give what you append through `event()` an idempotency key derived from the fact — here the legacy account number — never from the attempt. A re-run of the import then appends nothing a second time; a key minted per attempt would de-duplicate nothing. See [Appending Events](/posts/eventstore-appending-events/#idempotency) for how the store handles the key.
+`event(data)` takes the bare event; anything beyond its data — tags, an idempotency key — is given as the eventstore's `EphemeralEvent`, built the way an append builds it. Give what you append through `event()` an idempotency key derived from the fact — here the legacy account number — never from the attempt. A re-run of the import then appends nothing a second time; a key minted per attempt would de-duplicate nothing. See [Appending Events](/posts/eventstore-appending-events/#idempotency) for how the store handles the key.
 
 ### Lifecycle Belongs to the Owner
 
@@ -222,7 +237,7 @@ public class ErasureRequests {
 
 ### The Inbound Edge Is Separate From the Application
 
-`incoming(...)` and `translate(...)` feed the domain with events from outside, which is a different job from deciding on behalf of a user:
+`incoming(...)` and `translate(...)`, reached through `inbound()`, feed the domain with events from outside, which is a different job from deciding on behalf of a user:
 
 ```java
 /** Consumes the CRM's messages and hands them to the context. */
@@ -311,9 +326,9 @@ When you extend a context interface, decide whose a method is, and put it on the
 
 ## Summary
 
-- `BoundedContext` is the composition of audiences: application, inbound edge, operator, erasure, escape hatch, owner.
+- `BoundedContext` is the composition of audiences: application, inbound edge, operator, erasure, escape hatch, owner. The inbound edge and the readers of the inbound and outbound streams are narrowed from `inbound()` and `outbound()`.
 - Narrowing is an assignment: a built context already is each audience. Build the context in one place and hand out narrow types from there.
-- Declare `BankingApi extends ApplicationCapabilities<D,O>` and let `Banking` extend it; controllers and endpoints take `BankingApi`.
+- Declare `BankingApi extends ApplicationCapabilities<D>` and let `Banking` extend it; controllers and endpoints take `BankingApi`.
 - `event()` appends without a boundary check, so it is off the application surface; opt in with `ProvidedEventCapability` and an idempotency key derived from the fact.
 - Lifecycle is the owner's; operators stop and restart named processors on the instance they call, and decide nothing; erasure is its own audience.
 - No audience opens the event log; `UnboundedReadModelCapability` is named explicitly by a dashboard interface that needs it.

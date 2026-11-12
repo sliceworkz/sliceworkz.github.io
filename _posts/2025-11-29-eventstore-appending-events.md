@@ -63,7 +63,7 @@ Tags enable querying events across different event types based on shared busines
 ```java
 // Find all events for a specific customer, regardless of event type
 List<Event<CustomerEvent>> customerEvents = stream.query(
-    EventQuery.forTags(Tags.of("customer", "123"))
+    EventFilter.forTags("customer", "123")
 );
 ```
 
@@ -219,24 +219,25 @@ The EventStore implements optimistic locking through the DCB pattern using `Appe
 ### How It Works
 
 1. Take the stream's `head()` — the reference of its newest stored event — *before* reading
-2. Query relevant events using an `EventQuery`, bounded with `until(head)`
+2. Read the relevant events: an `EventFilter` for which facts matter, read as `EventQuery.of(filter).notAfter(head)`
 3. Make a business decision based on those facts
-4. Append new events with `AppendCriteria` containing the same query — **without** the `until` — and the head
-5. If new events matching the query exist after the head, `OptimisticLockingException` is thrown
+4. Append new events with `AppendCriteria` built from the same filter (or the same query) and the head
+5. If new events matching the filter exist after the head, `OptimisticLockingException` is thrown
 
 ```java
-EventQuery relevant = EventQuery.forTags(Tags.of("customer", "123"));
+EventFilter relevant = EventFilter.forTags("customer", "123");
 
 // Step 1: pin the boundary. An absent head is an empty stream, and a valid boundary
 EventReference head = stream.head().orElse(null);
 
-// Step 2 & 3: query the relevant facts as of that head, and decide
-List<Event<CustomerEvent>> facts = stream.query(relevant.until(head));
+// Step 2 & 3: read the relevant facts as of that head, and decide
+EventQuery read = EventQuery.of(relevant).notAfter(head);
+List<Event<CustomerEvent>> facts = stream.query(read);
 
-// Step 4 & 5: conditional append -- the query unbounded, the head as the expected last event
+// Step 4 & 5: conditional append -- the filter, the head as the expected last event
 try {
     stream.append(
-        AppendCriteria.of(relevant, head),
+        AppendCriteria.of(relevant, head),      // AppendCriteria.of(read, head) is the same criteria
         Event.of(new CustomerNameChanged("Jane"), Tags.of("customer", "123"))
     );
 } catch (OptimisticLockingException e) {
@@ -244,18 +245,44 @@ try {
 }
 ```
 
+`AppendCriteria` holds an `EventFilter` and an expected reference. It has two factories — `of(EventFilter, reference)` and `of(EventQuery, reference)` — and the second takes the query's **filter only**: its direction, limit and `notAfter` read bound say how the facts were read, not which facts are relevant. So the query a decision read with is exactly the one to pass; there is nothing to strip off first.
+
 ### Why the Head, and Not the Last Relevant Event
 
 The classic formulation notes the reference of the last *relevant* event from the query result and hands that to `AppendCriteria`. That still works, and is correct. Taking the head first is better in three ways:
 
-- **One boundary for several reads.** A decision that takes more than one query — a decision model plus an existence check, say — bounds each of them with `until(head)`, so nothing can land between the reads unseen. With the last relevant event of each read there is no single moment the decision was taken at.
+- **One boundary for several reads.** A decision that takes more than one query — a decision model plus an existence check, say — bounds each of them with `notAfter(head)`, so nothing can land between the reads unseen. With the last relevant event of each read there is no single moment the decision was taken at.
 - **No special case for an empty history.** `head()` is empty for an empty stream, and `null` is a valid "I decided on nothing" reference. There is no `getLast()` to throw on an empty result.
 - **A cheaper check on PostgreSQL.** The lock check walks the stream forward *from the reference* looking for a matching event. From the head that is a walk over the few events appended during the decision; from the last relevant event of a long-idle entity it is a walk over every stream event since — see [Stream Design and Performance](/posts/eventstore-stream-design-and-performance/#the-consistency-check-and-a-stale-cursor).
 
 `head()` never deserializes, upcasts or decrypts: an event this stream cannot map, one that upcasts into nothing, or one sealed under a key store that is down cannot make it fail. It is what a query would see — on PostgreSQL it sits behind the same visibility barrier as every read — and the event at the head need not match your filter: it is a cursor for the check, and only matching events after it count.
 
-> **Hand `AppendCriteria` the query without its `until`.** An `until` bounds a consistency boundary exactly as it bounds a read: `AppendCriteria.of(relevant.until(head), head)` — which is what reusing "the query I read with" produces, and reads as the more careful of the two — deems nothing after the head relevant. Every append is admitted and no `OptimisticLockingException` is ever raised: optimistic locking is off, and nothing tells you so.
-{: .prompt-danger }
+> **The read bound and the check bound are kept apart.** The read bound `EventQuery.notAfter(head)` is a property of the read, and `AppendCriteria.of(query, head)` never takes it — a check bounded at the very reference it compares against would find nothing new, ever. So handing the append the query you read with is always correct.
+{: .prompt-info }
+
+### Items Bounded Before the Reference
+
+A filter item can carry business bounds of its own — `after(ref)` (exclusive) and `until(ref)` (inclusive) — for decisions that are about part of the history: *the movements after the last stock count*, *the invoices up to the year close*. See [Bounding What Is Relevant](/posts/eventstore-querying-events/#bounding-what-is-relevant-after-and-until).
+
+The check asks for relevant events *after* the expected reference, so when an `AppendCriteria` is made each item's bounds are judged against that reference, comparing stored events:
+
+- an item **`until` a reference at or before the expected one** can match no event appended later, and is **left out** of the check;
+- an item **`after` a reference at or before the expected one** **loses that bound**, since every event after the expected reference is after it too;
+- every other bound is kept, and checked.
+
+```java
+EventFilter facts = EventFilter.forTypes(StockAdded.class, StockPicked.class).tagged("product", p).after(lastCount)
+                       .or(EventFilter.forTypes(InvoiceIssued.class).tagged("customer", c).until(yearClosed));
+
+EventReference head = stream.head().orElse(null);
+// ... read EventQuery.of(facts).notAfter(head), decide ...
+
+// the invoice item (until yearClosed, before head) is left out of the check;
+// the movements item loses its after(lastCount) and is checked for anything after head
+stream.append(AppendCriteria.of(facts, head), newEvent);
+```
+
+Nothing is pruned without an expected reference: a decision on an empty boundary counts every matching event. When every item is removed the filter matches nothing, and the append is unconditional — which is correct, since the decision depends only on history no later append can change.
 
 ### First Append (Empty Stream)
 
@@ -263,7 +290,7 @@ When appending to an empty stream, or when no previous relevant events exist, th
 
 ```java
 stream.append(
-    AppendCriteria.of(EventQuery.forTags(Tags.of("customer", "123")), null),  // decided on an empty result
+    AppendCriteria.of(EventFilter.forTags("customer", "123"), null),  // decided on an empty result
     Event.of(new CustomerRegistered("John"), Tags.of("customer", "123"))
 );
 ```
@@ -272,7 +299,7 @@ stream.append(
 
 ```java
 // checked: fails if any event tagged customer=123 exists
-AppendCriteria.of(EventQuery.forTags(Tags.of("customer", "123")), null);
+AppendCriteria.of(EventFilter.forTags("customer", "123"), null);
 
 // unchecked: appends unconditionally
 AppendCriteria.none();
@@ -377,7 +404,7 @@ public void appendIdempotently(
 
     // Define criteria: no event with this idempotency key should exist
     AppendCriteria criteria = AppendCriteria.of(
-        EventQuery.forTags(Tags.of("idempotency", idempotencyKey)),
+        EventFilter.forTags("idempotency", idempotencyKey),
         null  // Expect no prior event with this key
     );
 

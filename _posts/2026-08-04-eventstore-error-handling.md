@@ -25,7 +25,7 @@ Everything is unchecked. Nothing forces a `catch` you did not want.
 | `EventImportConflictException` | `…eventstore.spi` | `importEvents` hitting an existing id or idempotency key | **No** — change the mode or the data |
 | `ShreddingException` | `…eventstore.shredding` | the key store protecting personal data cannot be reached, holds no such key, or an envelope is malformed | **Maybe, with backoff** — an outage clears; a miswired key store or a malformed envelope does not |
 | `ProjectorException` | `…eventstore.projection` | a `Projector` run — wraps whatever it caught | inspect `getCause()` |
-| `IllegalArgumentException` | — | a misconfigured `getEventStream(...)` call, an illegal `Tag`, an incompatible `or`, a filter naming a legacy type, an append through a wildcard stream, a batch repeating an idempotency key | **No** — a code fix |
+| `IllegalArgumentException` | — | a misconfigured `getEventStream(...)` call, an illegal `Tag`, a `null` filter handed to `EventQuery.of` or `AppendCriteria`, a filter naming a legacy type, an append through a wildcard stream, a batch repeating an idempotency key | **No** — a code fix |
 
 **There is deliberately no common root** for "anything this library throws". A root only pays for itself if catching that is a useful operation, and it is not: these failures need opposite responses. A boundary conflict wants an immediate retry, a dropped connection wants backoff, an unreadable payload wants neither. A root would mostly encourage the broad catch that this split exists to avoid.
 
@@ -34,11 +34,11 @@ Everything is unchecked. Nothing forces a `catch` you did not want.
 `OptimisticLockingException` is not an error condition. It is the DCB mechanism working: a new relevant fact emerged between the moment a decision was taken and the moment its result was appended.
 
 ```java
-EventQuery relevant = EventQuery.forTags(Tags.of("customer", "123"));
+EventFilter relevant = EventFilter.forTags("customer", "123");
 
 for ( int attempt = 0; attempt < 5; attempt++ ) {
     EventReference head = stream.head().orElse(null);          // pin the boundary first
-    List<Event<CustomerEvent>> facts = stream.query(relevant.until(head));
+    List<Event<CustomerEvent>> facts = stream.query(EventQuery.of(relevant).notAfter(head));
 
     if ( !decide(facts) ) {
         return;                                  // the new facts changed the decision
@@ -46,7 +46,7 @@ for ( int attempt = 0; attempt < 5; attempt++ ) {
 
     try {
         stream.append(
-            AppendCriteria.of(relevant, head),   // the query WITHOUT its until
+            AppendCriteria.of(relevant, head),   // the same filter, the head as reference
             Event.of(new CustomerNameChanged("123", "Jane"), Tags.of("customer", "123")));
         return;
     } catch ( OptimisticLockingException e ) {
@@ -56,7 +56,7 @@ for ( int attempt = 0; attempt < 5; attempt++ ) {
 throw new IllegalStateException("gave up after 5 contended attempts");
 ```
 
-Three things matter about the loop. **Re-read and re-decide**, do not merely re-append: appending the same conclusion against a fresh reference defeats the point of the check. **Bound the attempts**, because a boundary that is genuinely hot will not clear on its own — measured, a boundary shared by sixteen writers conflicts 82% of the time, and adding writers makes useful throughput strictly worse; widen the boundary instead. And **never hand the criteria the bounded query**: `AppendCriteria.of(relevant.until(head), head)` never raises this exception at all, because nothing after the head is relevant to it — the loop then "succeeds" every time.
+Three things matter about the loop. **Re-read and re-decide**, do not merely re-append: appending the same conclusion against a fresh reference defeats the point of the check. **Bound the attempts**, because a boundary that is genuinely hot will not clear on its own — measured, a boundary shared by sixteen writers conflicts 82% of the time, and adding writers makes useful throughput strictly worse; widen the boundary instead. Handing the criteria the query you read with, `AppendCriteria.of(EventQuery.of(relevant).notAfter(head), head)`, is equally right: it takes the query's filter only, never its `notAfter` read bound.
 
 The exception carries the boundary that fired, which is worth logging when contention is unexpected:
 
@@ -162,7 +162,7 @@ catch ( EventDeserializationException e ) {
 `query()` and `page()` read their result in full before returning it, so a poison event fails **the call that reads it**, and nothing is returned — a query or page holding one hands out none of its events:
 
 ```java
-List<Event<CustomerEvent>> events = stream.query(EventQuery.matchAll());   // throws here, or returns everything
+List<Event<CustomerEvent>> events = stream.query(EventFilter.matchAll());   // throws here, or returns everything
 ```
 
 `getEventById` throws the same way. And `append` deserializes the events it just wrote in order to return them — so a payload that serializes but cannot be read back fails *there*, as a deserialization failure, with the event already stored.
@@ -184,7 +184,7 @@ There is no recovery but to fix the code, so they are not serde failures and no 
 
 `Tag.of(...)` and `Tags.of(...)` also reject shapes that would not survive storage — see [tag construction rules](/posts/eventstore-appending-events/#what-a-tag-may-contain) — and `Tags.tag(key)` throws `IllegalStateException` when several tags carry the key.
 
-Queries and appends have their own rules, and violating them throws here too, with nothing read or stored: `or` rejects differing `until` references, differing directions, and any query carrying a limit; a filter naming a legacy type is refused on a stream that upcasts it; an append through a wildcard stream is refused; and a batch repeating an idempotency key is refused.
+Queries and appends have their own rules, and violating them throws here too, with nothing read or stored: a query or criteria without a filter is refused (say `EventFilter.matchAll()` or `matchNone()` when that is what you mean); a filter naming a legacy type is refused on a stream that upcasts it; an append through a wildcard stream is refused; and a batch repeating an idempotency key is refused.
 
 ## Failures Inside a Projector
 

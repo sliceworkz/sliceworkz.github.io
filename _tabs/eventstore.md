@@ -22,7 +22,7 @@ Sliceworkz Eventstore is an **open source eventstore** implementation in Java.
 
 - Fully compliant with **DCB**, the <a href="https://dcb.events/specification">Dynamic Consistency Boundary specification</a>
 - Fully **typed access** to Event via EventStreams, checked by the compiler
-- Event **Query** capabilities on event Types and Tags, with a fluent builder and paged reads
+- Event **Filters** on event Types and Tags, with per-item `after`/`until` bounds and unions, read as **Queries** that are paged, limited, backwards or pinned at a moment
 - **Optimistic locking** on Event appends, atomic under concurrency, with `head()` to pin a boundary before deciding
 - Built-in **upcasting** of legacy events, across chains of versions
 - **Stored event names** decoupled from class names with `@EventName`

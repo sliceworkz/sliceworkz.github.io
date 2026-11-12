@@ -33,6 +33,7 @@ That brings JUnit Jupiter (engine included), the in-memory event storage, the ev
 | `CommandTest` | a command, and the business rules it checks | [Commands](#commands-commandtest) |
 | `AggregateTest` | an aggregate | [Aggregates](#aggregates-aggregatetest) |
 | `LiveModelTest` | a live read model | [Live Read Models](#live-read-models-livemodeltest) |
+| `InboundLiveModelTest`, `OutboundLiveModelTest` | a live read model over the inbound or outbound stream | [Read Models over the Edge Streams](#read-models-over-the-edge-streams) |
 | `AutomationTest` | an automation with its to-do list | [Automations](#automations-automationtest) |
 | `PolicyTest` | a policy and the command it issues | [Policies](#policies-policytest) |
 | `TranslatorTest` | translators | [Translators](#translators-translatortest) |
@@ -82,10 +83,10 @@ private static final AccountId ACC_1 = ACCOUNT.id("acc-1");
 @Test
 void depositsOnAnOpenAccount ( ) {
     given()
-        .event(opened(), ACCOUNT.tags(ACC_1))
+        .event(opened(), Tags.of(ACCOUNT.tag(ACC_1)))
         .when(new DepositCommand(ACC_1, 100))
         .then()
-        .event(new MoneyDeposited(ACC_1, 100), ACCOUNT.tags(ACC_1));
+        .event(new MoneyDeposited(ACC_1, 100), Tags.of(ACCOUNT.tag(ACC_1)));
 }
 
 @Test
@@ -143,7 +144,7 @@ void openingAnAccountRaisesAccountOpened ( ) {
     given()
         .when(new OpenAccountCommand(ALICE))
         .then()
-        .event(new AccountOpened(ACCOUNT.id(IGNORE_ID()), ALICE, LocalDate.now()), CUSTOMER.tags(ALICE));
+        .event(new AccountOpened(ACCOUNT.id(IGNORE_ID()), ALICE, LocalDate.now()), Tags.of(CUSTOMER.tag(ALICE)));
 }
 ```
 
@@ -160,7 +161,7 @@ void theResponseIsTheNewAccountsId ( ) {
         .when(new OpenAccountWithResultCommand(CUSTOMER.id("alice")))
         .then();
     AccountId accountId = ((TestResultWithResponse<BankingDomainEvent, AccountId>) result).response();
-    result.event(new AccountOpened(accountId, CUSTOMER.id("alice"), LocalDate.now()), ACCOUNT.tags(accountId));
+    result.event(new AccountOpened(accountId, CUSTOMER.id("alice"), LocalDate.now()), Tags.of(ACCOUNT.tag(accountId)));
 }
 ```
 
@@ -180,8 +181,8 @@ With a strictly enforced `MAXIMUM_WITHDRAWAL` and a `WITHDRAWAL_DESCRIBED` guide
 @Test
 void aWithdrawalAboveTheMaximumIsBlocked ( ) {
     given()
-        .event(opened(), ACCOUNT.tags(ACC_1))
-        .event(new MoneyDeposited(ACC_1, 10_000), ACCOUNT.tags(ACC_1))
+        .event(opened(), Tags.of(ACCOUNT.tag(ACC_1)))
+        .event(new MoneyDeposited(ACC_1, 10_000), Tags.of(ACCOUNT.tag(ACC_1)))
         .when(new WithdrawCommand(ACC_1, 6_000, "car"))
         .then()
         .rulesViolated()
@@ -191,8 +192,8 @@ void aWithdrawalAboveTheMaximumIsBlocked ( ) {
 @Test
 void aPreviewShowsTheGuidelineWithoutAppendingAnything ( ) {
     given()
-        .event(opened(), ACCOUNT.tags(ACC_1))
-        .event(new MoneyDeposited(ACC_1, 1_000), ACCOUNT.tags(ACC_1))
+        .event(opened(), Tags.of(ACCOUNT.tag(ACC_1)))
+        .event(new MoneyDeposited(ACC_1, 1_000), Tags.of(ACCOUNT.tag(ACC_1)))
         .as("alice")
         .whenEvaluated(new WithdrawCommand(ACC_1, 100, ""))
         .thenEvaluation()
@@ -227,8 +228,8 @@ An execution that **goes ahead** with violations is asserted through its event: 
 @Test
 void aWithdrawalWithoutDescriptionGoesAheadAndRecordsTheGuideline ( ) {
     given()
-        .event(opened(), ACCOUNT.tags(ACC_1))
-        .event(new MoneyDeposited(ACC_1, 1_000), ACCOUNT.tags(ACC_1))
+        .event(opened(), Tags.of(ACCOUNT.tag(ACC_1)))
+        .event(new MoneyDeposited(ACC_1, 1_000), Tags.of(ACCOUNT.tag(ACC_1)))
         .when(new WithdrawCommand(ACC_1, 100, ""))
         .then()
         .event(new MoneyWithdrawn(ACC_1, 100, "", List.of(new RuleViolation(WITHDRAWAL_DESCRIBED.id(),
@@ -251,7 +252,7 @@ class CardAggregateTest extends AggregateTest<BankingDomainEvent, BankingInbound
 
     @Test
     void anIssuedCardIsBlocked ( ) {
-        given(CARD.tags(CARD_A))
+        given(Tags.of(CARD.tag(CARD_A)))
             .events(new CardIssued(ACC_1, CARD_A))
             .when(card -> card.block("reported stolen"))
             .then()
@@ -260,7 +261,7 @@ class CardAggregateTest extends AggregateTest<BankingDomainEvent, BankingInbound
 
     @Test
     void aBlockedCardIsNotBlockedTwice ( ) {
-        given(CARD.tags(CARD_A))
+        given(Tags.of(CARD.tag(CARD_A)))
             .events(new CardIssued(ACC_1, CARD_A), new CardBlocked(ACC_1, CARD_A, "reported lost"))
             .when(card -> card.block("reported stolen"))
             .then()
@@ -286,10 +287,10 @@ class AccountDetailsReadModelTest extends LiveModelTest<BankingDomainEvent, Bank
     @Test
     void showsTheBalanceOfOneAccount ( ) {
         given()
-            .event(new AccountOpened(ACC_1, CUSTOMER.id("alice"), LocalDate.of(2026, 1, 5)), ACCOUNT.tags(ACC_1))
-            .event(new MoneyDeposited(ACC_1, 100), ACCOUNT.tags(ACC_1))
-            .event(new AccountOpened(ACC_2, CUSTOMER.id("bob"), LocalDate.of(2026, 1, 6)), ACCOUNT.tags(ACC_2))
-            .event(new MoneyDeposited(ACC_2, 999), ACCOUNT.tags(ACC_2))
+            .event(new AccountOpened(ACC_1, CUSTOMER.id("alice"), LocalDate.of(2026, 1, 5)), Tags.of(ACCOUNT.tag(ACC_1)))
+            .event(new MoneyDeposited(ACC_1, 100), Tags.of(ACCOUNT.tag(ACC_1)))
+            .event(new AccountOpened(ACC_2, CUSTOMER.id("bob"), LocalDate.of(2026, 1, 6)), Tags.of(ACCOUNT.tag(ACC_2)))
+            .event(new MoneyDeposited(ACC_2, 999), Tags.of(ACCOUNT.tag(ACC_2)))
             .when(ACC_1)
             .then()
             .liveModel(model -> ((AccountDetailsReadModel) model).details().orElseThrow())
@@ -307,7 +308,33 @@ class AccountDetailsReadModelTest extends LiveModelTest<BankingDomainEvent, Bank
 }
 ```
 
+Tags are given as a `Tags` everywhere in the test bases — `Tags.of(ACCOUNT.tag(ACC_1))` for one entity's tag.
+
 `liveModel(mapper)` picks the part of the read model to assert on — usually the value it exposes — and **must come first**: `is(expected)` compares that mapped value field by field, and `satisfies(assertion)` hands it to your own assertion. Seeding a second account is worth the two lines: it proves the read model's query selects by its tag and not by luck.
+
+### Read Models over the Edge Streams
+
+A read model projected from the inbound or the outbound stream (see [Translators, Publishers and Dispatchers](/posts/eventmodeling-translators-publishers-dispatchers/#read-models-over-the-inbound-and-outbound-streams)) has a base of its own: `InboundLiveModelTest` registers it `.live()` on `builder.inbound()`, seeds inbound events as they are — nothing is translated, since nothing but the read model is registered — and reads it through `kernel().inbound().read(...)`. `OutboundLiveModelTest` is the same over the outbound stream.
+
+```java
+class InboundTrafficReadModelTest extends InboundLiveModelTest<BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> {
+
+    // the three event type methods, plus:
+    @Override
+    public Class<? extends ReadModel<BankingInboundEvent>> getLiveModelClass ( ) {
+        return InboundTrafficReadModel.class;
+    }
+
+    @Test
+    void countsWhatCameInPerTypeAndPerCustomer ( ) {
+        given()
+            .events(new CustomerSuspended(ALICE), new CustomerSuspended(BOB), new CustomerSuspended(ALICE))
+        .then()
+            .liveModel(model -> ((InboundTrafficReadModel) model).published().data())
+            .is(new Traffic(Map.of("CustomerSuspended", 3L), Map.of("alice", 2L, "bob", 1L)));
+    }
+}
+```
 
 ## Automations: `AutomationTest`
 
@@ -318,18 +345,18 @@ class GrantWelcomeBonusAutomationTest
         extends AutomationTest<AccountAwaitingBonus, BankingDomainEvent, BankingInboundEvent, BankingOutboundEvent> {
 
     @Override
-    public Automation<AccountAwaitingBonus, BankingDomainEvent, BankingOutboundEvent> automation ( ) {
+    public Automation<AccountAwaitingBonus, BankingDomainEvent> automation ( ) {
         return new GrantWelcomeBonusAutomation(new AccountsAwaitingWelcomeBonusTodoList());
     }
 
     @Test
     void aNewAccountGetsItsBonusOnce ( ) {
         given()
-            .event(opened(), ACCOUNT.tags(ACC_1))
+            .event(opened(), Tags.of(ACCOUNT.tag(ACC_1)))
             .expectTodoItems(new AccountAwaitingBonus(ACC_1))
             .whenBatchRuns()
                 .itemsHandled(1)
-                .event(new WelcomeBonusGranted(ACC_1, GrantWelcomeBonusCommand.BONUS), ACCOUNT.tags(ACC_1))
+                .event(new WelcomeBonusGranted(ACC_1, GrantWelcomeBonusCommand.BONUS), Tags.of(ACCOUNT.tag(ACC_1)))
             .and()
             .expectNoTodoItems();
     }
@@ -337,7 +364,7 @@ class GrantWelcomeBonusAutomationTest
     @Test
     void aRedeliveredItemGrantsNothingTwice ( ) {
         given()
-            .event(opened(), ACCOUNT.tags(ACC_1))
+            .event(opened(), Tags.of(ACCOUNT.tag(ACC_1)))
             .whenBatchRuns()
                 .itemsHandled(1)
             .and()
@@ -369,7 +396,7 @@ private final TransferGateway gateway = ( toIban, amountInCents, key ) -> answer
 void anUnexpectedFailureStopsTheAutomation ( ) {
     answers.add(() -> { throw new IllegalStateException("adapter bug"); });
     given()
-        .event(new TransferRequested(T_1, ACC_1, "BE01", 100), TRANSFER.tags(T_1))
+        .event(new TransferRequested(T_1, ACC_1, "BE01", 100), Tags.of(TRANSFER.tag(T_1)))
         .whenBatchRuns()
             .automationStopped();
 }
@@ -396,9 +423,9 @@ class BlockCardsOfClosedAccountPolicyTest extends PolicyTest<BankingDomainEvent,
 
     @Test
     void aRedeliveredEventIsNotReactedToAgain ( ) {
-        given(new AccountOpened(ACC_1, CUSTOMER.id("alice"), LocalDate.of(2026, 1, 5)), ACCOUNT.tags(ACC_1))
+        given(new AccountOpened(ACC_1, CUSTOMER.id("alice"), LocalDate.of(2026, 1, 5)), Tags.of(ACCOUNT.tag(ACC_1)))
             .and(new CardIssued(ACC_1, CARD_A), Tags.of(ACCOUNT.tag(ACC_1), CARD.tag(CARD_A)))
-            .and(new AccountClosed(ACC_1), ACCOUNT.tags(ACC_1))
+            .and(new AccountClosed(ACC_1), Tags.of(ACCOUNT.tag(ACC_1)))
         .whenReacting()
             .events(new CardBlocked(ACC_1, CARD_A, "account closed"))
         .and()
@@ -417,8 +444,8 @@ A rejection follows the policy's rejection handling. By default it **stalls**, a
 ```java
 @Test
 void aRejectionStallsThePolicy ( ) {
-    var result = given(new AccountOpened(ACC_1, CUSTOMER.id("alice"), LocalDate.of(2026, 1, 5)), ACCOUNT.tags(ACC_1))
-        .and(new AccountClosed(ACC_1), ACCOUNT.tags(ACC_1))
+    var result = given(new AccountOpened(ACC_1, CUSTOMER.id("alice"), LocalDate.of(2026, 1, 5)), Tags.of(ACCOUNT.tag(ACC_1)))
+        .and(new AccountClosed(ACC_1), Tags.of(ACCOUNT.tag(ACC_1)))
         .whenReacting()
         .rejected("Account acc-1 is closed");
     assertNotNull(result.stalledOn());            // the event the policy is stuck on
@@ -431,8 +458,8 @@ void aRejectionStallsThePolicy ( ) {
 
 @Test
 void aRejectionIsSkipped ( ) {
-    given(new AccountOpened(ACC_1, CUSTOMER.id("alice"), LocalDate.of(2026, 1, 5)), ACCOUNT.tags(ACC_1))
-        .and(new AccountClosed(ACC_1), ACCOUNT.tags(ACC_1))
+    given(new AccountOpened(ACC_1, CUSTOMER.id("alice"), LocalDate.of(2026, 1, 5)), Tags.of(ACCOUNT.tag(ACC_1)))
+        .and(new AccountClosed(ACC_1), Tags.of(ACCOUNT.tag(ACC_1)))
         .whenReacting()
         .rejected("Account acc-1 is closed")
         .noEvents();
@@ -458,12 +485,12 @@ class PartnerDepositTranslatorTest extends TranslatorTest<BankingDomainEvent, Ba
         given()
             .when(new PartnerDepositReceived("acc-1", 250))
             .then()
-            .event(new MoneyDeposited(ACCOUNT.id("acc-1"), 250), ACCOUNT.tags(ACCOUNT.id("acc-1")));
+            .event(new MoneyDeposited(ACCOUNT.id("acc-1"), 250), Tags.of(ACCOUNT.tag(ACCOUNT.id("acc-1"))));
     }
 }
 ```
 
-Two properties of that path are asserted on every test for free: the inbound event is **not** persisted, and an inbound event no translator claims makes `then().noTranslatorRegistered()` pass rather than vanishing. The interactive path matches translators on the inbound event's *type*; the translation logic is the same one the asynchronous `incoming(...)` path runs. See [Translators, Publishers and Dispatchers](/posts/eventmodeling-translators-publishers-dispatchers/).
+Two properties of that path are asserted on every test for free: the inbound event is **not** persisted, and an inbound event no translator claims makes `then().noTranslatorRegistered()` pass rather than vanishing. The interactive path matches translators on the inbound event's *type*; the translation logic is the same one the asynchronous `inbound().incoming(...)` path runs. See [Translators, Publishers and Dispatchers](/posts/eventmodeling-translators-publishers-dispatchers/).
 
 ## Publishers: `PublisherTest`
 
@@ -472,11 +499,11 @@ Two properties of that path are asserted on every test for free: the inbound eve
 ```java
 @Test
 void anOpenedAccountIsAnnouncedOnceAndOnlyOnce ( ) {
-    given(new AccountOpened(ACC_1, CUSTOMER.id("alice"), LocalDate.of(2026, 1, 5)), ACCOUNT.tags(ACC_1))
+    given(new AccountOpened(ACC_1, CUSTOMER.id("alice"), LocalDate.of(2026, 1, 5)), Tags.of(ACCOUNT.tag(ACC_1)))
     .whenPublished()
-        .published(new AccountAnnounced(ACC_1), ACCOUNT.tags(ACC_1))
+        .published(new AccountAnnounced(ACC_1), Tags.of(ACCOUNT.tag(ACC_1)))
     .and()
-        .and(new AccountOpened(ACC_2, CUSTOMER.id("bob"), LocalDate.of(2026, 1, 6)), ACCOUNT.tags(ACC_2))
+        .and(new AccountOpened(ACC_2, CUSTOMER.id("bob"), LocalDate.of(2026, 1, 6)), Tags.of(ACCOUNT.tag(ACC_2)))
     .whenPublished()
         .published(new AccountAnnounced(ACC_2))
     .and()
@@ -489,7 +516,7 @@ void anOpenedAccountIsAnnouncedOnceAndOnlyOnce ( ) {
 
 ## Dispatchers: `DispatcherTest`
 
-A dispatcher is a projection over the outbound stream, and `DispatcherTest` drives it as one. `given(...)` seeds outbound events as fixture data; the test asserts on the fake the dispatcher sends to:
+A dispatcher is an event handler over the outbound stream, read forward from a cursor, and `DispatcherTest` drives it the way its processor does. `given(...)` seeds outbound events as fixture data; the test asserts on the fake the dispatcher sends to:
 
 ```java
 private final List<String> sent = new ArrayList<>();
@@ -560,7 +587,7 @@ Which storage a test runs on depends on how its method is annotated:
 | `@Test` | once, against an in-memory store. Nothing to configure |
 | `@ForEachBackend` | once per registered `EventStoreBackend`, each reported under its backend's name: `openingAnAccountRaisesAccountOpened [postgres:18]` |
 
-`@ForEachBackend` is `org.sliceworkz.eventstore.testing.ForEachBackend`, the eventstore's own — see [Testing Your Application](/posts/eventstore-testing/) for the harness behind it. It works on every bounded-context base: `CommandTest`, `AggregateTest`, `LiveModelTest`, `AutomationTest`, `PolicyTest`, `TranslatorTest`, `PublisherTest` and `DispatcherTest`.
+`@ForEachBackend` is `org.sliceworkz.eventstore.testing.ForEachBackend`, the eventstore's own — see [Testing Your Application](/posts/eventstore-testing/) for the harness behind it. It works on every bounded-context base: `CommandTest`, `AggregateTest`, `LiveModelTest`, `InboundLiveModelTest`, `OutboundLiveModelTest`, `AutomationTest`, `PolicyTest`, `TranslatorTest`, `PublisherTest` and `DispatcherTest`.
 
 **Use `@ForEachBackend` where the storage could change the answer**: anything touching consistency boundaries, tags, idempotency keys or ordering — a DCB conflict under a real advisory lock, a tag round trip through PostgreSQL's `text[]`, a redelivery swallowed by a stream-scoped unique index. **Use `@Test` where the scenario is about your own code** and no storage can change it; it costs no container.
 
@@ -665,6 +692,7 @@ The examples module carries a test per pattern, written against these bases:
 | [`WithdrawCommandTest`](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-examples/src/test/java/org/sliceworkz/eventmodeling/examples/banking/features/withdraw/WithdrawCommandTest.java) | every enforcement level, `as(...)`, previews and a quota |
 | [`ExecutePaymentAutomationTest`](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-examples/src/test/java/org/sliceworkz/eventmodeling/examples/payments/features/executepayment/ExecutePaymentAutomationTest.java) | every `onFailure` branch, deferred retries seeded rather than waited out |
 | [`ReportExcessBalanceAutomationTest`](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-examples/src/test/java/org/sliceworkz/eventmodeling/examples/banking/features/excessbalance/ReportExcessBalanceAutomationTest.java) | a redelivered item swallowed by its key |
+| [`InboundTrafficReadModelTest`](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-examples/src/test/java/org/sliceworkz/eventmodeling/examples/banking/features/inboundtraffic/InboundTrafficReadModelTest.java) | a read model over the inbound stream |
 | [`BlockCardsOfAccountPolicyTest`](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-examples/src/test/java/org/sliceworkz/eventmodeling/examples/banking/features/blockcardsofaccount/BlockCardsOfAccountPolicyTest.java) | a policy, its redelivery, and a later trigger blocking nothing twice |
 
 The module's own [README](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-testing/README.md) has the reference for each base.
