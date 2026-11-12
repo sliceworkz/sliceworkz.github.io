@@ -230,7 +230,7 @@ The framework works out which Event Modeling pattern a slice is (`SliceType`) fr
 | parts of more than one pattern | `UNCLEAR` |
 | nothing | `UNDEFINED` |
 
-`STATE_VIEW` was called `STATE_READ` before 0.9.0 — the read-only slice is a *state view*, as Event Modeling calls it. Monitoring events carry the type in every slice descriptor, so a monitoring store holding events from before the rename cannot be read by a dashboard on 0.9.0: clear such a (development or test) store when upgrading.
+The read-only slice is a *state view*, as Event Modeling calls it.
 
 The rule is the one the Sliceworkz Modeler applies to a modeled slice, so a slice in the code and the same slice in the model come out as the same type. Three consequences:
 

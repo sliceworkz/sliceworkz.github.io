@@ -215,11 +215,6 @@ twice.
 filter forward. Override `eventQuery()` only for a model that reads otherwise — the newest event,
 backwards with a limit of one — and build it on the filter: `EventQuery.of(eventFilter()).backwards().limit(1)`.
 
-> **Coming from 0.8?** A decision model used to implement `EventQuery eventQuery()`. It now implements
-> `EventFilter eventFilter()` and returns the filter — `EventQuery.forTypes(X.class).tagged(...)` becomes
-> `EventFilter.forTypes(X.class).tagged(...)`. `initQuery()` stays an `EventQuery`, built as
-> `EventQuery.of(filter).backwards().limit(1)`.
-{: .prompt-warning } The repository's
 [`ActivePeriodDecisionModel`](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-examples/src/main/java/org/sliceworkz/eventmodeling/examples/banking/features/currentperiod/ActivePeriodDecisionModel.java)
 is the full version of this model.
 
@@ -318,12 +313,6 @@ bank.execute(command, Execution.idempotent(requestId).withRetry()); // both
 
 It works the same for `Command` and `CommandWithResult`.
 
-> **Coming from 0.8?** `execute(command, key)` is `execute(command, Execution.idempotent(key))`, and
-> `executeWithRetry(command[, key][, policy])` is `execute(command, Execution.retrying(...))` — with
-> `.withIdempotencyKey(key)` when it had a key. The overloads taking a `Tracing` are gone too: bind it
-> instead (see [Tracing](#tracing-who-through-what-in-which-flow)).
-{: .prompt-warning }
-
 ## Retrying a Conflict
 
 An `OptimisticLockingException` is the routine DCB outcome under contention, and the answer is always the
@@ -389,9 +378,7 @@ The command decides how it treats a caller's key with one choice on the `Command
 | `idempotencyKey(key, CallerKey.REFUSED)` | the command's | refused |
 
 A refusal is an `IllegalStateException`, before anything is appended: the command and its caller disagree
-about who keys the execution, which is a bug in one of them. (In 0.8 these were five separate methods —
-`idempotencyKey`, `fallbackIdempotencyKey`, `exclusiveIdempotencyKey`, `requireIdempotencyKey` and
-`forbidIdempotencyKey`.)
+about who keys the execution, which is a bug in one of them.
 
 ## Tracing: Who, Through What, in Which Flow
 
@@ -417,10 +404,6 @@ Optional<EventReference> ref = TracingScope.call(alice, () -> bank.execute(comma
 was bound before, also when the work throws. Without a bound tracing, the command starts a fresh flow with
 no actor. An HTTP layer typically binds the tracing built from the authenticated user once per request.
 
-> **Coming from 0.8?** `execute(command, tracing)`, `executeWithRetry(command, tracing, …)` and the other
-> overloads taking a `Tracing` are gone. Bind the tracing around the call instead. A `Tracing` handed to
-> `read(...)` among its parameters is refused, naming this remedy.
-{: .prompt-warning } [Observability and Tracing](/posts/eventmodeling-observability/)
 covers correlation across commands, automations and translators.
 
 ## Aggregates: the Second Checked Write Path
@@ -477,9 +460,9 @@ account.withdraw(new BigDecimal("10"), "coffee");
   type — and every event the aggregate raises is tagged with the identity.
 - **`eventFilter(Tags identity)` decides both what the aggregate reads and what its append checks.** The
   default is `EventFilter.forTags(identity)`. Override it to leave out events that can change none of the
-  aggregate's decisions: an event it leaves out is neither read nor checked. (Up to 0.8 this was
-  `eventQuery(Tags identity)`, and the check stayed on every event carrying the identity whatever the
-  aggregate read — so an aggregate narrowing its read could be blocked for good by an event it never saw.)
+  aggregate's decisions: an event it leaves out is neither read nor checked.
+  Because read and check are one filter, an aggregate that narrows its read is never blocked by an event it
+  does not read.
 - **`raiseEvent` appends immediately**, checked against the last event the instance has seen. An instance
   that has fallen behind — loaded before another instance appended — gets an `OptimisticLockingException`.
   `context.updateFromStream()` catches it up; loading it again does the same.

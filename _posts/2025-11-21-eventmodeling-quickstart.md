@@ -79,9 +79,6 @@ For production, use `sliceworkz-eventstore-infra-postgres` instead of the in-mem
 
 The framework logs through SLF4J; add the binding of your choice (Logback, for instance) to see what it reports.
 
-> **Coming from 0.8?** 0.9.0 moves to Eventstore 0.13's split of filters and queries, and makes several API choices single values. The changes you will meet first: read models, decision models, todo lists, translators, publishers, policies and dispatchers declare `eventFilter()` instead of `eventQuery()`; `Entity.tags(id)` is gone in favour of `tag(id)`; `executeWithRetry(...)` and `execute(command, key)` become `execute(command, Execution...)`; a `Tracing` is bound with `TracingScope` instead of passed; `ApplicationCapabilities` and `Automation`'s context lose their outbound type parameter; translators, publishers and dispatchers are registered on `builder.inbound()` and `builder.outbound()`; and the `STATE_READ` slice type is `STATE_VIEW`. Each guide notes the changes in its own area.
-{: .prompt-warning }
-
 ## Step 2: Define the Domain
 
 A bounded context has three kinds of events: **domain events** it records itself, **inbound events** other systems tell it, and **outbound events** it publishes. Next to them sit the **entities** — the kinds of thing events are about — each with an id type of its own.

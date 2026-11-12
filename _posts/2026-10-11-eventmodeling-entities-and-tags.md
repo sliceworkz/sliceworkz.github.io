@@ -92,9 +92,6 @@ public EventFilter eventFilter ( ) {
 
 `raiseEvent(event, Tag...)` and the eventstore's `EventFilter.forTags(Tag...)` / `.tagged(Tag...)` take an entity's `Tag` as it is. `Tags.of(ACCOUNT.tag(id))` is left for what takes a `Tags` alone: an aggregate's identity, `raiseEvent` with an idempotency key, a provided event, the test bases.
 
-> **Coming from 0.8?** `Entity.tags(id)` is gone — it was `tag(id)` wrapped in a `Tags`. Write `ACCOUNT.tag(id)` where a `Tag...` is taken (`raiseEvent`, `forTags`, `tagged`), and `Tags.of(ACCOUNT.tag(id))` elsewhere.
-{: .prompt-warning }
-
 And an endpoint turns a path parameter into an id:
 
 ```java

@@ -339,13 +339,10 @@ Called as `handle("alice", "req-42", ...)`, the port event and the `AccountOpene
 
 The rules of the binding:
 
-- **Binding is the only way to say who a call is for.** No capability takes a `Tracing` argument any more; a component's own context (an automation's, a translator's, a policy's) carries the tracing of the event it handles, whatever is bound.
+- **Binding is the only way to say who a call is for.** No capability takes a `Tracing` argument; a component's own context (an automation's, a translator's, a policy's) carries the tracing of the event it handles, whatever is bound.
 - A call in the middle of an expression binds for just that call: `TracingScope.call(alice, () -> banking.execute(command))`, or `TracingScope.run(alice, () -> ...)` for work that answers nothing. Both restore what was bound before, also when the work throws.
 - A binding **belongs to its thread**. Nothing is inherited by a thread the request starts, nor by the processor threads of automations and dispatchers, which carry the tracing of the events they handle.
 - `close()` restores what was bound before, so scopes nest; it is idempotent and does nothing on another thread. `TracingScope.bind(null)` is an `IllegalArgumentException` — an edge that forgot its tracing should be visible.
-
-> **Coming from 0.8?** The overloads taking a `Tracing` — `execute(command, tracing)`, `read(X.class, tracing, ...)`, `event(..., tracing)` and the rest — are gone. Bind the tracing around the call instead: `try ( TracingScope s = TracingScope.bind(tracing) ) { banking.execute(command); }`. A `Tracing` still handed to `read(...)` among its parameters is refused up front, naming the remedy.
-{: .prompt-warning }
 
 ## The Inventory: `BoundedContextStarting.ports`
 

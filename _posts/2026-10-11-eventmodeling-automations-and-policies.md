@@ -131,9 +131,6 @@ Three things in there are worth copying:
 
 `Automation<T, D>` takes the item type first, then the domain events. Note the to-do list is declared the other way round, `TodoListReadModel<D, T>`. The one method that does work is `handle`:
 
-> **Coming from 0.8?** `Automation` and `AutomationContext` lost their outbound type parameter — an automation writes the domain stream only, so it was never used: `Automation<T, D, O>` is `Automation<T, D>`, `AutomationContext<D, O>` is `AutomationContext<D>`.
-{: .prompt-warning }
-
 ```java
 public class ExecuteTransferAutomation implements Automation<TransferToExecute, BankingDomainEvent> {
 
@@ -287,9 +284,6 @@ public Optional<EventReference> handle ( AccountToLock item, AutomationContext<B
                      .withRetry(RetryPolicy.of(5)));
 }
 ```
-
-> **Coming from 0.8?** `executeWithRetry(command[, key][, policy])` and `execute(command, key)` are gone: `execute(command, Execution.retrying())`, `Execution.idempotent(key)`, or both, `Execution.idempotent(key).withRetry(...)`. Likewise `context.event(data, tags, key)` is `context.event(EphemeralEvent.of(data, tags).withIdempotencyKey(key))`.
-{: .prompt-warning }
 
 Each attempt re-executes the command, which re-reads its decision models and decides again against the new facts; only `OptimisticLockingException` is retried. A `BusinessException` from the re-decide propagates — and lands in your `onFailure`. A conflict cleared inside `handle` never reaches `onFailure` at all.
 

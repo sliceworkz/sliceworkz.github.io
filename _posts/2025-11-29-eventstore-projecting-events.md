@@ -139,9 +139,6 @@ public EventQuery eventQuery() {
 
 A `null` from `eventFilter()` is refused with an `IllegalStateException`: say `EventFilter.matchAll()` or `EventFilter.matchNone()` when that is what you mean.
 
-> **Coming from 0.12?** `eventQuery()` used to be the abstract method. Rename it to `eventFilter()` and return the filter: `EventQuery eventQuery() { return EventQuery.forTags(tags); }` becomes `EventFilter eventFilter() { return EventFilter.forTags(tags); }`. Keep an `eventQuery()` override only where it reads backwards, with a limit, or bounded.
-{: .prompt-warning }
-
 **The query is read once per run.** Storage is asked with it and every event of the run is matched against it, so a projection that computes its filter cannot answer differently halfway through a run — and is not asked once per event, either.
 
 ## Using the Projector

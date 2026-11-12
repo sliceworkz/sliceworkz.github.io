@@ -83,9 +83,6 @@ public class SalaryPaidTranslator implements Translator<BankingInboundEvent, Ban
 
 A translator is always read forward from its bookmark, which is why it declares an `EventFilter` and no `EventQuery`: a direction, limit or read bound would have nothing to mean there. How the command runs is one value, an `Execution` — here idempotent under a key derived from the inbound event, and re-executed on an optimistic-locking conflict. A domain event the translator records itself is given the way the event store appends one: an `EphemeralEvent` with its tags and, where it needs one, its idempotency key.
 
-> **Coming from 0.8?** A translator's `eventQuery()` is now `eventFilter()`, returning the filter (`EventFilter.forTypes(...)` for `EventQuery.forTypes(...)`). `executeWithRetry(command, key, policy)` is `execute(command, Execution.idempotent(key).withRetry(policy))`, and `event(data, tags, key)` is `event(EphemeralEvent.of(data, tags).withIdempotencyKey(key))`.
-{: .prompt-warning }
-
 `translate` is handed the inbound `Event`, not just its payload — the one-`when` rule every component follows — so the tags, the timestamp and the reference are at hand. The reference's id is what keys the translation: a redelivered inbound event raises nothing twice.
 
 ### A translator must not throw
@@ -120,9 +117,6 @@ payrollFeed.incoming(new SalaryPaid(accountId.value(), 250_000, "PAY-2026-10"), 
 // a caller that needs to act on the outcome right away
 List<EventReference> raised = payrollFeed.translate(new SalaryPaid(accountId.value(), 250_000, "PAY-2026-10"));
 ```
-
-> **Coming from 0.8?** `incoming(...)` and `translate(...)` have left the root of the bounded context: they are `banking.inbound().incoming(...)` and `banking.inbound().translate(...)`.
-{: .prompt-warning }
 
 `incoming` is the default: the inbound event is durable before you acknowledge it, and the translator retries without the caller. Give it an **idempotency key from the sender's own message id** (`incoming(event, key)`), so a sender retrying its delivery stores the message once.
 
@@ -263,9 +257,6 @@ public class BalanceNotificationFeatureSlice implements Slice<Banking> {
 ```
 
 Publishers and dispatchers are registered on `builder.outbound()`, beside the outbound legacy event types and any read model over the outbound stream.
-
-> **Coming from 0.8?** `builder.translator(...)`, `builder.publisher(...)` and `builder.dispatcher(...)` are `builder.inbound().translator(...)`, `builder.outbound().publisher(...)` and `builder.outbound().dispatcher(...)`. `historicalEventTypes(domain, inbound, outbound)` is split per stream: `builder.legacyEventTypes(domain)`, `builder.inbound().legacyEventTypes(inbound)`, `builder.outbound().legacyEventTypes(outbound)`. And Translator, Publisher and Dispatcher each declare `eventFilter()` instead of `eventQuery()`.
-{: .prompt-warning }
 
 `build()` holds the registration to two rules, each naming every offender:
 

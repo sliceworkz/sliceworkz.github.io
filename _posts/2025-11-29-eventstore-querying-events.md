@@ -50,9 +50,6 @@ Event.of(new CustomerUpdated("Dave"), Tags.none()) // ✗ Type matches, but miss
 
 The same filter can be used both for database-level filtering and in-process filtering, as explained further down.
 
-> **Coming from 0.12?** `EventQuery` no longer has filter builders: `EventQuery.forTypes(...)`, `forTags(...)`, `forEvents(...)`, `matchAll()`, `matchNone()`, `tagged(...)` and `or(...)` are gone. Build the `EventFilter` and wrap it — `EventQuery.forTypes(X.class).tagged(k, v)` becomes `EventQuery.of(EventFilter.forTypes(X.class).tagged(k, v))`, or just the filter where the read is a plain forward one. A query's `until(ref)` is now `notAfter(ref)`, and `EventFilter.forEvents(types, tags)` is `EventFilter.of(types, tags)`.
-{: .prompt-warning }
-
 ## Building a Filter
 
 There are two spellings, and they build the same filter — a filter built one way compares equal to the same filter built the other way.
@@ -425,9 +422,6 @@ List<Event<CustomerEvent>> backward = stream.query(upTo.backwards());
 **It never reaches a consistency boundary.** `AppendCriteria.of(query, head)` takes the query's *filter* only; its direction, limit and read bound say how the facts were read, not which facts are relevant. So the query a decider read with is exactly the one to hand to the append — the read is bounded at the head, the check looks past it. See [Optimistic Locking](/posts/eventstore-appending-events/#optimistic-locking).
 
 Note that the ordering compared is the tuple, not the position alone. Positions and transactions are assigned independently, so an event can hold a lower position and a higher transaction than one that committed before it. Comparing positions would silently drop such events.
-
-> In 0.12 this bound was `EventQuery.until(ref)`, and it lived on the filter — which is why an `AppendCriteria` built from a bounded query used to miss conflicts, and why the criteria had to be built from an unbounded one. With the bound on the query, that trap is gone.
-{: .prompt-info }
 
 ## Bounding What Is Relevant: `after` and `until`
 

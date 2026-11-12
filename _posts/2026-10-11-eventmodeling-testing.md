@@ -310,9 +310,6 @@ class AccountDetailsReadModelTest extends LiveModelTest<BankingDomainEvent, Bank
 
 Tags are given as a `Tags` everywhere in the test bases — `Tags.of(ACCOUNT.tag(ACC_1))` for one entity's tag.
 
-> **Coming from 0.8?** `Entity.tags(id)` is gone: an entity's tag is `ACCOUNT.tag(id)`, wrapped as `Tags.of(ACCOUNT.tag(id))` where a `Tags` is asked for — as it is by `.event(e, tags)`, `given(e, tags)`, `given(identity)` and the event assertions.
-{: .prompt-warning }
-
 `liveModel(mapper)` picks the part of the read model to assert on — usually the value it exposes — and **must come first**: `is(expected)` compares that mapped value field by field, and `satisfies(assertion)` hands it to your own assertion. Seeding a second account is worth the two lines: it proves the read model's query selects by its tag and not by luck.
 
 ### Read Models over the Edge Streams

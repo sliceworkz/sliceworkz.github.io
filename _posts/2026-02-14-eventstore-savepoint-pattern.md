@@ -211,7 +211,7 @@ When no savepoint exists — for example, on the very first run before any savep
 
 ## Savepoints in a Decision
 
-The same shape works without a `Projector`, when a command reads its facts by hand. A savepoint is then a business bound on the filter: the movements recorded *after* the last count are relevant, nothing before it. Since 0.13 each item of a filter carries its own bounds, so that is one filter, and the read and the consistency check agree on it:
+The same shape works without a `Projector`, when a command reads its facts by hand. A savepoint is then a business bound on the filter: the movements recorded *after* the last count are relevant, nothing before it. Each item of a filter carries its own bounds, so that is one filter, and the read and the consistency check agree on it:
 
 ```java
 EventReference head = stream.head().orElse(null);

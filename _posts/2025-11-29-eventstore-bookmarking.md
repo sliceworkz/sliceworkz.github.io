@@ -146,9 +146,6 @@ resumeAfter.ifPresentOrElse(
 
 The resume point is empty if no bookmark exists for that reader (first run scenario), or if its bookmark records a read position only — a reader that has handled nothing yet starts from the beginning either way.
 
-> **Coming from 0.12?** `EventSource.getBookmark(reader)` is gone. It answered the resume point while `findBookmark` answered the whole bookmark, and for a reader with a read position only the two disagreed about whether it had a bookmark at all. Replace `stream.getBookmark(reader)` with `stream.findBookmark(reader).flatMap(Bookmark::reference)`. (The storage SPI keeps `EventStorage.getBookmark` as a cheaper read for backends; only the application-facing stream lost it.)
-{: .prompt-warning }
-
 The whole bookmark also says how far a reader has *read*:
 
 ```java

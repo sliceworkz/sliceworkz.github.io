@@ -68,7 +68,7 @@ The corollary: **nothing replays what a failing listener missed**. The event is 
 |---|---|
 | `BoundedContextStarting` | `start()` begins: the instance (logical, physical, process), the deployed and undeployed feature slices with their members, the aspects this instance runs, the declared rulebook, and every port binding with the slices that asked for it |
 | `BoundedContextStarted` | the context is usable; `startupDurationMicros` is the time spent in `start()` |
-| `BoundedContextStopping` / `BoundedContextStopped` | `stop()` or `terminate()`, before and after. `restartable` tells them apart: `true` for `stop()` — in code, or by an operator's `StopBoundedContext` — where the process lives on and a `BoundedContextStarting` may follow; `false` for `terminate()`, nothing of this context runs here again. An event stored before 0.9.0 reads `false`: back then only a termination reported anything |
+| `BoundedContextStopping` / `BoundedContextStopped` | `stop()` or `terminate()`, before and after. `restartable` tells them apart: `true` for `stop()` — in code, or by an operator's `StopBoundedContext` — where the process lives on and a `BoundedContextStarting` may follow; `false` for `terminate()`, nothing of this context runs here again. |
 
 `BoundedContextStarting` is the inventory: it is the one place a dashboard learns what a deployment *carries* before any of it has done anything — a read model nothing has updated yet, a business rule never violated, a port never called.
 
@@ -76,10 +76,7 @@ The corollary: **nothing replays what a failing listener missed**. The event is 
 
 Every `FeatureSlice` descriptor — on `BoundedContextStarting` and on each event attributed to a slice — carries its name, its `SliceType` (`STATE_CHANGE`, `STATE_VIEW`, `AUTOMATION`, `TRANSLATION`, ...) and its members. A `SliceMember` names the component, its kind and aspect and, for a read model, how it is projected and from which stream (`inbound` or `outbound` for one registered on `builder.inbound()`/`outbound()`, absent for the domain stream).
 
-Since 0.9.0 a member also says what it **reads**: the stored names of the event types it is fed, read at registration off a translator's, publisher's, dispatcher's or policy's `eventFilter()`, and off the filter of a read model registered as an instance. That lets a reader wire a context's members together before any of them has run — which dispatcher sends which outbound event, which translator takes which inbound one. `reads` is empty for a filter that matches nothing, and absent (`null`) where the types are not known: a filter with an item naming no type (match-all, or tags only), a live read model (only its class is known at registration), a command, an aggregate, an automation, and an event stored before the field existed. "Fed nothing" and "fed everything" never read the same.
-
-> **Coming from 0.8?** The read-only slice type `STATE_READ` is now `STATE_VIEW`, as Event Modeling calls it. A monitoring store holding events from before the rename cannot be read by a dashboard on 0.9.0: clear such a store — development and test history only — when upgrading.
-{: .prompt-warning }
+A member also says what it **reads**: the stored names of the event types it is fed, read at registration off a translator's, publisher's, dispatcher's or policy's `eventFilter()`, and off the filter of a read model registered as an instance. That lets a reader wire a context's members together before any of them has run — which dispatcher sends which outbound event, which translator takes which inbound one. `reads` is empty for a filter that matches nothing, and absent (`null`) where the types are not known: a filter with an item naming no type (match-all, or tags only), a live read model (only its class is known at registration), a command, an aggregate, and an automation. "Fed nothing" and "fed everything" never read the same.
 
 **Commands, and the reads they make**
 
@@ -382,9 +379,6 @@ AccountId opened = TracingScope.call(Tracing.actorAndChannel("bob@bank", "batch-
 ```
 
 A scope belongs to its thread: `close()` restores what was bound before (scopes nest), is idempotent, and does nothing on another thread. Nothing is inherited by other threads — processor threads carry the tracing of the events they handle instead, and a component's own context (an automation's, a translator's, a policy's) binds the tracing of what it handles around every call it forwards.
-
-> **Coming from 0.8?** Every overload taking a `Tracing` — `execute(command, tracing)`, `read(X.class, tracing, ...)`, `event(..., tracing)` and the rest — is gone. Bind the tracing with `TracingScope.bind(...)`, or `TracingScope.call(...)`/`run(...)` for a single call. A `read(X.class, tracing, id)` left over still compiles (its parameters are `Object...`), and is refused up front with a message saying to bind the tracing instead.
-{: .prompt-warning }
 
 ### Across processors
 

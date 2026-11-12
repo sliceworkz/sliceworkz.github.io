@@ -257,7 +257,7 @@ The classic formulation notes the reference of the last *relevant* event from th
 
 `head()` never deserializes, upcasts or decrypts: an event this stream cannot map, one that upcasts into nothing, or one sealed under a key store that is down cannot make it fail. It is what a query would see — on PostgreSQL it sits behind the same visibility barrier as every read — and the event at the head need not match your filter: it is a cursor for the check, and only matching events after it count.
 
-> **The read bound and the check bound are kept apart for you.** Up to 0.12, the read bound (`until(head)`) lived on the filter, so `AppendCriteria.of(relevant.until(head), head)` deemed nothing after the head relevant and silently switched optimistic locking off. In 0.13 the read bound is `EventQuery.notAfter(head)`, a property of the read, and `AppendCriteria.of(query, head)` never takes it — reusing "the query I read with" is now simply correct.
+> **The read bound and the check bound are kept apart.** The read bound `EventQuery.notAfter(head)` is a property of the read, and `AppendCriteria.of(query, head)` never takes it — a check bounded at the very reference it compares against would find nothing new, ever. So handing the append the query you read with is always correct.
 {: .prompt-info }
 
 ### Items Bounded Before the Reference

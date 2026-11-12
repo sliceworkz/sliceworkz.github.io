@@ -64,12 +64,6 @@ what came in — and the owner narrows it to `TranslationCapability<I>` or `Read
 handing it on. `outbound()` only reads: nothing but a publisher writes the outbound stream. The root of the
 context is the domain stream.
 
-> **Coming from 0.8?** `ApplicationCapabilities<D,O>` lost its unused outbound type parameter — it is
-> `ApplicationCapabilities<D>` — and `incoming(...)`/`translate(...)` moved from the root of the context to
-> `inbound()`. `executeWithRetry` is gone: `execute(command, Execution.retrying())`, see
-> [Commands and Decision Models](/posts/eventmodeling-commands-and-decision-models/#how-a-command-is-executed-execution).
-{: .prompt-warning }
-
 Build the context in one place — your `main`, your dependency-injection configuration — and hand out the narrow types from there. A caller then gets the reach its job needs, and cannot be handed another's by a wiring change nobody looked at twice.
 
 ## An Alias Interface: `BankingApi`
@@ -179,7 +173,7 @@ public class LegacyAccountImport {
 }
 ```
 
-`event(data)` takes the bare event; anything beyond its data — tags, an idempotency key — is given as the eventstore's `EphemeralEvent`, built the way an append builds it. (Up to 0.8 this was `event(data, tags, key)` and its siblings.) Give what you append through `event()` an idempotency key derived from the fact — here the legacy account number — never from the attempt. A re-run of the import then appends nothing a second time; a key minted per attempt would de-duplicate nothing. See [Appending Events](/posts/eventstore-appending-events/#idempotency) for how the store handles the key.
+`event(data)` takes the bare event; anything beyond its data — tags, an idempotency key — is given as the eventstore's `EphemeralEvent`, built the way an append builds it. Give what you append through `event()` an idempotency key derived from the fact — here the legacy account number — never from the attempt. A re-run of the import then appends nothing a second time; a key minted per attempt would de-duplicate nothing. See [Appending Events](/posts/eventstore-appending-events/#idempotency) for how the store handles the key.
 
 ### Lifecycle Belongs to the Owner
 
