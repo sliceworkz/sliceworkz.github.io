@@ -12,9 +12,9 @@ A bounded context runs on three streams, one per kind of event it declares — `
 
 | stream | holds | written by | read by |
 |---|---|---|---|
-| **inbound** (`I`) | events other systems told us about | `incoming(...)` | translators |
+| **inbound** (`I`) | events other systems told us about | `inbound().incoming(...)` | translators, read models over it |
 | **domain** (`D`) | the facts this context decided | commands, automations, translators | everything inside |
-| **outbound** (`O`) | the published language: what we tell the world | publishers, and only publishers | dispatchers |
+| **outbound** (`O`) | the published language: what we tell the world | publishers, and only publishers | dispatchers, read models over it |
 
 Three components move events across the edges:
 
@@ -24,7 +24,7 @@ external event ─► incoming ─► inbound ─► Translator ─► command �
                     └──────────────────────────────────────────────────────────┘
 ```
 
-All three are projector-driven processors in a slice's **automation aspect**: they run on the single elected leader of the deployment, are bookmarked on the stream they read, retry a failing event with backoff, and are delivered **at least once**. This guide uses the banking domain of the [quickstart](/posts/eventmodeling-quickstart/), extended with what crosses the edge:
+All three are projector-driven processors in a slice's **automation aspect**: they run on the single elected leader of the deployment, are bookmarked on the stream they read, retry a failing event with backoff, and are delivered **at least once**. Everything about the two edge streams is reached through one door per stream: on the builder, `builder.inbound()` takes the translators and `builder.outbound()` the publishers and dispatchers; on the context, `inbound()` and `outbound()` hand out what an application may do with them. This guide uses the banking domain of the [quickstart](/posts/eventmodeling-quickstart/), extended with what crosses the edge:
 
 ```java
 sealed interface BankingInboundEvent {
@@ -47,7 +47,7 @@ Inbound and outbound events are **integration events**: a contract with another 
 
 ### The translator
 
-A `Translator<I, D>` selects inbound events with `eventQuery()` and handles each in `translate(Event<I>, TranslatorContext)`. Its context is the same as an automation's: execute commands, or append a domain event no command decided on.
+A `Translator<I, D>` selects inbound events with `eventFilter()` and handles each in `translate(Event<I>, TranslatorContext)`. Its context is the same as an automation's: execute commands, or append a domain event no command decided on.
 
 A payroll provider tells the bank a salary was paid. That becomes a deposit — through the command, so the bank's own rules decide it:
 
@@ -56,8 +56,8 @@ A payroll provider tells the bank a salary was paid. That becomes a deposit — 
 public class SalaryPaidTranslator implements Translator<BankingInboundEvent, BankingDomainEvent> {
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forTypes(SalaryPaid.class);
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(SalaryPaid.class);
     }
 
     @Override
@@ -67,18 +67,24 @@ public class SalaryPaidTranslator implements Translator<BankingInboundEvent, Ban
                 AccountId accountId = ACCOUNT.id(salary.accountId());
                 String key = "salary:" + event.reference().id().value();     // derived from the inbound event
                 try {
-                    context.executeWithRetry(new DepositMoneyCommand(accountId, salary.amountInCents()), key,
-                                             RetryPolicy.DEFAULT);
+                    context.execute(new DepositMoneyCommand(accountId, salary.amountInCents()),
+                                    Execution.idempotent(key).withRetry());
                 } catch ( BusinessException refused ) {
                     // decided about in-band: recorded as a fact, never thrown at the projector
-                    context.event(new DepositRefused(accountId, salary.amountInCents(), refused.getMessage()),
-                                  ACCOUNT.tags(accountId), key + "/refused");
+                    context.event(EphemeralEvent.of(new DepositRefused(accountId, salary.amountInCents(), refused.getMessage()),
+                                                    Tags.of(ACCOUNT.tag(accountId)))
+                                                .withIdempotencyKey(key + "/refused"));
                 }
             }
         }
     }
 }
 ```
+
+A translator is always read forward from its bookmark, which is why it declares an `EventFilter` and no `EventQuery`: a direction, limit or read bound would have nothing to mean there. How the command runs is one value, an `Execution` — here idempotent under a key derived from the inbound event, and re-executed on an optimistic-locking conflict. A domain event the translator records itself is given the way the event store appends one: an `EphemeralEvent` with its tags and, where it needs one, its idempotency key.
+
+> **Coming from 0.8?** A translator's `eventQuery()` is now `eventFilter()`, returning the filter (`EventFilter.forTypes(...)` for `EventQuery.forTypes(...)`). `executeWithRetry(command, key, policy)` is `execute(command, Execution.idempotent(key).withRetry(policy))`, and `event(data, tags, key)` is `event(EphemeralEvent.of(data, tags).withIdempotencyKey(key))`.
+{: .prompt-warning }
 
 `translate` is handed the inbound `Event`, not just its payload — the one-`when` rule every component follows — so the tags, the timestamp and the reference are at hand. The reference's id is what keys the translation: a redelivered inbound event raises nothing twice.
 
@@ -95,7 +101,7 @@ Catching `BusinessException` from the command is the clean way to do the second:
 
 ### `incoming(...)` or `translate(...)`
 
-Application code (an HTTP endpoint receiving a webhook, a message-bus consumer) feeds inbound events in through the context's `TranslationCapability<BankingInboundEvent>` — the narrow type to hand such an adapter, since feeding the domain external events is a different job from executing commands on a user's behalf (see [Who May Do What](/posts/eventmodeling-who-may-do-what/)). There are two ways, reusing the same registered translators:
+Application code (an HTTP endpoint receiving a webhook, a message-bus consumer) feeds inbound events in through the context's `inbound()`. It answers `InboundCapabilities<BankingInboundEvent>` — `incoming`, `translate` and `read` — and its `TranslationCapability<BankingInboundEvent>` half is the narrow type to hand such an adapter, since feeding the domain external events is a different job from executing commands on a user's behalf (see [Who May Do What](/posts/eventmodeling-who-may-do-what/)). There are two ways, reusing the same registered translators:
 
 | | `incoming(event)` | `translate(event)` |
 |---|---|---|
@@ -106,12 +112,17 @@ Application code (an HTTP endpoint receiving a webhook, a message-bus consumer) 
 | no translator matches | the event waits on the inbound stream | `NoTranslatorRegisteredException` |
 
 ```java
+TranslationCapability<BankingInboundEvent> payrollFeed = banking.inbound();   // what the adapter is handed
+
 // a webhook: store the message, acknowledge, let the translator catch up
-banking.incoming(new SalaryPaid(accountId.value(), 250_000, "PAY-2026-10"), "payroll:PAY-2026-10");
+payrollFeed.incoming(new SalaryPaid(accountId.value(), 250_000, "PAY-2026-10"), "payroll:PAY-2026-10");
 
 // a caller that needs to act on the outcome right away
-List<EventReference> raised = banking.translate(new SalaryPaid(accountId.value(), 250_000, "PAY-2026-10"));
+List<EventReference> raised = payrollFeed.translate(new SalaryPaid(accountId.value(), 250_000, "PAY-2026-10"));
 ```
+
+> **Coming from 0.8?** `incoming(...)` and `translate(...)` have left the root of the bounded context: they are `banking.inbound().incoming(...)` and `banking.inbound().translate(...)`.
+{: .prompt-warning }
 
 `incoming` is the default: the inbound event is durable before you acknowledge it, and the translator retries without the caller. Give it an **idempotency key from the sender's own message id** (`incoming(event, key)`), so a sender retrying its delivery stores the message once.
 
@@ -125,16 +136,16 @@ public class PayrollIntakeFeatureSlice implements Slice<Banking> {
 
     @Override
     public void configureAutomation ( BoundedContextBuilder<Banking> builder ) {
-        builder.translator(new SalaryPaidTranslator());
+        builder.inbound().translator(new SalaryPaidTranslator());
     }
 }
 ```
 
-`builder.translator(Class)` constructs a translator with a no-argument constructor itself; register an instance when it needs anything passed in. A translator's name is its class' simple name, and it keys its bookmark on the inbound stream — see [Names are bookmark keys](#names-are-bookmark-keys) below.
+Translators are registered on `builder.inbound()`, beside the inbound legacy event types (`builder.inbound().legacyEventTypes(...)`) and any read model over the inbound stream; `done()` returns to the builder. `builder.inbound().translator(Class)` constructs a translator with a no-argument constructor itself; register an instance when it needs anything passed in. A translator's name is its class' simple name, and it keys its bookmark on the inbound stream — see [Names are bookmark keys](#names-are-bookmark-keys) below.
 
 ### The flow continues
 
-Every event carries an `x-correlation-id` naming its flow. A translator continues the flow of what it translates: the domain events it raises carry the inbound event's correlation id (an inbound event without one starts a flow of its own), and on the `translate` path the caller's tracing. So "everything that came of this salary payment" is a tag query. See [Observability and Tracing](/posts/eventmodeling-observability/).
+Every event carries an `x-correlation-id` naming its flow. A translator continues the flow of what it translates: the domain events it raises carry the inbound event's correlation id (an inbound event without one starts a flow of its own), and on the `translate` path the tracing the caller has bound with `TracingScope`. So "everything that came of this salary payment" is a tag query. See [Observability and Tracing](/posts/eventmodeling-observability/).
 
 ## Publishers: telling the world what was decided
 
@@ -153,15 +164,15 @@ Every hop is bookmarked and at least once, and every outbound event traces back 
 public class AccountOpenedNoticePublisher implements Publisher<BankingDomainEvent, BankingOutboundEvent> {
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forTypes(AccountOpened.class);
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(AccountOpened.class);
     }
 
     @Override
     public void publish ( Event<BankingDomainEvent> event, PublisherContext<BankingDomainEvent, BankingOutboundEvent> context ) {
         if ( event.data() instanceof AccountOpened opened ) {
             context.publish(new AccountOpenedNotice(opened.accountId(), opened.customerId()),
-                            ACCOUNT.tags(opened.accountId()));
+                            Tags.of(ACCOUNT.tag(opened.accountId())));
         }
     }
 }
@@ -192,8 +203,8 @@ Each read model a publisher reads is declared in `reads()`:
 public class BalanceChangedPublisher implements Publisher<BankingDomainEvent, BankingOutboundEvent> {
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forTypes(MoneyDeposited.class);
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(MoneyDeposited.class);
     }
 
     @Override
@@ -206,7 +217,7 @@ public class BalanceChangedPublisher implements Publisher<BankingDomainEvent, Ba
         if ( event.data() instanceof MoneyDeposited deposited ) {
             var balance = context.readAsOfEvent(AccountBalanceReadModel.class, deposited.accountId());
             context.publish(new BalanceChanged(deposited.accountId(), balance.balanceInCents()),
-                            ACCOUNT.tags(deposited.accountId()));
+                            Tags.of(ACCOUNT.tag(deposited.accountId())));
         }
     }
 }
@@ -244,11 +255,17 @@ public class BalanceNotificationFeatureSlice implements Slice<Banking> {
     @Override
     public void configureAutomation ( BoundedContextBuilder<Banking> builder ) {
         builder.readmodel(AccountBalanceReadModel.class).live();      // what the publisher reads, on this instance
-        builder.publisher(new BalanceChangedPublisher());
-        builder.dispatcher(new BalanceChangedDispatcher(builder.port(CustomerNotifications.class)));
+        builder.outbound()
+               .publisher(new BalanceChangedPublisher())
+               .dispatcher(new BalanceChangedDispatcher(builder.port(CustomerNotifications.class)));
     }
 }
 ```
+
+Publishers and dispatchers are registered on `builder.outbound()`, beside the outbound legacy event types and any read model over the outbound stream.
+
+> **Coming from 0.8?** `builder.translator(...)`, `builder.publisher(...)` and `builder.dispatcher(...)` are `builder.inbound().translator(...)`, `builder.outbound().publisher(...)` and `builder.outbound().dispatcher(...)`. `historicalEventTypes(domain, inbound, outbound)` is split per stream: `builder.legacyEventTypes(domain)`, `builder.inbound().legacyEventTypes(inbound)`, `builder.outbound().legacyEventTypes(outbound)`. And Translator, Publisher and Dispatcher each declare `eventFilter()` instead of `eventQuery()`.
+{: .prompt-warning }
 
 `build()` holds the registration to two rules, each naming every offender:
 
@@ -264,7 +281,7 @@ A read of a class not declared in `reads()` is an `IllegalArgumentException` at 
 
 ### Sending what was published
 
-A `Dispatcher<O>` is a projection over the outbound stream: an `eventQuery()` and a `when(Event<O>)`. It is the **outbox pattern** without a table of its own — the outbound stream *is* the outbox, written in the same store as the domain, and the dispatcher's bookmark records how far it has been sent.
+A `Dispatcher<O>` is an event handler over the outbound stream: an `eventFilter()` and a `when(Event<O>)`. It is an `EventHandler`, not a projection of its own — the framework builds the projection around it and always reads it forward from its bookmark, so it has no query and no `initQuery()` to declare. It is the **outbox pattern** without a table of its own — the outbound stream *is* the outbox, written in the same store as the domain, and the dispatcher's bookmark records how far it has been sent.
 
 A dispatcher calls the outside world, so it takes a port:
 
@@ -286,8 +303,8 @@ public class BalanceChangedDispatcher implements Dispatcher<BankingOutboundEvent
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forTypes(BalanceChanged.class);
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(BalanceChanged.class);
     }
 
     @Override
@@ -319,6 +336,43 @@ A translator, a dispatcher, a publisher and a read model are each identified by 
 
 For a dispatcher, getting the name wrong is the costliest mistake in the framework: duplicate publishing to an external system. Use a named class, and do not rename it casually — a new name is a new bookmark, and it starts from the beginning of the outbound stream.
 
+## Read models over the inbound and outbound streams
+
+A read model can be projected from what came in or what went out, as well as from the domain stream: *how many messages did each partner send us*, *what did we tell this customer last*. It is an ordinary `ReadModel<E>` — `PublishingReadModel`, a SQL read model, snapshots and the live/eventually-consistent choice all carry over — declared over the stream's event type and registered on that stream's door:
+
+```java
+public class InboundTrafficReadModel extends PublishingReadModel<BankingInboundEvent, InboundTrafficReadModel.Traffic> {
+
+    public static final InboundTrafficReadModel INSTANCE = new InboundTrafficReadModel();
+
+    @Override
+    protected Traffic initialState ( ) {
+        return new Traffic(Map.of(), Map.of());
+    }
+
+    @Override
+    protected Traffic apply ( Traffic traffic, Event<BankingInboundEvent> event ) {
+        // count per stored type, and per customer the event is about
+    }
+
+    @Override
+    public EventFilter eventFilter ( ) {
+        return EventFilter.matchAll();      // every inbound event, whether a translator claims it or not
+    }
+
+    public record Traffic ( Map<String, Long> perType, Map<String, Long> perCustomer ) { }
+}
+
+// in its slice
+builder.inbound().readmodel(InboundTrafficReadModel.INSTANCE).eventuallyConsistent();
+
+// reading it: the context's inbound() is also a ReadModelCapability over the inbound events
+ReadModelCapability<BankingInboundEvent> inboundScreen = banking.inbound();
+ReadModelResult<Traffic> traffic = inboundScreen.read(InboundTrafficReadModel.class).published();
+```
+
+`builder.outbound().readmodel(...)` and `banking.outbound().read(...)` are the same over the outbound stream. Such a read model keeps its bookmark under a processor type of its own, so it may share a name with a domain read model, and an operator finds it as `ProcessorKind.INBOUND_READ_MODEL` or `OUTBOUND_READ_MODEL`.
+
 ## Why there is no command that raises outbound events
 
 It looks simpler for a command to raise its domain event *and* the outbound event in one go. Two reasons it is not offered:
@@ -347,8 +401,8 @@ Each has a test base in `sliceworkz-eventmodeling-testing` that drives it synchr
 ```java
 @Test
 void aBurstOfDepositsIsPublishedAsTheStatesItWentThrough ( ) {
-    given(new MoneyDeposited(A1, 1000), ACCOUNT.tags(A1))
-        .and(new MoneyDeposited(A1, 500), ACCOUNT.tags(A1))
+    given(new MoneyDeposited(A1, 1000), Tags.of(ACCOUNT.tag(A1)))
+        .and(new MoneyDeposited(A1, 500), Tags.of(ACCOUNT.tag(A1)))
     .whenPublished()
         .published(new BalanceChanged(A1, 1000), new BalanceChanged(A1, 1500))
     .and()
@@ -361,6 +415,7 @@ void aBurstOfDepositsIsPublishedAsTheStatesItWentThrough ( ) {
 
 ## Summary
 
+- Everything about the edges goes through one door per stream: `builder.inbound()`/`outbound()` to register translators, publishers, dispatchers, legacy types and read models; `context.inbound()`/`outbound()` to feed and read them.
 - **Translators** turn inbound events into domain events, usually through a command. They must not throw on validation: decide in-band, record a refusal as a domain event. Key what they raise from the inbound event's id. `incoming` is durable and asynchronous; `translate` is synchronous and stores nothing.
 - **Publishers** map recorded facts into outbound events and decide nothing. Every read says as of when; `readAsOfEvent` is the usual choice. Keys (`<event id>/<n>`) and `x-published-from` come for free, and the first publication stands. Register from `configureAutomation`, with their live read models beside them.
 - **Dispatchers** send the outbound stream to the outside world, at least once. Hand the receiver the outbound event's id to de-duplicate on, and keep the dispatcher's name stable — it is its bookmark.
