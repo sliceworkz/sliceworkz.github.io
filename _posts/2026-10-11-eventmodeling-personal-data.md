@@ -71,7 +71,7 @@ public record RegisterCustomerCommand ( CustomerId customerId, String name, Addr
                .raiseEvent(new CustomerRegistered(customerId,
                                Shreddable.of(name, customer),
                                Shreddable.of(address, customer.withCategory("address"))),
-                           CUSTOMER.tags(customerId));
+                           CUSTOMER.tag(customerId));
     }
 }
 ```
@@ -163,8 +163,8 @@ public class CustomerDetailsReadModel implements ReadModel<BankingDomainEvent> {
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forEvents(EventTypesFilter.of(CustomerRegistered.class), CUSTOMER.tags(customerId));
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTypes(CustomerRegistered.class).tagged(CUSTOMER.tag(customerId));
     }
 
     @Override
@@ -264,7 +264,7 @@ The third is a command and a slice like any other. Its event says that a custome
 public record ForgetCustomerCommand ( CustomerId customerId ) implements Command<BankingDomainEvent> {
     @Override
     public void execute ( CommandContext<BankingDomainEvent, BankingDomainEvent> context ) {
-        context.noDecisionModels().raiseEvent(new CustomerForgotten(customerId), CUSTOMER.tags(customerId));
+        context.noDecisionModels().raiseEvent(new CustomerForgotten(customerId), CUSTOMER.tag(customerId));
     }
 }
 ```
@@ -304,7 +304,7 @@ public class ErasureRequests {
         SubjectErasureReport report = privacy.erase("customer", customerId.value(),
                 ErasureReason.of("GDPR art.17 request " + requestReference));
         // 2. tell the read models holding a copy to drop it
-        banking.execute(new ForgetCustomerCommand(customerId), "forget/" + requestReference);
+        banking.execute(new ForgetCustomerCommand(customerId), Execution.idempotent("forget/" + requestReference));
         return report;
     }
 }
@@ -348,7 +348,7 @@ class CustomerDetailsReadModelTest extends LiveModelTest<BankingDomainEvent, Ban
         var test = given().event(new CustomerRegistered(alice,
                         Shreddable.of("Alice Martin", subject),
                         Shreddable.of(new Address("Main Street 1", "Ghent"), subject.withCategory("address"))),
-                CUSTOMER.tags(alice));
+                Tags.of(CUSTOMER.tag(alice)));
 
         kernel().erase("customer", alice.value(), ErasureReason.of("GDPR art.17 request #4711"));
 

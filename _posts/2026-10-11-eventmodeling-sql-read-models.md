@@ -57,8 +57,8 @@ public class AccountRegisterProjector extends SqlReadModelProjector<BankingDomai
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.matchAll();
+    public EventFilter eventFilter ( ) {
+        return EventFilter.matchAll();
     }
 
     @Override
@@ -96,7 +96,7 @@ Here is what you write and what you get from the base class:
 | you write | the base class provides |
 |---|---|
 | `createTables()`: DDL, idempotent (`CREATE TABLE IF NOT EXISTS`) | `table("accounts")` → `rm_register_accounts` |
-| `eventQuery()`: which events to project | `EVENT_REF_COLUMNS`: the four freshness columns to put in a table |
+| `eventFilter()`: which events to project, read forward | `EVENT_REF_COLUMNS`: the four freshness columns to put in a table |
 | `project(Event<E>)`: what an event does to the rows | `execute(sql, params...)` on the batch's own connection |
 | | `updateOnce`, `insertIfAbsent`, `insertOnce`: idempotent writes |
 | | `eventReference()`, `eventId()`, `eventPosition()`, `eventTx()`, `eventIndex()` of the event being projected |
@@ -427,8 +427,8 @@ public class SqlCurrentBalanceReadModel implements SeededReadModel<BankingDomain
     }
 
     @Override
-    public EventQuery eventQuery ( ) {
-        return EventQuery.forEvents(EventTypesFilter.any(), ACCOUNT.tags(accountId));
+    public EventFilter eventFilter ( ) {
+        return EventFilter.forTags(ACCOUNT.tag(accountId));
     }
 
     @Override
