@@ -5,10 +5,10 @@ title: Appending Events
 description: Appending Domain Events to the Eventstore
 date: 2025-11-29 02:00:00
 categories: [Eventstore Documentation,Eventstore API]
-tags: [events,append,tags,optimistic locking,dcb,idempotency]
+tags: [events,append,tags,tagged events,tag requirements,optimistic locking,dcb,idempotency]
 ---
 
-This guide covers how to append events to an event stream, including adding tags, understanding event metadata, optimistic locking, and implementing idempotency.
+This guide covers how to append events to an event stream, including adding tags, understanding event metadata, optimistic locking, letting events state their own tags, and implementing idempotency.
 
 ## Appending an Event to a Stream
 
@@ -308,6 +308,115 @@ AppendCriteria.none();
 A boundary over a current event type also counts the legacy events that [upcast](/posts/eventstore-defining-events/#approach-2-upcasting) into it, exactly as a query for that type returns them — so a decision read through the query and the lock check never disagree about a legacy event.
 
 `AppendCriteria.isNone()` is what distinguishes them — it is derived from the filter, independently of the reference. And `expectedLastEventReference()` is **never null** whichever factory produced the criteria: a null is normalised to `Optional.empty()`, so it is always safe to call `.isPresent()` on it.
+
+## Events That State Their Own Tags
+
+Everything above passes the tags with each append. That is all you need, and it stays the way to tag an event whenever you prefer it. This chapter describes an **option** on top of it: letting the event itself say which tags it carries, and which tags it must carry. You can adopt it for one event type, for all of them, or not at all.
+
+### Why You Might Want It
+
+A consistency boundary selects the facts a decision depends on by their tags. An event appended *without* a tag it should carry matches no boundary that selects by that tag: the decision that should have conflicted is admitted, nothing is thrown and nothing is logged. When tags are passed at every place an event is appended, that mistake can be made at every one of those places.
+
+Most tags repeat a value the payload already holds — the customer id of a `CustomerRegistered`, the two accounts of a transfer. The event is the one place that can state those tags once. And for the tags the payload does *not* hold, the event can still declare that they are required, so an append that forgets one is refused. Used together, the two give you a guarantee: **every stored event of that type carries the tags your consistency boundaries are designed around.**
+
+### `eventTags()`: Tags Derived from the Payload
+
+An event's data implements `Tagged` and answers `eventTags()`:
+
+```java
+import org.sliceworkz.eventstore.events.Tag;
+import org.sliceworkz.eventstore.events.Tagged;
+import org.sliceworkz.eventstore.events.Tags;
+
+sealed interface CustomerEvent {
+
+    record CustomerRegistered ( String customerId, String name ) implements CustomerEvent, Tagged {
+        public Tags eventTags ( ) {
+            return Tags.of("customer", Objects.requireNonNull(customerId));
+        }
+    }
+
+    record CustomerNameChanged ( String customerId, String name ) implements CustomerEvent, Tagged {
+        public Tags eventTags ( ) {
+            return Tags.of("customer", Objects.requireNonNull(customerId));
+        }
+    }
+}
+```
+
+The caller no longer has to repeat them:
+
+```java
+stream.append(Event.of(new CustomerRegistered("123", "John"), Tags.none()));
+// stored with customer:123
+```
+
+The tags you pass and the tags the event states are **merged**: a union, so nothing you pass is lost and a tag given both ways is stored once. A caller can therefore still add a tag whose value is not in the payload — a channel, a region:
+
+```java
+stream.append(Event.of(new CustomerRegistered("123", "John"), Tags.of("channel", "web")));
+// stored with customer:123 and channel:web
+```
+
+`eventTags()` is plain code, so a tag can be anything code can compute: several values under one key, a period derived from a date. `Tagged` is a separate interface beside your sealed root, so the event types that do not need it simply do not implement it, and the two kinds mix freely in one hierarchy and one batch.
+
+### `tagRequirements()`: Tags an Event Must Carry
+
+`eventTags()` protects the tags the payload holds. A tag the caller must supply can still be forgotten. `tagRequirements()` names a tag key and how many distinct tags under it the stored event must carry:
+
+```java
+import org.sliceworkz.eventstore.events.TagRequirement;
+
+record MoneyTransferred ( String transferId, String from, String to, long amount ) implements BankEvent, Tagged {
+
+    public Tags eventTags ( ) {
+        return Tags.of(Tag.of("transfer", transferId), Tag.of("account", from), Tag.of("account", to),
+                       Tag.of("from-account", from), Tag.of("to-account", to));
+    }
+
+    public Set<TagRequirement> tagRequirements ( ) {
+        return Set.of(TagRequirement.of("account").between(1, 2),
+                      TagRequirement.of("channel").exactlyOne());   // not in the payload: the caller passes it
+    }
+}
+
+stream.append(Event.of(new MoneyTransferred("t1", "A", "B", 100), Tags.of("channel", "atm")));  // stored
+stream.append(Event.of(new MoneyTransferred("t2", "A", "B", 100), Tags.none()));                // refused
+```
+
+The requirement is checked against the **merged** tags, whoever supplied them, so it describes the stored event: *a transfer is about one or two accounts* holds whether the accounts come from the payload or from the caller, and catches a third account passed by mistake.
+
+`TagRequirement.of(key)` means one or more, narrowed with:
+
+| Requirement | Distinct tags under the key |
+|---|---|
+| `TagRequirement.of("channel")` | one or more |
+| `.exactlyOne()` | exactly 1 |
+| `.exactly(n)` | exactly n |
+| `.between(min, max)` | min to max, both inclusive |
+| `.atMostOne()` | none or one: optional, but never two |
+
+`tagRequirements()` defaults to no requirements, so an event can implement `eventTags()` alone. A key starting with `x-` cannot be required: that prefix is for the tags a framework adds to every event.
+
+> **A count is of distinct tags.** `Tags` is a set, so a transfer from account A to account A carries a single `account:A`, and `exactly(2)` refuses it. Where that case is legitimate, require `between(1, 2)`, or rely on role keys such as `from-account` and `to-account` beside the entity key, as above.
+{: .prompt-tip }
+
+### What Happens on Append
+
+Every append goes through the same path, so the tags are merged and the requirements checked whichever way the event reaches the stream — `Event.of`, an `EphemeralEvent` built by hand, a batch:
+
+- **The whole batch is checked before anything is written.** One incomplete event stores nothing of the batch.
+- **An unmet requirement is an `IllegalArgumentException`** naming the event type and every requirement it misses, for example `'account' tags required: between 1 and 2, found 0`. It is the caller's mistake, refused like the store's other argument checks.
+- **A failing `eventTags()` is an `EventSerializationException`.** When it throws or returns `null`, it is a property of the payload, the same on every retry: not worth retrying, like any other failure to write the payload. Return `Tags.none()` for an event about nothing in particular.
+- **Nothing is observed and no key is minted.** The check runs before the payload is serialized, so a refused event never seals a [personal data](/posts/eventstore-defining-events/#personal-data-in-the-event-payload) value either.
+
+### Things to Know
+
+- **Tags are stored with the event, and only then.** Changing `eventTags()` or the requirements changes the tags of events appended afterwards. Events already stored keep the tags they were stored with, and nothing checks them again — not a query, not an upcast, not an [import](/posts/eventstore-importing-events/). Tagging an event type that has history in a new way is a migration of that history, or a boundary over the new tag misses the old events.
+- **A missing id is not an error by itself.** `Tag.of(key, null)` is a legal flag tag, so an event whose id field is `null` would be stored with a bare `customer` tag and match no boundary on any customer. Refuse it in `eventTags()`, as `Objects.requireNonNull` does above. A requirement on the key does not catch it: a flag tag still counts as one.
+- **One key per kind of thing.** An event about two accounts carries `account` twice. A role key (`from-account`) goes *beside* the entity key, never instead of it: a boundary on everything about an account reads `account`, and would miss the events where the account only had a role key.
+- **No personal data in a tag.** Tags are stored in the clear, indexed, and survive the erasure of a `Shreddable` value. Never tag an event with a value it seals.
+- **Neither method is part of the payload.** `eventTags()` and `tagRequirements()` carry no `get` prefix and are no record components, so they are not written into the stored JSON.
 
 ## Idempotency
 
