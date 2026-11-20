@@ -114,8 +114,8 @@ Three rules make these readable:
 | event | when |
 |---|---|
 | `LeadershipAcquired` / `LeadershipReleased` | per leader-only processor, with the fencing token or the reason it was released |
-| `PortCalled` / `PortCallRejected` / `PortCallFailed` | a call through a monitored port returned, said no, or failed — with the caller (component and slice) and the duration |
-| `PortCallsSummarized` | a summarized port's calls per interval: counts per outcome and a latency histogram |
+| `PortCalled` / `PortCallRejected` / `PortCallFailed` | a call through a monitored port returned, said no, or failed — with the caller (component and slice), the duration, and what it consumed of a paid service when its adapter reported it |
+| `PortCallsSummarized` | a summarized port's calls per interval: counts per outcome, a latency histogram and the consumption summed per provider and product |
 | `InstructionHandled` / `InstanceStatusReported` | the answer to a management instruction (see [Running in Production](/posts/eventmodeling-running-in-production/#reaching-every-instance-the-management-stream)) |
 
 Ports are covered in [Ports, Adapters and Monitored Calls](/posts/eventmodeling-ports-and-adapters/).
