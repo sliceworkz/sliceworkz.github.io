@@ -195,6 +195,70 @@ That an event can belong to several such boundaries at once is the point of DCB,
 
 A *month*, a *period* or another time-based concept can be an entity too, when events are about it and decisions are made per instance of it. The repository's [`BankingDomainWithClosingTheBooks`](https://github.com/sliceworkz/eventmodeling/blob/develop/sliceworkz-eventmodeling-examples/src/main/java/org/sliceworkz/eventmodeling/examples/banking/BankingDomainWithClosingTheBooks.java) declares a `MONTH` entity with a `MonthId`, and a helper that turns a `YearMonth` into one so every tag spells it the same way.
 
+## Events That State Their Own Tags
+
+So far every command passes the tags with the event it raises, and that is all the framework needs. As an **option**, an event can also state its own tags, through the eventstore's `Tagged` interface — see [Events That State Their Own Tags](/posts/eventstore-appending-events/#events-that-state-their-own-tags) for the store's side. You can adopt it for one event type, a whole domain, or not at all.
+
+What it buys: most tags repeat an id the payload already carries, and a tag a command forgets is silent — the event is stored, matches no boundary that selects by it, and a decision that should have conflicted is admitted. Stated once on the event, the entity tags cannot be forgotten by any command that raises it, and the tags the payload does *not* hold can be required.
+
+The event states its tags through its entities:
+
+```java
+public sealed interface BankingDomainEvent extends Tagged {
+
+    record AccountOpened ( AccountId accountId, CustomerId customerId, LocalDate date ) implements BankingDomainEvent {
+        @Override
+        public Tags eventTags ( ) {
+            return Tags.of(ACCOUNT.tag(accountId), CUSTOMER.tag(customerId));
+        }
+    }
+}
+```
+
+Putting `Tagged` on the sealed root makes every event of the domain state its tags; putting it on single records leaves the others as they were. A command then raises the event with only the tags its payload does not carry — usually none:
+
+```java
+result.raiseEvent(new AccountOpened(accountId, customerId, LocalDate.now()));
+```
+
+The tags the command passes and the tags the event states are merged, and the framework's own `x-` tags are kept beside them.
+
+### Requiring Tags
+
+`tagRequirements()` declares how many distinct tags per key the stored event must carry, whoever supplied them — useful above all for a tag the payload does not hold:
+
+```java
+Entity<AccountId> FROM_ACCOUNT = Entity.of("from-account", AccountId::new);
+Entity<AccountId> TO_ACCOUNT   = Entity.of("to-account", AccountId::new);
+
+record MoneyTransferred ( TransferId transferId, AccountId from, AccountId to, long amount ) implements BankingDomainEvent {
+    @Override
+    public Tags eventTags ( ) {
+        return Tags.of(TRANSFER.tag(transferId), ACCOUNT.tag(from), ACCOUNT.tag(to),
+                       FROM_ACCOUNT.tag(from), TO_ACCOUNT.tag(to));
+    }
+    @Override
+    public Set<TagRequirement> tagRequirements ( ) {
+        return Set.of(TagRequirement.of("channel").exactlyOne());   // not in the payload: the command passes it
+    }
+}
+
+result.raiseEvent(new MoneyTransferred(transferId, from, to, 10), Tag.of("channel", "atm"));
+```
+
+A command that raises the event without a required tag fails **where it raises it**: `raiseEvent` throws `IllegalArgumentException` ("MoneyTransferred is raised without the tags it requires: 'channel' tags required: exactly 1, found 0"), nothing is appended, and the execution is reported as a `CommandFailed` — a bug in the command, not a business answer. The store checks the same requirements again on append, and that check is the one that decides: it also covers aggregates, provided events and translators.
+
+### Role Keys Beside the Entity Key
+
+The transfer above shows the shape for an event about two instances of one entity. It carries the entity's key twice (`account:A`, `account:B`), and each role as a key of its own, declared as an `Entity` with the same id type. The role keys go **beside** the entity key, never instead of it: a decision about everything that happened to an account filters on `ACCOUNT.tag(id)` and finds the transfer whichever side the account was on; a decision genuinely about what an account *sent* filters on `FROM_ACCOUNT.tag(id)`, and money arriving in that account is no new fact for it, so it does not conflict.
+
+### Things to Know
+
+- **Tags are stored with the event.** Changing `eventTags()` re-tags nothing already stored: tagging an event type that has history in a new way is a migration of that history.
+- **In tests, seeded events are tagged as production tags them.** A test's `given()` events need no tags the event states itself.
+- **Refuse a null id in `eventTags()`.** `ACCOUNT.tag(null)` already throws, which is one more reason to tag through the entity.
+- **No personal data in a tag**, stated or passed: tags are stored in the clear and survive [erasure](/posts/eventmodeling-personal-data/).
+
 ## The Kernel's Own Tags
 
 Your entity tags are not the only tags on an event. The framework adds tracing tags to everything it appends, all with an `x-` prefix: `x-actor`, `x-channel`, `x-correlation-id`, `x-instance-logical` and friends, and, on events raised in reaction to another event, `x-caused-by`. They say who did what, in which flow, from which process. Matching is containment, so they never get in the way of a filter or a boundary built on your entity tags. Do not choose entity names starting with `x-`. [Observability and Tracing](/posts/eventmodeling-observability/) covers what they carry and how to read them.
@@ -244,6 +308,7 @@ The marker applies to the payload, not to tags: the tag assertion checks that th
 - One id type per entity is what makes swapped arguments and mistyped tags compile errors.
 - Keep the id record lenient, with its component called `value`; put rules in the factory or the command.
 - The entity name is the tag key and is stored; so is the component name `value`. The record's class name is not.
+- Optionally, an event states its own tags (`Tagged.eventTags()`) and the tags it requires (`tagRequirements()`), so a command raises it with only what the payload does not carry.
 - `tag()` is a flag, not a wildcard. Tags that identify nothing are plain `Tag.of(key, value)`.
 - In tests, `ACCOUNT.id(IGNORE_ID())` stands for a minted id.
 

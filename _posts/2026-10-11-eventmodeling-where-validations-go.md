@@ -95,6 +95,8 @@ A command is not a payload record — it is never stored — so its compact cons
 parameter is a value object, step 1 already did the work: a command taking `EmailAddress` cannot receive a
 malformed email.
 
+The tags an event is stored with are part of the request too. An event that [states its own tags](/posts/eventmodeling-entities-and-tags/#events-that-state-their-own-tags) may declare how many it must carry per key; a command that raises it without a tag its payload does not hold — a channel, an entity the event is about but does not carry — fails with `IllegalArgumentException` where it raised the event, before anything is appended. Without such a requirement that mistake is silent: the event is stored, matches no consistency boundary that selects by the missing tag, and a later decision that should have conflicted is admitted.
+
 ## 3. Rules on History: Decide on a Decision Model, Let the Append Re-check
 
 ```java
@@ -304,6 +306,7 @@ retries the design promises will happen.
 | Business rule with an enforcement level | judged after the command ran | a rule people may break under conditions | `RuleViolationException` (a `BusinessException`) unless overridden, or recorded on the events | no — override, or change the request |
 | DCB append check | inside the append | facts newer than the decision | `OptimisticLockingException` | yes — `Execution.retrying()` |
 | Empty boundary (uniqueness) | inside the append | a concurrent duplicate claim | `OptimisticLockingException`, then the re-decide's `BusinessException` | re-execute |
+| Tag requirement (`Tagged.tagRequirements()`), when used | where the command raises the event, and again on append | an event missing a tag its boundaries select it by | `IllegalArgumentException`, nothing stored | no — pass the tag |
 | Idempotency key | inside the append | the same request twice | an empty result, silently | no — already done |
 | Automation `onFailure` | after an effect failed | a failing external effect | an `AutomationFailureAction` and an event | per the action |
 

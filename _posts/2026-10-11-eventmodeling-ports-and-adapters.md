@@ -366,6 +366,36 @@ Independently of the events, a context's `BoundedContextObserver` is told of eve
 
 The observation is started on the caller's thread before the adapter runs, so it nests under whatever made the call: the transfer gateway's calls arrive nested in the automation's `AutomationRun`, a command's calls in its `CommandExecution`. A tracing binding gets the port as a child span with nothing to propagate. See [Observability and Tracing](/posts/eventmodeling-observability/).
 
+## What a Call Consumed of a Paid Service
+
+Some ports cost money per call: a language model billed by the token, an SMS gateway by the segment, a geocoding API by the request. The adapter knows what the provider billed, and can report it to the call it runs in:
+
+```java
+public String summarize ( String text ) {
+    var response = client.messages().create(request(text));
+    PortCall.current().consumed(Consumption.of("anthropic", MODEL)
+            .served(response.model())
+            .quantity("input_tokens", response.usage().inputTokens())
+            .quantity("output_tokens", response.usage().outputTokens())
+            .reference(response.id()));
+    return response.text();
+}
+```
+
+- **`Consumption`** names a `provider`, the `product` asked for, optionally the product actually `served` (a fallback model), the quantities in the **provider's own billing units**, the provider's `reference` for the call, and a few low-cardinality `attribute`s. The framework knows no kind of service and no prices: quantities only, so the numbers can be checked against the provider's invoice line by line.
+- **It travels with the call.** What was reported is on the call's `PortCalled`, `PortCallRejected` or `PortCallFailed` as `consumption`, summed per provider and billed product in a summarized port's `PortCallsSummarized`, and handed to the observer through `Observation.Scope.consumed(...)`, so a tracer puts it on the span and a metrics binding counts it — per bounded context, slice, port and caller, like the call itself.
+- **Report before throwing.** A refused call is usually billed too, and a call that throws has no return value to carry it — which is why consumption is reported to the call rather than returned by the port.
+- **Report unconditionally.** Outside a monitored call — a binding without `.monitored()`, the adapter's own test — `PortCall.current()` answers a call that records nothing. Several reports on one call are all kept (a retry, a fallback). An adapter handing work to another thread takes `PortCall.current()` on the calling thread and reports through that handle; a report arriving after the call ended is dropped with a warning.
+- **In the adapter's own test**, `PortCall.open(sink)` opens a call whose reports go to the sink, so the test sees exactly what the adapter reports:
+
+```java
+List<Consumption> reported = new ArrayList<>();
+try ( var call = PortCall.open(reported::add) ) {
+    adapter.summarize("...");
+}
+assertEquals(1200, reported.getFirst().amount("input_tokens"));
+```
+
 ## When Not to Monitor
 
 A port is not only where a dependency is bound; it is also where configuration and infrastructure reach a slice. Those are not calls worth reporting:
@@ -425,4 +455,5 @@ To assert on the monitoring itself — that a decline is a `PortCallRejected`, t
 | an outage counted as a failure, always | an exception extending `PortUnavailableException` |
 | a busy port reported cheaply | `PortMonitoring.summarized(interval)` or `.summarizing(interval, "method")` |
 | one request as one flow | `TracingScope.bind(tracing)` at the edge |
+| what a call cost of a paid service | `PortCall.current().consumed(Consumption.of(provider, product).quantity(unit, n))` in the adapter |
 | what a deployment depends on | `BoundedContextStarting.ports` |
